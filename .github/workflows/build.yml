@@ -291,7 +291,10 @@ jobs:
           xcodebuild -project build-ios/EzPlay.xcodeproj -scheme EzPlay -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO build 2>&1 | tee sim-build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
-          APP=$(find build-sim/Build/Products -name PerformLive.app -type d | head -1)
+          # CMake's Xcode projects send products to build-ios/EzPlay_artefacts,
+          # not to the derived-data folder.
+          APP=$(find build-ios/EzPlay_artefacts build-sim/Build/Products -path "*iphonesimulator*" -name PerformLive.app -type d 2>/dev/null | head -1)
+          [ -n "$APP" ] || APP=$(find build-ios build-sim -name PerformLive.app -type d 2>/dev/null | head -1)
           if [ -z "$APP" ]; then grep -B2 -A8 "error:" sim-build.log | head -150; exit 1; fi
           echo "APP=$APP" >> "$GITHUB_ENV"
 
