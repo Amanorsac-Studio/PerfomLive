@@ -1,0 +1,106 @@
+# ============================================================================
+#  EzPlay .gitignore — C++ / JUCE / CMake / Visual Studio / VS Code / Windows
+# ============================================================================
+
+# ---- CMake ------------------------------------------------------------------
+build/
+build-*/
+build_verify/
+build_release/
+out/
+
+# Packaged tester builds (package_release.ps1 output) -- 30 MB of exe per
+# version, rebuildable from source in one command. Never in git.
+dist/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# ---- JUCE ---------------------------------------------------------------
+JuceLibraryCode/
+*_artefacts/
+JuceHeader.h
+
+# ---- C++ build artifacts -------------------------------------------------
+*.o
+*.obj
+*.lo
+*.slo
+*.a
+*.lib
+*.la
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.ilk
+*.exp
+*.pdb
+*.idb
+*.map
+
+# ---- Visual Studio --------------------------------------------------------
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+Debug/
+Release/
+x64/
+x86/
+ipch/
+*.tlog
+*.log
+
+# ---- VS Code ----------------------------------------------------------------
+.vscode/
+*.code-workspace
+
+# ---- Secrets (never commit) --------------------------------------------------
+# The store backend reads every credential from the environment; a .env file
+# is the usual way to hold those locally. Ignored repo-wide so one can never
+# be swept in by a `git add .`, in this directory or any future service dir.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Walkthrough recorder intermediates (regenerate with `node record.js`) ---
+marketing/video/frames/
+marketing/video/probe_frames/
+marketing/video/probe_frames2/
+marketing/video/list.txt
+marketing/video/check-*.png
+marketing/video/node_modules/
+
+# ---- Windows ----------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.tmp
+*.temp
+~$*
+
+# ---- Standalone test/tool build output (decktest, switchtest, gen_stems) ---
+decktest.exe
+decktest.obj
+switchtest.exe
+switchtest.obj
+gen_stems.exe
+gen_stems.obj

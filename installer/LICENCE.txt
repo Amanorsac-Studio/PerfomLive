@@ -1,0 +1,26 @@
+PERFORMLIVE BETA (Testing)
+
+This is a free test build of PerformLive from Amanorsac Studio.
+
+Your use of PerformLive is covered by the Amanorsac Studio End User
+Licence Agreement and Terms of Service, published at:
+
+    https://amanorsac.studio/legal
+
+How Amanorsac Studio handles your information is set out in the
+Privacy Policy:
+
+    https://amanorsac.studio/privacy
+
+About this beta
+
+  - It is a test build and may contain faults. Keep your own copies of
+    anything important.
+  - It stops opening on a fixed date. The installer's last page and the
+    STORE page inside the app both show that date.
+  - There is no licence key and no account. PerformLive itself never
+    connects to the internet.
+  - No sounds are included. The app opens empty.
+
+By continuing, you accept the licence agreement published at the
+address above.

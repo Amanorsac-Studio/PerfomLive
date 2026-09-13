@@ -1,0 +1,358 @@
+name: Build
+
+# Mac and iPad builds of PERFORMLIVE BETA (Testing). The Windows installer is
+# built on the studio machine (package_release.ps1), because it needs
+# Steinberg's ASIO SDK, which cannot be put in a public repository.
+#
+# The certificate steps follow the studio's macOS Code Signing & Notarisation
+# Standard (proven on SecondOut 1.3.2), and the iPad signing follows PulseRoom's
+# TestFlight job. This repository is public, so Actions minutes are free and
+# both jobs run on every push.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: Mac (signed + notarised installer)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      # Developer ID Application - signs PerformLive.app.
+      DEV_ID_APP_P12:            ${{ secrets.MAC_CERT_P12 }}
+      DEV_ID_APP_P12_PASSWORD:   ${{ secrets.MAC_CERT_PASSWORD }}
+      # Developer ID Installer - a DIFFERENT certificate, signs the .pkg.
+      DEV_ID_INST_P12:           ${{ secrets.MAC_INSTALLER_P12 }}
+      DEV_ID_INST_P12_PASSWORD:  ${{ secrets.MAC_INSTALLER_PASSWORD }}
+      APPLE_TEAM_ID:             ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_P8:                ${{ secrets.ASC_KEY_P8 }}
+      ASC_KEY_ID:                ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID:             ${{ secrets.ASC_ISSUER_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The engine is plain C++17 with no JUCE, so its suites build in seconds.
+      # Expected counts match verify_batch.sh on Windows; a drift is a failure.
+      - name: Engine tests
+        run: |
+          set -u
+          for suite in decktest:67 switchtest:69 stemlentest:9 stemplaytest:15 stemlocktest:18 outroutetest:10 sectiontest:41 arrangetest:37; do
+            name="${suite%%:*}"; want="${suite##*:}"
+            clang++ -std=c++17 -O2 -I. "$name.cpp" -o "$RUNNER_TEMP/$name" || { echo "::error::$name does not compile"; exit 1; }
+            out="$("$RUNNER_TEMP/$name" 2>&1)"
+            pass=$(printf '%s\n' "$out" | grep -c '\[PASS\]' || true)
+            fail=$(printf '%s\n' "$out" | grep -c '\[FAIL\]' || true)
+            if [ "$fail" -ne 0 ] || [ "$pass" -ne "$want" ]; then
+              printf '%s\n' "$out" | grep '\[FAIL\]' || true
+              echo "::error::$name: $pass of $want passed, $fail failed"
+              exit 1
+            fi
+            echo "$name: $pass/$want PASS"
+          done
+
+      # A missing secret must not quietly produce an unsigned build that looks
+      # like a release. A tag hard-fails; anything else warns and labels the
+      # package UNSIGNED.
+      - name: Require signing material
+        id: gate
+        run: |
+          missing=()
+          [ -n "$DEV_ID_APP_P12" ]           || missing+=(MAC_CERT_P12)
+          [ -n "$DEV_ID_APP_P12_PASSWORD" ]  || missing+=(MAC_CERT_PASSWORD)
+          [ -n "$DEV_ID_INST_P12" ]          || missing+=(MAC_INSTALLER_P12)
+          [ -n "$DEV_ID_INST_P12_PASSWORD" ] || missing+=(MAC_INSTALLER_PASSWORD)
+          [ -n "$APPLE_TEAM_ID" ]            || missing+=(APPLE_TEAM_ID)
+          [ -n "$ASC_KEY_P8" ]               || missing+=(ASC_KEY_P8)
+          [ -n "$ASC_KEY_ID" ]               || missing+=(ASC_KEY_ID)
+          [ -n "$ASC_ISSUER_ID" ]            || missing+=(ASC_ISSUER_ID)
+
+          if [ ${#missing[@]} -eq 0 ]; then
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+            echo "Signing and notarisation enabled."
+            exit 0
+          fi
+
+          echo "sign=false" >> "$GITHUB_OUTPUT"
+          printf 'Missing secret: %s\n' "${missing[@]}"
+          echo "::warning::Unsigned Mac build - the secrets above resolved empty. Organisation secrets must have visibility that includes this public repository."
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "::error::Refusing to publish an unsigned build for tag ${{ github.ref_name }}."
+            exit 1
+          fi
+
+      - name: Import signing certificates
+        if: steps.gate.outputs.sign == 'true'
+        run: |
+          KEYCHAIN=build.keychain
+          KEYCHAIN_PASSWORD=$(uuidgen)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -s "$KEYCHAIN"
+
+          # Only the shape of a bad secret is ever reported, never its value.
+          decode_p12 () {
+            raw="$1"; out="$2"; name="$3"
+            stripped=$(printf '%s' "$raw" | tr -d '[:space:]')
+            if [ -z "$stripped" ]; then echo "::error::$name is empty."; return 1; fi
+            case "$stripped" in
+              -----BEGIN*) echo "::error::$name holds PEM text, but a base64-encoded .p12 is required."; return 1 ;;
+            esac
+            if ! printf '%s' "$stripped" | base64 --decode > "$out" 2>/dev/null || [ ! -s "$out" ]; then
+              echo "::error::$name is not valid base64 (${#stripped} characters). It should hold the file's contents, not its name."
+              return 1
+            fi
+            if [ "$(head -c 1 "$out" | xxd -p)" != "30" ]; then
+              echo "::error::$name decoded, but is not a PKCS#12 archive (probably a .cer/.pem with no private key)."
+              return 1
+            fi
+            echo "  $name: decoded OK ($(wc -c < "$out" | tr -d ' ') bytes)"
+          }
+
+          echo "Checking certificate secrets:"
+          decode_p12 "$DEV_ID_APP_P12"  app.p12       MAC_CERT_P12
+          decode_p12 "$DEV_ID_INST_P12" installer.p12 MAC_INSTALLER_P12
+
+          trim () { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          security import app.p12       -k "$KEYCHAIN" -P "$(trim "$DEV_ID_APP_P12_PASSWORD")"  -T /usr/bin/codesign -T /usr/bin/productsign
+          security import installer.p12 -k "$KEYCHAIN" -P "$(trim "$DEV_ID_INST_P12_PASSWORD")" -T /usr/bin/codesign -T /usr/bin/productsign
+          rm -f app.p12 installer.p12
+
+          # Without this, codesign blocks on a GUI prompt and the job hangs.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+
+          echo "Identities available to this build:"
+          security find-identity -v | sed 's/^/  /'
+
+      - name: Configure
+        run: |
+          COMMON=(-S . -B build -G Xcode
+                  -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+                  -DPERFORMLIVE_BUILD_NUMBER="${{ github.run_number }}")
+          if [ "${{ steps.gate.outputs.sign }}" = "true" ]; then
+            # Xcode signs at build time and applies JUCE's hardened-runtime
+            # entitlements. INJECT_BASE_ENTITLEMENTS=NO keeps get-task-allow out.
+            cmake "${COMMON[@]}" \
+              -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_STYLE=Manual \
+              -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="Developer ID Application" \
+              -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+              -DCMAKE_XCODE_ATTRIBUTE_OTHER_CODE_SIGN_FLAGS="--timestamp" \
+              -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO
+          else
+            cmake "${COMMON[@]}"
+          fi
+
+      - name: Build
+        run: |
+          set -o pipefail
+          cmake --build build --config Release --target EzPlay 2>&1 | tee build.log | grep -E "error:|warning: unused|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/EzPlay_artefacts/Release/PerformLive.app || { grep -B2 -A8 "error:" build.log | head -150; exit 1; }
+
+      - name: Read version
+        id: version
+        run: echo "version=$(sed -n 's/^project(EzPlay VERSION \([0-9.]*\)).*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: In-app self-tests and bundled files
+        run: |
+          APP=build/EzPlay_artefacts/Release/PerformLive.app
+          for f in fonts/Inter-Regular.ttf fonts/SpaceGrotesk-Bold.ttf art/creators-qr.jpg art/amanorsac-logo.jpg art/dial-face.png logo.png; do
+            test -f "$APP/Contents/Resources/$f" || { echo "::error::$f is missing from Contents/Resources"; exit 1; }
+          done
+          for suite in beta persistence library importer; do
+            if perl -e 'alarm 180; exec @ARGV' "$APP/Contents/MacOS/PerformLive" --selftest-$suite > "self_$suite.log" 2>&1; then
+              echo "--selftest-$suite: PASS ($(grep -c '\[PASS\]' "self_$suite.log") checks)"
+            else
+              cat "self_$suite.log"; echo "::error::--selftest-$suite failed"; exit 1
+            fi
+          done
+
+      - name: Verify app signature
+        if: steps.gate.outputs.sign == 'true'
+        run: |
+          APP=build/EzPlay_artefacts/Release/PerformLive.app
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign --display --verbose=2 "$APP" 2>&1 | grep -q "flags=.*runtime" \
+            || { echo "::error::not signed with the hardened runtime - notarisation would reject it."; exit 1; }
+          codesign --display --verbose=4 "$APP" 2>&1 | grep -q "^Timestamp=" \
+            || { echo "::error::no secure timestamp - notarisation would reject it."; exit 1; }
+          if codesign --display --entitlements - --xml "$APP" 2>/dev/null | grep -q "get-task-allow"; then
+            echo "::error::carries com.apple.security.get-task-allow - notarisation would reject it."; exit 1
+          fi
+          lipo -archs "$APP/Contents/MacOS/PerformLive"
+
+      - name: Assemble installer package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ROOT=pkgroot
+          mkdir -p "$ROOT/Applications"
+          cp -R build/EzPlay_artefacts/Release/PerformLive.app "$ROOT/Applications/"
+
+          # Not relocatable: otherwise Installer "upgrades" any other copy with
+          # the same bundle id wherever it sits (a download folder, a build
+          # folder) and /Applications stays empty.
+          pkgbuild --analyze --root "$ROOT" component.plist
+          plutil -replace 0.BundleIsRelocatable -bool NO component.plist
+
+          pkgbuild --root "$ROOT" \
+                   --component-plist component.plist \
+                   --identifier com.amanorsac.performlive.installer \
+                   --version "$VERSION" \
+                   --install-location / \
+                   "PerformLive-$VERSION-unsigned.pkg"
+
+      - name: Sign, notarise and staple the installer
+        if: steps.gate.outputs.sign == 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG="PerformLive-$VERSION-macOS.pkg"
+
+          productsign --sign "Developer ID Installer" "PerformLive-$VERSION-unsigned.pkg" "$PKG"
+          rm -f "PerformLive-$VERSION-unsigned.pkg"
+          pkgutil --check-signature "$PKG"
+
+          printf '%s' "$ASC_KEY_P8" | base64 --decode > asc.p8 2>/dev/null || true
+          grep -q "BEGIN PRIVATE KEY" asc.p8 2>/dev/null || printf '%s' "$ASC_KEY_P8" > asc.p8
+          grep -q "BEGIN PRIVATE KEY" asc.p8 \
+            || { echo "::error::ASC_KEY_P8 is neither base64-encoded nor a raw .p8 private key."; rm -f asc.p8; exit 1; }
+          trap 'rm -f asc.p8' EXIT
+
+          # notarytool --wait exits 0 even when Apple says "Invalid".
+          set +e
+          RESULT=$(xcrun notarytool submit "$PKG" \
+                     --key asc.p8 --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+                     --wait --timeout 30m --output-format json)
+          set -e
+          echo "$RESULT"
+          SUBMISSION_ID=$(printf '%s' "$RESULT" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)
+          STATUS=$(printf '%s' "$RESULT" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::Apple returned notarisation status '$STATUS'. Its log follows."
+            [ -n "$SUBMISSION_ID" ] && xcrun notarytool log "$SUBMISSION_ID" --key asc.p8 --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" || true
+            exit 1
+          fi
+
+          xcrun stapler staple "$PKG"
+          xcrun stapler validate "$PKG"
+          spctl --assess -vv --type install "$PKG"
+
+      - name: Name the unsigned package honestly
+        if: steps.gate.outputs.sign != 'true'
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mv "PerformLive-$VERSION-unsigned.pkg" "PerformLive-$VERSION-macOS-UNSIGNED.pkg"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PerformLive-${{ steps.version.outputs.version }}-macOS
+          path: PerformLive-*.pkg
+          if-no-files-found: error
+
+      - name: Clean up keychain
+        if: always() && steps.gate.outputs.sign == 'true'
+        run: security delete-keychain build.keychain || true
+
+  ipad:
+    name: iPad (simulator check + TestFlight)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure (iPadOS)
+        run: |
+          cmake -S . -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_XCODE_GENERATE_SCHEME=ON \
+            -DPERFORMLIVE_BUILD_NUMBER="${{ github.run_number }}"
+
+      # Always runs, signed or not: proves the iPad code compiles and launches.
+      - name: Build for the iPad simulator
+        run: |
+          set -o pipefail
+          xcodebuild -project build-ios/EzPlay.xcodeproj -scheme EzPlay -configuration Release \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO build 2>&1 | tee sim-build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          APP=$(find build-sim/Build/Products -name PerformLive.app -type d | head -1)
+          if [ -z "$APP" ]; then grep -B2 -A8 "error:" sim-build.log | head -150; exit 1; fi
+          echo "APP=$APP" >> "$GITHUB_ENV"
+
+      - name: Screenshots on an iPad simulator
+        run: |
+          set -x
+          ls "$APP" | head -40
+          test -f "$APP/fonts/Inter-Regular.ttf" || test -f "$APP/Resources/fonts/Inter-Regular.ttf" \
+            || { echo "::error::fonts are missing from the iPad bundle"; exit 1; }
+
+          DEVTYPE=$(xcrun simctl list devicetypes | grep -E "iPad Air 11-inch|iPad Pro 11-inch|iPad Air" | head -1 | sed -E 's/.*\((com\.apple[^)]+)\).*/\1/')
+          RUNTIME=$(xcrun simctl list runtimes available | grep -E "^iOS " | tail -1 | sed -E 's/.* - ([^ ]+)$/\1/')
+          UDID=$(xcrun simctl create PerformLive-iPad "$DEVTYPE" "$RUNTIME")
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" "$APP"
+
+          mkdir -p shots
+          xcrun simctl launch "$UDID" com.amanorsac.performlive
+          sleep 30
+          xcrun simctl io "$UDID" screenshot shots/01-opens.png
+          xcrun simctl terminate "$UDID" com.amanorsac.performlive || true
+
+          xcrun simctl launch "$UDID" com.amanorsac.performlive --simulate-beta-ended
+          sleep 15
+          xcrun simctl io "$UDID" screenshot shots/02-beta-ended.png
+          xcrun simctl terminate "$UDID" com.amanorsac.performlive || true
+
+          # A crash shows up here rather than as a mysterious home screen.
+          cp ~/Library/Logs/DiagnosticReports/PerformLive* shots/ 2>/dev/null || true
+          xcrun simctl spawn "$UDID" log show --last 5m --style compact --predicate 'process == "PerformLive"' > shots/app-log.txt 2>&1 || true
+
+      - name: Upload simulator screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PerformLive-iPad-simulator
+          path: shots/
+          if-no-files-found: ignore
+
+      - name: Signed archive and TestFlight upload
+        id: testflight
+        env:
+          APPLE_TEAM_ID:  ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_P8:     ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID:     ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID:  ${{ secrets.ASC_ISSUER_ID }}
+          # The organisation holds its Apple Distribution certificate under one
+          # of these names (Nebula Tide uses the first, SecondOut's notes name
+          # the second). Whichever imports with a private key is used.
+          DIST_P12_A:     ${{ secrets.IOS_DIST_CERT_P12 }}
+          DIST_P12_B:     ${{ secrets.APPLE_DIST_P12 }}
+          DIST_PW_A:      ${{ secrets.IOS_CERT_PASSWORD }}
+          DIST_PW_B:      ${{ secrets.APPLE_DIST_PASSWORD }}
+          DIST_PW_C:      ${{ secrets.APPLE_DIST_P12_PASSWORD }}
+        run: bash tools/ci_ipad_testflight.sh
+
+      - name: Upload iPad build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PerformLive-iPad
+          path: PerformLive-*-iPad.ipa
+          if-no-files-found: ignore
