@@ -291,11 +291,22 @@ jobs:
           xcodebuild -project build-ios/EzPlay.xcodeproj -scheme EzPlay -configuration Release \
             -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO build 2>&1 | tee sim-build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
-          # CMake's Xcode projects send products to build-ios/EzPlay_artefacts,
-          # not to the derived-data folder.
-          APP=$(find build-ios/EzPlay_artefacts build-sim/Build/Products -path "*iphonesimulator*" -name PerformLive.app -type d 2>/dev/null | head -1)
-          [ -n "$APP" ] || APP=$(find build-ios build-sim -name PerformLive.app -type d 2>/dev/null | head -1)
-          if [ -z "$APP" ]; then grep -B2 -A8 "error:" sim-build.log | head -150; exit 1; fi
+          # Ask Xcode where it put the app rather than guessing: CMake's Xcode
+          # projects override the usual derived-data product folder.
+          SETTINGS=$(xcodebuild -project build-ios/EzPlay.xcodeproj -scheme EzPlay -configuration Release \
+                       -sdk iphonesimulator -derivedDataPath build-sim -showBuildSettings 2>/dev/null)
+          TBD=$(printf '%s\n' "$SETTINGS" | awk -F' = ' '$1 ~ /^ *TARGET_BUILD_DIR$/ {print $2}' | tail -1)
+          WRAP=$(printf '%s\n' "$SETTINGS" | awk -F' = ' '$1 ~ /^ *WRAPPER_NAME$/ {print $2}' | tail -1)
+          APP="$TBD/$WRAP"
+          echo "Xcode says the app is at: $APP"
+          if [ ! -d "$APP" ]; then
+            echo "::error::No app at $APP"
+            printf '%s\n' "$SETTINGS" | grep -E " (TARGET_NAME|PRODUCT_NAME|TARGET_BUILD_DIR|BUILT_PRODUCTS_DIR|CONFIGURATION_BUILD_DIR|WRAPPER_NAME|SDKROOT|SUPPORTED_PLATFORMS) = " | sort -u
+            find "$PWD" "$HOME/Library/Developer/Xcode/DerivedData" -name "*.app" -type d -not -path "*/JUCE/*" 2>/dev/null | head -20
+            grep -E "^(CompileC|Ld|CodeSign|Touch|ProcessInfoPlistFile|CopySwiftLibs|RegisterExecutionPolicyException) " sim-build.log | tail -15
+            grep -B2 -A8 "error:" sim-build.log | head -80
+            exit 1
+          fi
           echo "APP=$APP" >> "$GITHUB_ENV"
 
       - name: Screenshots on an iPad simulator
