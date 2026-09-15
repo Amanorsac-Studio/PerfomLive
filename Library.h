@@ -108,6 +108,18 @@ struct LibraryEntry
 juce::var libraryEntryToVar (const LibraryEntry& entry);
 LibraryEntry libraryEntryFromVar (const juce::var& v);
 
+// A folder in the LIBRARY browser: a named group of samples (usually one
+// song's stems) with an optional picture. Its id is the same value every
+// member carries in LibraryEntry::collectionId, so the stem-set groups older
+// imports made become folders as they load (see Library::load()).
+struct LibraryFolder
+{
+    juce::String id;
+    juce::String name;
+    juce::String imagePath;      // relative to the library root; only ever "Folders/<uuid>.png", written by setFolderImage()
+    int64_t createdAtMs { 0 };
+};
+
 // One library root's own metadata database (root/library.json) + asset
 // resolution. A root moved or copied to another machine carries its own
 // complete database with it -- "moved libraries" and "multiple library
@@ -155,15 +167,48 @@ public:
 
     const std::vector<LibraryEntry>& entries() const { return allEntries; }
 
+    // ---- Folders --------------------------------------------------------
+    static constexpr int kMaxFolderNameLength = 80;
+
+    const std::vector<LibraryFolder>& folders() const { return allFolders; }
+    std::optional<LibraryFolder> findFolder (const juce::String& folderId) const;
+
+    // New folder holding assetIds (which leave any folder they were in).
+    LibraryFolder createFolder (const juce::String& name, const juce::StringArray& assetIds);
+    void upsertFolder (const LibraryFolder& folder);
+
+    // Deletes the folder and its picture. The samples stay in the library.
+    void removeFolder (const juce::String& folderId);
+
+    // Moves one sample into folderId, or out of any folder when folderId is
+    // empty. False if the sample isn't in this library or the folder isn't.
+    bool setEntryFolder (const juce::String& assetId, const juce::String& folderId);
+    int folderSize (const juce::String& folderId) const;
+
+    // The folder's picture inside root/Folders, or a non-existent File.
+    juce::File folderImageFile (const juce::String& folderId) const;
+
+    // Decodes `source`, scales it to at most 512 px and writes a fresh PNG
+    // into root/Folders -- the library keeps a clean copy, never the user's
+    // original file. On failure returns false with a message for the user.
+    bool setFolderImage (const juce::String& folderId, const juce::File& source, juce::String& error);
+    void clearFolderImage (const juce::String& folderId);
+
+    // A folder name for these samples: their shared leading words
+    // ("Grace - Drums" + "Grace - Bass" -> "Grace"), else "Stem set".
+    static juce::String suggestFolderName (const juce::StringArray& sampleNames);
+
     // SHA-256 of the file's raw bytes, as a lowercase hex string. Streamed
     // (juce::FileInputStream), not loaded fully into a second buffer first.
     static juce::String hashFile (const juce::File& file);
 
 private:
     juce::File libraryJsonFile() const { return root.getChildFile ("library.json"); }
+    void adoptLooseCollections();
 
     juce::File root;
     std::vector<LibraryEntry> allEntries;
+    std::vector<LibraryFolder> allFolders;
 };
 
 // Aggregates several Library roots. AssetIds are globally unique (UUIDs),

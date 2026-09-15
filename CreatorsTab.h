@@ -2,16 +2,14 @@
 //  CreatorsTab.h -- the STORE page for the public beta, and the window that
 //  replaces the app once the beta has ended.
 //
-//  The online pack store is not in this build. The owner's call for the beta:
-//  no network requests of any kind, so the app keeps the promise the published
-//  privacy policy makes (Build Standard B46). The STORE tab instead tells
-//  people who make loops and stems how to become a creator: the studio
-//  lockup, the contacts the owner gave for it, and the QR code for the
-//  creators' WhatsApp group.
+//  The online pack store is not in this build: STORE opens on a preview
+//  catalogue (StoreShowcase.h) and this page, which tells people who make
+//  loops and stems how to become a creator: the studio lockup, the contacts
+//  the owner gave for it, and the QR code for the creators' WhatsApp group.
 //
-//  The links hand off to the operating system's own mail app and browser. The
-//  app itself still sends nothing, and every address it hands over is a
-//  compiled-in constant -- never text read from a file or a server.
+//  The links hand off to the operating system's own mail app and browser, and
+//  every address they hand over is a compiled-in constant -- never text read
+//  from a file or a server.
 //
 //  Colours are the PerformLive tokens written out, because this header is
 //  included before the performlive namespace is declared in Main.cpp. Body

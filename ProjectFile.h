@@ -78,6 +78,15 @@ struct DeckSnapshot
     static constexpr int kDeckLayers = 8;
     std::array<LayerSnapshot, kDeckLayers> layers;
     double tempoOverrideBpm { -1.0 };   // -1 = no override ("play as recorded")
+    // Owner: one tempo per song, set by the user, never detected. -1 = not
+    // set yet (nothing is ever stretched until it is). Additive field.
+    double sourceBpm { -1.0 };
+    bool   stemMode  { true };          // ezdeck::DeckMode; absent reads as stem (the default)
+    // The song's own click and guide tracks, beside the row (not on a deck).
+    // Paths are validated on load like every layer path. Additive.
+    juce::String clickFile, guideFile;
+    bool useSongClick { true }, useSongGuide { true };   // the song's own track, or the built-in click/cues
+    juce::String meter;   // the song's own time signature ("6/8"); "" = its signature group's. Additive.
 
     // Phase 1.1 P1 "Row Management" -- purely descriptive per-row metadata
     // (Main.cpp's own comment on layerDisplayName() explains the Row=deck
@@ -103,11 +112,18 @@ struct DeckSnapshot
         int          startBar { 0 };
         juce::uint32 colourArgb { 0 };
         bool skip { false }, optional { false }, loopOnEntry { false }, pauseAfter { false };
+        juce::String cue;   // Guide.h: "" automatic, "-" silent, else a cue stem
     };
     std::vector<SectionSnapshot> sections;
     int  arrangementLengthBars { 0 };
     int  endBehaviour { 2 };        // 0 stop, 1 cue next, 2 auto-advance (ezarr::EndBehaviour)
     int  countInBars { 0 };
+
+    // Native guide tracks (Guide.h). Additive; absent reads as off.
+    bool guideClick { false };
+    bool guideCues { false };
+    int  cueLeadBars { 2 };
+    bool cueCounts { true };
 };
 
 struct VoiceSnapshot
@@ -172,6 +188,42 @@ struct SettingsSnapshot
     bool onePadAtATime    { true };
     bool meterVisible     { true };
     bool tempoLockEnabled { false };
+
+    // LEGACY (read only): live input and instrument per deck column, from
+    // before the live tracks existed. settingsFromVar() moves them onto the
+    // live tracks below; nothing writes them any more.
+    static constexpr int kLiveColumns = 8;
+    std::array<int,  kLiveColumns> liveInputChannel { -1, -1, -1, -1, -1, -1, -1, -1 };
+    std::array<bool, kLiveColumns> liveInputStereo  {};
+
+    // Instrument plugin per column (PX-D): the plugin's identifier string
+    // (empty = none) and its saved state, base64. Additive.
+    std::array<juce::String, kLiveColumns> instrumentId;
+    std::array<juce::String, kLiveColumns> instrumentState;
+
+    // The live tracks (LIVE 1-4 on the mixer): each is a device input
+    // (trackInput >= 0, stereo takes the next channel too), an instrument
+    // plugin (identifier + base64 state), or nothing. trackMidiChannel: 0 =
+    // every channel, else 1-16. Global, not per song: a mic jack is a
+    // physical thing.
+    static constexpr int kLiveTracks = 4;
+    std::array<int,  kLiveTracks>          trackInput { -1, -1, -1, -1 };
+    std::array<bool, kLiveTracks>          trackStereo {};
+    std::array<juce::String, kLiveTracks>  trackInstrumentId;
+    std::array<juce::String, kLiveTracks>  trackInstrumentState;
+    std::array<int,  kLiveTracks>          trackMidiChannel {};
+
+    // PERFORM LIVE channel strip per track: 0-7 the decks, 8-11 the live
+    // tracks. On/off and full state (every knob, the preset), base64.
+    // Files from before the live tracks have 8 entries, which keep meaning
+    // the same decks.
+    static constexpr int kStrips = kLiveColumns + kLiveTracks;
+    std::array<bool, kStrips>         stripOn {};
+    std::array<juce::String, kStrips> stripState;
+
+    // The mixer's WEB strip: the browser page's level (0..1) and mute. Additive.
+    float webGain { 1.0f };
+    bool  webMute { false };
 };
 
 struct ProjectSnapshot
@@ -180,14 +232,10 @@ struct ProjectSnapshot
     SettingsSnapshot settings;
     double masterTempoBpm { 120.0 };
     int    viewedSignature { 0 };
-    // One entry per mixer channel, in MixerChannel order: Tab1-8, Pads, Fx,
-    // Metro. This stayed at 7 when PX-B added Tab5-8 while the save loop
-    // wrote 11 -- four entries past the end of the array on every save, which
-    // Debug caught as a crash and Release would have done as silent memory
-    // corruption. kMixerChannels is asserted against ezdeck::kNumMixerChannels
-    // in Main.cpp so the two cannot drift again. Files saved with 7 entries
-    // are remapped on load (ProjectFile.cpp).
-    static constexpr int kMixerChannels = 11;
+    // One entry per mixer channel, in MixerChannel order: Tab1-8, Live1-4,
+    // Pads, Fx, Metro (click), Cues. Asserted against ezdeck::kNumMixerChannels
+    // in Main.cpp. Files saved with 7, 11 or 12 entries are remapped on load.
+    static constexpr int kMixerChannels = 16;
     std::array<MixerChannelSnapshot, kMixerChannels> mixerChannels;
     float  masterGain { 1.0f };
     std::vector<DeckSnapshot>  decks;   // only decks with at least one loaded layer

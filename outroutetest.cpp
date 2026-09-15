@@ -149,7 +149,9 @@ int main()
         std::array<const float*, kNumMixerChannels> inL {}, inR {};
         for (int c = 0; c < kNumMixerChannels; ++c)
         {
-            srcL[(size_t) c] = constantSource (numSamples, 1.0f);
+            // Cues is solo-exempt too (Guide.h) and stays on Main, so it is
+            // silent here: this check is about Tab1 alone on pair 0.
+            srcL[(size_t) c] = constantSource (numSamples, c == (int) MixerChannel::Cues ? 0.0f : 1.0f);
             srcR[(size_t) c] = srcL[(size_t) c];
             inL[(size_t) c] = srcL[(size_t) c].data();
             inR[(size_t) c] = srcR[(size_t) c].data();

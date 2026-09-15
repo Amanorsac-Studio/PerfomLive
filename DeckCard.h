@@ -253,6 +253,25 @@ public:
         // ---- empty: just a centred plus ------------------------------------
         if (state == State::empty)
         {
+            if (clipName.isNotEmpty())
+            {
+                // PX-C: an empty slot in a live-input column says what it is
+                // carrying rather than inviting a file.
+                const auto label = clipName.upToFirstOccurrenceOf ("  ", false, false);
+                const auto detail = clipName.fromFirstOccurrenceOf ("  ", false, false).trim();
+                auto box = getLocalBounds().withSizeKeepingCentre (juce::jmin (getWidth() - 20, 230), 40);
+                g.setColour (accent.withAlpha (0.16f));
+                g.fillRoundedRectangle (box.toFloat(), 8.0f);
+                g.setColour (accent.withAlpha (0.8f));
+                g.drawRoundedRectangle (box.toFloat().reduced (0.5f), 8.0f, 1.0f);
+                g.setColour (accent.brighter (0.2f));
+                g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)).withExtraKerningFactor (0.08f));
+                g.drawText (label, box.removeFromTop (22), juce::Justification::centred, false);
+                g.setColour (juce::Colour (0xffa3a6cc));
+                g.setFont (juce::Font (juce::FontOptions (10.5f, juce::Font::plain)));
+                g.drawText (detail, box, juce::Justification::centred, false);
+                return;
+            }
             g.setColour (juce::Colour (0xff6f7099));
             g.setFont (juce::Font (juce::FontOptions (20.0f, juce::Font::plain)));
             g.drawText ("+", getLocalBounds(), juce::Justification::centred, false);

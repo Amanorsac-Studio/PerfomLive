@@ -56,9 +56,16 @@ namespace ezdeck
 // matches the UI strip order exactly, which is what the meter refresh loop
 // relies on -- the new tabs are inserted BEFORE Pads so that "tab index N
 // is channel N" stays true for every layer.
+// Guide.h: Cues is the spoken guide voice, beside Metro (the click). Both
+// are exempt from solo, like any cue send on a desk.
+// Live1..Live4: the live tracks (a mic / DI input, or a hosted instrument).
+// They are their own channels, after the eight decks, so a deck column is
+// only ever stems -- a live source never replaces a column's audio.
 enum class MixerChannel { Tab1, Tab2, Tab3, Tab4, Tab5, Tab6, Tab7, Tab8,
-                          Pads, Fx, Metro, kCount };
+                          Live1, Live2, Live3, Live4,
+                          Pads, Fx, Metro, Cues, kCount };
 constexpr int kNumMixerChannels = (int) MixerChannel::kCount;
+constexpr int kNumLiveTracks    = 4;
 
 class Mixer
 {
@@ -70,6 +77,7 @@ public:
         // its solo-exemption are established together rather than patched in
         // later (ARCHITECTURE.md's resolved Architecture Decision Pending #4).
         channels[(size_t) MixerChannel::Metro].exemptFromSolo = true;
+        channels[(size_t) MixerChannel::Cues].exemptFromSolo  = true;
     }
 
     void  setChannelGain (MixerChannel ch, float gain) { channels[idx (ch)].gain.store (gain, std::memory_order_relaxed); }

@@ -41,6 +41,9 @@ struct Section
     bool        optional { false };
     bool        loopOnEntry { false };
     bool        pauseAfter { false };
+    // Native cue for this section (Guide.h): "" = spoken from the name,
+    // "-" = silent, else a cue stem such as "Chorus-2" or "Last-Time".
+    std::string cue;
 };
 
 enum class EndBehaviour { stop, cueNext, autoAdvance };
@@ -51,6 +54,13 @@ struct Arrangement
     int          lengthBars { 0 };     // the song's length; sections beyond it are clamped on use
     EndBehaviour atEnd { EndBehaviour::autoAdvance };
     int          countInBars { 0 };    // 0 = none, else 1/2/4
+
+    // Native guide tracks (Guide.h). Off by default: a stem pack that ships
+    // its own click and cue stems should not get a second set on top.
+    bool guideClick { false };
+    bool guideCues { false };
+    int  cueLeadBars { 2 };            // the name is spoken this many bars early
+    bool cueCounts { true };           // "1, 2, 3, 4" into each section
 
     bool empty() const { return sections.empty(); }
 

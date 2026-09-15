@@ -1,0 +1,8 @@
+PERFORM LIVE channel strip -- vendored from Amanorsac Plugins
+
+Source: C:/Users/amano/Documents/Amanorsac Studio/APPS/Amanorsac Plugins/src/perform
+Commit: 234c929 (Open PERFORM LIVE on a general-purpose preset)
+
+Compiled straight into PerformLive (not loaded as a VST3), so it always ships
+with the app, can't be missing or mismatched, and is never scanned.
+To update: copy the four files from the path above and rebuild.

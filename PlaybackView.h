@@ -19,17 +19,23 @@
 //  sample-exact) in one place -- SessionComponent -- and makes this file a
 //  renderer that cannot get the music wrong.
 //
-//  Editing sections happens here too, on the timeline's ruler: double-click
-//  adds a section at that bar, drag a boundary to move it, right-click a
-//  section for its name, colour and flags. "Auto-section" drafts a typical
-//  worship structure to be corrected rather than built from nothing.
+//  Editing sections happens here too: "+ Section" adds one at the playhead,
+//  a double-click adds one anywhere on the timeline, and both offer the usual
+//  names in one click (the colour follows the name). Drag a boundary to move
+//  it; right-click a section for its flags. "Auto-section" drafts a typical
+//  worship structure to be corrected rather than built from nothing. Each
+//  track's header names it, and solos or mutes it.
 // ============================================================================
 #pragma once
 
 #include <JuceHeader.h>
 #include "Arrangement.h"
+#include "Guide.h"       // ezguide::cueIsOff -- the section menu's Cue choices
+#include "CueDetect.h"   // ezcue::DraftSection -- sections read from a cue track
 #include "Deck.h"        // ezdeck::kNumLayers -- the lane count follows the engine
 #include "UiArt.h"
+#include "TouchSupport.h"
+#include "SectionNameField.h"   // type "v" -> Verse when naming a section
 
 #include <functional>
 #include <vector>
@@ -84,6 +90,11 @@ public:
     virtual juce::String layerName (int songIndex, int layer) const = 0;
     virtual bool layerEnabled (int songIndex, int layer) const = 0;
     virtual void toggleLayer (int songIndex, int layer) = 0;
+    /** Names a track ("DRUMS", "BGVs"); an empty name goes back to the file name. */
+    virtual void setLayerName (int songIndex, int layer, const juce::String& name) { juce::ignoreUnused (songIndex, layer, name); }
+    virtual bool layerHasCustomName (int songIndex, int layer) const { juce::ignoreUnused (songIndex, layer); return false; }
+    /** The audio file behind a track, shown small inside its lane. */
+    virtual juce::String layerFileName (int songIndex, int layer) const { juce::ignoreUnused (songIndex, layer); return {}; }
     /** True when a layer makes sound without holding an audio file --
         a live input or a hosted instrument. Defaulted to false so the
         view can already ask the question before PX-C/PX-D exist to
@@ -107,6 +118,30 @@ public:
     virtual void nextSong() = 0;
     virtual void prevSong() = 0;
     virtual void seekToBar (double bar) = 0;
+
+    // ---- native click and cues (Guide.h) ----
+    virtual bool guideClick() const { return false; }
+    virtual void setGuideClick (bool) {}
+    virtual bool guideCues() const { return false; }
+    virtual void setGuideCues (bool) {}
+    virtual int  cueLeadBars() const { return 2; }
+    virtual void setCueLeadBars (int) {}
+    virtual bool cueCounts() const { return true; }
+    virtual void setCueCounts (bool) {}
+    /** Every spoken cue the bank holds, grouped: "Song Form/Chorus-2". */
+    virtual juce::StringArray cueNames() const { return {}; }
+    virtual bool cueBankLoaded() const { return false; }
+    virtual void previewCue (const juce::String& stem) { juce::ignoreUnused (stem); }
+
+    // ---- sections from the song's own cue track (CueDetect.h) ----
+    /** Listens to one track of the song and returns the sections its cues
+        imply. Empty when the track has no audio or no cues were heard. */
+    /** layer -1 = the song's own guide track. Listens in the background, then
+        opens a review window where each suggested section can be heard,
+        renamed, moved or dropped before it replaces the song's sections. */
+    virtual void listenForSections (int songIndex, int layer) { juce::ignoreUnused (songIndex, layer); }
+    /** The song's own guide track, loaded beside the row rather than on a deck. */
+    virtual bool songHasGuideTrack (int songIndex) const { juce::ignoreUnused (songIndex); return false; }
 };
 
 //==============================================================================
@@ -143,7 +178,181 @@ inline juce::String formatClock (double seconds)
 }
 
 //==============================================================================
-//  The timeline: ruler + section blocks + four lanes + playhead.
+//  Stem identity: a lane is recognised by its icon and colour before its name.
+//  The icon follows the track NAME ("DRUMS", "Kick", "Bass Gtr", "BGVs"...),
+//  so naming a track is the only thing a performer has to do -- nothing new
+//  is stored, and a stem still named after its file gets a sensible icon.
+//==============================================================================
+enum class StemKind { drums, bass, keys, synth, guitar, vocals, pads, strings, brass, click, other };
+
+inline StemKind stemKindFor (const juce::String& rawName)
+{
+    const auto n = rawName.toLowerCase();
+    auto has = [&n] (const char* w) { return n.contains (w); };
+    if (has ("click") || has ("cue") || has ("guide") || has ("metro") || has ("count"))                  return StemKind::click;
+    if (has ("bass") || has ("808"))                                                                       return StemKind::bass;
+    if (has ("drum") || has ("perc") || has ("kick") || has ("snare") || has ("hihat") || has ("hi-hat")
+        || has ("shaker") || has ("tamb") || has ("cymbal") || has ("toms") || has ("clap") || has ("cong")
+        || has ("bongo") || has ("djembe") || has ("cajon") || has ("cowbell") || has ("agogo"))          return StemKind::drums;
+    if (has ("clav"))                                                                                      return StemKind::keys;
+    if (has ("gtr") || has ("guitar"))                                                                     return StemKind::guitar;
+    if (has ("vox") || has ("vocal") || has ("choir") || has ("bgv") || has ("sing") || has ("harmon"))     return StemKind::vocals;
+    if (has ("key") || has ("piano") || has ("rhodes") || has ("organ") || has ("wurli"))                  return StemKind::keys;
+    if (has ("synth") || has ("arp") || has ("lead"))                                                      return StemKind::synth;
+    if (has ("pad") || has ("atmos") || has ("ambien") || has ("drone") || has ("swell"))                  return StemKind::pads;
+    if (has ("string") || has ("violin") || has ("cello") || has ("orch"))                                 return StemKind::strings;
+    if (has ("brass") || has ("horn") || has ("trumpet") || has ("sax"))                                   return StemKind::brass;
+    return StemKind::other;
+}
+
+/** Line-art instrument glyphs, drawn in a unit square and scaled into `r`.
+    Drawn rather than bitmaps so they take any lane colour and stay sharp. */
+inline void drawStemIcon (juce::Graphics& g, StemKind kind, juce::Rectangle<float> r, juce::Colour c)
+{
+    const float s = (std::min) (r.getWidth(), r.getHeight());
+    if (s < 6.0f) return;
+    const auto box = r.withSizeKeepingCentre (s, s);
+    const auto xf = juce::AffineTransform::scale (s).translated (box.getX(), box.getY());
+    const juce::PathStrokeType stroke ((std::max) (1.4f, s * 0.075f), juce::PathStrokeType::curved, juce::PathStrokeType::rounded);
+    const float halfPi = juce::MathConstants<float>::halfPi;
+    const float twoPi  = juce::MathConstants<float>::twoPi;
+    juce::Path line, fill;
+
+    switch (kind)
+    {
+        case StemKind::drums:
+            line.addEllipse (0.14f, 0.34f, 0.72f, 0.22f);
+            line.startNewSubPath (0.14f, 0.45f); line.lineTo (0.14f, 0.74f);
+            line.startNewSubPath (0.86f, 0.45f); line.lineTo (0.86f, 0.74f);
+            line.addCentredArc (0.5f, 0.74f, 0.36f, 0.11f, 0.0f, halfPi, halfPi * 3.0f, true);
+            line.startNewSubPath (0.22f, 0.08f); line.lineTo (0.44f, 0.36f);
+            line.startNewSubPath (0.78f, 0.08f); line.lineTo (0.56f, 0.36f);
+            break;
+
+        case StemKind::bass:
+        case StemKind::guitar:
+        {
+            const bool bass = kind == StemKind::bass;
+            fill.addEllipse (0.08f, 0.52f, 0.38f, 0.38f);
+            fill.addEllipse (0.18f, 0.40f, 0.26f, 0.26f);
+            line.startNewSubPath (0.34f, 0.64f); line.lineTo (bass ? 0.88f : 0.80f, bass ? 0.10f : 0.18f);
+            fill.addEllipse (bass ? 0.83f : 0.75f, bass ? 0.04f : 0.12f, 0.12f, 0.12f);
+            break;
+        }
+
+        case StemKind::keys:
+            line.addRoundedRectangle (0.08f, 0.26f, 0.84f, 0.50f, 0.06f);
+            for (float x : { 0.29f, 0.50f, 0.71f }) { line.startNewSubPath (x, 0.52f); line.lineTo (x, 0.76f); }
+            for (float x : { 0.29f, 0.50f, 0.71f }) fill.addRectangle (x - 0.05f, 0.26f, 0.10f, 0.26f);
+            break;
+
+        case StemKind::synth:
+            line.addRoundedRectangle (0.08f, 0.44f, 0.84f, 0.40f, 0.06f);
+            for (float x : { 0.29f, 0.50f, 0.71f }) fill.addRectangle (x - 0.045f, 0.44f, 0.09f, 0.20f);
+            line.startNewSubPath (0.12f, 0.24f);
+            for (int i = 1; i <= 16; ++i)
+            {
+                const float t = (float) i / 16.0f;
+                line.lineTo (0.12f + 0.76f * t, 0.24f - 0.10f * std::sin (t * twoPi));
+            }
+            break;
+
+        case StemKind::vocals:
+            fill.addRoundedRectangle (0.36f, 0.06f, 0.28f, 0.46f, 0.14f);
+            line.addCentredArc (0.5f, 0.40f, 0.25f, 0.28f, 0.0f, halfPi, halfPi * 3.0f, true);
+            line.startNewSubPath (0.5f, 0.68f); line.lineTo (0.5f, 0.88f);
+            line.startNewSubPath (0.32f, 0.90f); line.lineTo (0.68f, 0.90f);
+            break;
+
+        case StemKind::click:
+            line.startNewSubPath (0.26f, 0.90f); line.lineTo (0.74f, 0.90f);
+            line.lineTo (0.60f, 0.10f); line.lineTo (0.40f, 0.10f); line.closeSubPath();
+            line.startNewSubPath (0.50f, 0.72f); line.lineTo (0.70f, 0.26f);
+            fill.addEllipse (0.62f, 0.34f, 0.12f, 0.12f);
+            break;
+
+        case StemKind::strings:
+            fill.addEllipse (0.26f, 0.36f, 0.48f, 0.52f);
+            line.startNewSubPath (0.5f, 0.06f); line.lineTo (0.5f, 0.94f);
+            line.startNewSubPath (0.14f, 0.30f); line.lineTo (0.86f, 0.62f);
+            break;
+
+        case StemKind::brass:
+            line.startNewSubPath (0.10f, 0.50f); line.lineTo (0.62f, 0.50f);
+            for (float x : { 0.24f, 0.36f, 0.48f }) { line.startNewSubPath (x, 0.36f); line.lineTo (x, 0.50f); }
+            fill.startNewSubPath (0.60f, 0.44f); fill.lineTo (0.92f, 0.22f);
+            fill.lineTo (0.92f, 0.78f); fill.lineTo (0.60f, 0.56f); fill.closeSubPath();
+            break;
+
+        case StemKind::pads:
+            for (int k = 0; k < 2; ++k)
+            {
+                const float y0 = 0.38f + 0.26f * (float) k;
+                line.startNewSubPath (0.08f, y0);
+                for (int i = 1; i <= 20; ++i)
+                {
+                    const float t = (float) i / 20.0f;
+                    line.lineTo (0.08f + 0.84f * t, y0 - 0.12f * std::sin (t * twoPi));
+                }
+            }
+            break;
+
+        case StemKind::other:
+        default:
+        {
+            const float hs[] = { 0.30f, 0.62f, 0.86f, 0.52f, 0.72f, 0.36f };
+            for (int i = 0; i < 6; ++i)
+            {
+                const float x = 0.14f + 0.144f * (float) i;
+                line.startNewSubPath (x, 0.5f - hs[i] * 0.42f);
+                line.lineTo (x, 0.5f + hs[i] * 0.42f);
+            }
+            break;
+        }
+    }
+
+    g.setColour (c);
+    if (! fill.isEmpty()) g.fillPath (fill, xf);
+    if (! line.isEmpty()) g.strokePath (line, stroke, xf);
+}
+
+/** A section's colour follows its name, so every Chorus in a set is the same
+    colour and a performer reads the structure before the words. Names that
+    mean nothing in particular fall back to the positional wheel. */
+inline juce::uint32 colourForSectionName (const std::string& raw, int fallbackIndex)
+{
+    const auto n = juce::String (juce::CharPointer_UTF8 (raw.c_str())).toLowerCase();
+    if (n.contains ("pre"))                                                   return 0xff4d7cff;
+    if (n.contains ("post"))                                                  return 0xffff6ec7;
+    if (n.contains ("chorus"))                                                return 0xffff2d95;
+    if (n.contains ("verse"))                                                 return 0xffa855f7;
+    if (n.contains ("intro"))                                                 return 0xff00d9ff;
+    if (n.contains ("bridge"))                                                return 0xffffa62b;
+    if (n.contains ("instr") || n.contains ("interlude") || n.contains ("break") || n.contains ("solo"))
+                                                                              return 0xff3dffc0;
+    if (n.contains ("tag") || n.contains ("vamp") || n.contains ("refrain"))  return 0xffb6ff2e;
+    if (n.contains ("outro") || n.contains ("ending"))                        return 0xffff5c3b;
+    return ezarr::defaultSectionColour (fallbackIndex);
+}
+
+//==============================================================================
+//  The timeline: ruler + section blocks + a header and waveform per track +
+//  playhead.
+//
+//  Lane header (left): icon, NAME, STEM/MUTED/SOLO, and S, M and the pencil.
+//  The pencil (or a click on the name) names the track from a preset list or
+//  by typing; the icon follows the name.
+//
+//  Waveforms are rendered once per lane into an image -- a mirrored peak
+//  body, a brighter RMS core and a soft glow -- and blitted every frame: the
+//  part already played at full strength, what is still to come dimmer, a
+//  muted lane faint. That is what makes them read as music rather than a
+//  barcode, and it is cheaper than before: two image draws per lane a frame
+//  instead of a thousand vertical lines.
+//
+//  Adding sections: "+ Section" (at the playhead), a double-click anywhere on
+//  the ruler or the waveforms, or right-click > Add section. Every route ends
+//  in the same one-click name list, and the colour follows the name.
 //==============================================================================
 class Timeline : public juce::Component, public juce::SettableTooltipClient
 {
@@ -151,28 +360,72 @@ public:
     explicit Timeline (PlaybackHost& h) : host (h) { setWantsKeyboardFocus (false); }
 
     std::function<void (int sectionIndex, juce::Point<int> screenPos)> onSectionMenu;
-    std::function<void (int bar)> onAddSectionAt;
+    std::function<void (int bar, juce::Point<int> screenPos)> onAddSectionAt;
+    std::function<void (int layer, juce::Point<int> screenPos)> onLaneMenu;
+
+    /** Same eight hues as the deck columns, so a lane and its column are
+        recognisably the same track. */
+    static juce::Colour laneColour (int layer)
+    {
+        static const juce::Colour cols[ezdeck::kNumLayers] = {
+            juce::Colour (0xff00d9ffu), juce::Colour (0xffa855f7u),
+            juce::Colour (0xffff2d95u), juce::Colour (0xffffa62bu),
+            juce::Colour (0xff3dffc0u), juce::Colour (0xff4d7cffu),
+            juce::Colour (0xffb6ff2eu), juce::Colour (0xffff5c3bu) };
+        return cols[(size_t) juce::jlimit (0, ezdeck::kNumLayers - 1, layer)];
+    }
 
     void rebuildPeaks()
     {
         const int song = host.currentSongIndex();
+        if (song != soloSong) { soloLane = -1; soloSong = -1; }
+
         for (int l = 0; l < ezdeck::kNumLayers; ++l)
         {
-            auto& p = peaks[(size_t) l];
-            p.assign (kPeakRes, 0.0f);
+            auto& pk = peaks[(size_t) l];
+            auto& rm = rms[(size_t) l];
+            pk.assign (kPeakRes, 0.0f);
+            rm.assign (kPeakRes, 0.0f);
+            laneImages[(size_t) l] = juce::Image();
+
             const auto* samples = song >= 0 ? host.layerSamples (song, l) : nullptr;
             hasAudio[(size_t) l] = samples != nullptr && ! samples->empty();
             if (! hasAudio[(size_t) l]) continue;
+
             const size_t n = samples->size();
+            float loudest = 0.0f;
             for (int b = 0; b < kPeakRes; ++b)
             {
                 const size_t s0 = (size_t) ((double) b / kPeakRes * (double) n);
-                const size_t s1 = (size_t) ((double) (b + 1) / kPeakRes * (double) n);
+                const size_t s1 = (std::max) (s0 + 1, (size_t) ((double) (b + 1) / kPeakRes * (double) n));
                 float mx = 0.0f;
-                for (size_t i = s0; i < s1 && i < n; ++i) mx = (std::max) (mx, std::fabs ((*samples)[i]));
-                p[(size_t) b] = mx;
+                double sq = 0.0;
+                size_t count = 0;
+                for (size_t i = s0; i < s1 && i < n; ++i)
+                {
+                    const float v = std::fabs ((*samples)[i]);
+                    mx = (std::max) (mx, v);
+                    sq += (double) v * (double) v;
+                    ++count;
+                }
+                pk[(size_t) b] = mx;
+                rm[(size_t) b] = count > 0 ? (float) std::sqrt (sq / (double) count) : 0.0f;
+                loudest = (std::max) (loudest, mx);
+            }
+
+            // A quiet stem (a pad at -18 dB) is scaled up to use its lane: the
+            // lane shows the SHAPE of the part; the mixer shows its level.
+            if (loudest > 0.0001f)
+            {
+                const float gain = 0.95f / loudest;
+                for (int b = 0; b < kPeakRes; ++b)
+                {
+                    pk[(size_t) b] *= gain;
+                    rm[(size_t) b] = (std::min) (pk[(size_t) b], rm[(size_t) b] * gain * 1.35f);
+                }
             }
         }
+
         // A layer earns a lane if it has audio, or if it is configured as
         // something that makes sound without a file -- a live input or a
         // hosted instrument. Layers 1-4 always keep a lane so the view
@@ -193,8 +446,8 @@ public:
 
         auto* arr = host.currentArrangement();
         const int song = host.currentSongIndex();
-        const int bars = song >= 0 ? (std::max) (1, host.songLengthBars (song)) : 0;
-        if (arr == nullptr || bars <= 0)
+        const auto geo = geometry();
+        if (arr == nullptr || geo.bars <= 0)
         {
             g.setColour (tokens::faint);
             g.setFont (juce::Font (juce::FontOptions (13.0f)));
@@ -202,90 +455,91 @@ public:
             return;
         }
 
-        const auto inner = r.reduced (12, 10);
-        const float pxPerBar = (float) inner.getWidth() / (float) bars;
-        const auto ruler = inner.withHeight (kRulerHeight);
-        const auto lanesArea = inner.withTrimmedTop (kRulerHeight + 6);
-        const int laneCount = (std::max) (1, (int) visibleLanes.size());
-        const int laneH = lanesArea.getHeight() / laneCount;
+        const auto xForBar = [&geo] (double b) { return (float) geo.ruler.getX() + (float) b * geo.pxPerBar; };
+
+        // ---- corner above the lane headers ----
+        g.setColour (tokens::faint);
+        g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)).withExtraKerningFactor (0.08f));
+        g.drawText ("SECTIONS", juce::Rectangle<int> (geo.inner.getX() + 8, geo.ruler.getY(), kHeaderW - 16, geo.ruler.getHeight()),
+                    juce::Justification::centredLeft);
 
         // ---- section blocks on the ruler ----
         const int current = host.currentSection();
         const int queued  = host.queuedSection();
+        if (arr->sections.empty())
+        {
+            g.setColour (tokens::card);
+            g.fillRoundedRectangle (geo.ruler.toFloat(), 6.0f);
+            g.setColour (tokens::dim);
+            g.setFont (juce::Font (juce::FontOptions (12.0f)));
+            g.drawText ("No sections yet. Press + Section, or double-click where a section starts.",
+                        geo.ruler.reduced (12, 0), juce::Justification::centredLeft, true);
+        }
         for (int i = 0; i < (int) arr->sections.size(); ++i)
         {
             const int b0 = arr->sectionStartBar (i), b1 = arr->sectionEndBar (i);
             if (b1 <= b0) continue;
-            auto block = juce::Rectangle<float> (inner.getX() + b0 * pxPerBar, (float) ruler.getY(),
-                                                 (b1 - b0) * pxPerBar, (float) ruler.getHeight()).reduced (1.0f, 0.0f);
-            auto col = sectionColour (*arr, i);
+            auto block = juce::Rectangle<float> (xForBar (b0), (float) geo.ruler.getY(),
+                                                 (float) (b1 - b0) * geo.pxPerBar, (float) geo.ruler.getHeight()).reduced (1.5f, 0.0f);
+            const auto col = sectionColour (*arr, i);
             const auto& s = arr->sections[(size_t) i];
             const bool dimmed = s.skip || s.optional;
-            g.setColour (col.withAlpha (i == current ? 0.95f : (dimmed ? 0.18f : 0.45f)));
-            g.fillRoundedRectangle (block, 5.0f);
+            const bool isCurrent = i == current;
+
+            if (isCurrent)
+            {
+                g.setColour (col.withAlpha (0.28f));
+                g.fillRoundedRectangle (block.expanded (2.0f, 2.0f), 7.0f);
+                g.setGradientFill (juce::ColourGradient (col.brighter (0.25f), 0.0f, block.getY(),
+                                                         col.darker (0.15f), 0.0f, block.getBottom(), false));
+                g.fillRoundedRectangle (block, 5.0f);
+            }
+            else
+            {
+                g.setColour (col.withAlpha (dimmed ? 0.10f : 0.22f));
+                g.fillRoundedRectangle (block, 5.0f);
+                g.setColour (col.withAlpha (dimmed ? 0.35f : 0.80f));
+                g.drawRoundedRectangle (block.reduced (0.5f), 5.0f, 1.0f);
+            }
             if (i == queued)
             {
                 g.setColour (tokens::queued);
                 g.drawRoundedRectangle (block, 5.0f, 2.0f);
             }
-            g.setColour (i == current ? juce::Colours::black.withAlpha (0.85f) : tokens::bright);
-            g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+
+            g.setColour (isCurrent ? juce::Colours::black.withAlpha (0.85f) : (dimmed ? tokens::faint : tokens::bright));
+            g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
             juce::String label = juce::String (s.name);
             if (s.loopOnEntry) label += " \xe2\x9f\xb3";
             if (s.pauseAfter)  label += " \xe2\x8f\xb8";
             if (s.optional)    label += " (opt)";
             g.drawFittedText (juce::String (juce::CharPointer_UTF8 (label.toRawUTF8())),
-                              block.reduced (6.0f, 0.0f).toNearestInt(), juce::Justification::centredLeft, 1);
-        }
-
-        // ---- bar grid across the lanes ----
-        g.setColour (tokens::border.withAlpha (0.5f));
-        const int every = pxPerBar >= 28.0f ? 1 : pxPerBar >= 12.0f ? 2 : 4;
-        for (int b = 0; b <= bars; b += every)
-        {
-            const float x = inner.getX() + b * pxPerBar;
-            g.drawVerticalLine ((int) x, (float) lanesArea.getY(), (float) lanesArea.getBottom());
-            if (pxPerBar >= 18.0f)
-            {
-                g.setColour (tokens::faint);
-                g.setFont (juce::Font (juce::FontOptions (9.0f)));
-                g.drawText (juce::String (b + 1), (int) x + 3, ruler.getBottom() - 2, 30, 10, juce::Justification::left);
-                g.setColour (tokens::border.withAlpha (0.5f));
-            }
+                              block.reduced (8.0f, 0.0f).toNearestInt(), juce::Justification::centredLeft, 1);
         }
 
         // ---- lanes ----
-        // Same eight hues as the deck columns, so a lane and its column
-        // are recognisably the same layer.
-        static const juce::Colour laneCols[ezdeck::kNumLayers] = {
-            juce::Colour (0xff00d9ffu), juce::Colour (0xffa855f7u),
-            juce::Colour (0xffff2d95u), juce::Colour (0xffffa62bu),
-            juce::Colour (0xff3dffc0u), juce::Colour (0xff4d7cffu),
-            juce::Colour (0xffb6ff2eu), juce::Colour (0xffff5c3bu) };
-        for (int slotIdx = 0; slotIdx < (int) visibleLanes.size(); ++slotIdx)
+        const float playX = xForBar (host.currentBar());
+        for (int slot = 0; slot < (int) visibleLanes.size(); ++slot)
         {
-            const int l = visibleLanes[(size_t) slotIdx];
-            auto lane = juce::Rectangle<int> (lanesArea.getX(), lanesArea.getY() + slotIdx * laneH, lanesArea.getWidth(), laneH).reduced (0, 3);
-            const bool on = host.layerEnabled (song, l);
-            g.setColour (tokens::card.withAlpha (0.5f));
-            g.fillRoundedRectangle (lane.toFloat(), 4.0f);
+            const int l = visibleLanes[(size_t) slot];
+            const auto row = laneRow (slot, geo);
+            drawLaneHeader (g, headerRect (row), song, l);
+            drawLaneWave (g, waveRect (row, geo), song, l, playX);
+        }
 
-            if (hasAudio[(size_t) l])
+        // ---- bar numbers and grid ----
+        const int every = geo.pxPerBar >= 28.0f ? 1 : geo.pxPerBar >= 12.0f ? 2 : geo.pxPerBar >= 6.0f ? 4 : 8;
+        g.setFont (juce::Font (juce::FontOptions (9.5f)));
+        for (int b = 0; b <= geo.bars; b += every)
+        {
+            const float x = xForBar (b);
+            if (b < geo.bars)
             {
-                const float mid = (float) lane.getCentreY();
-                const float half = (float) lane.getHeight() * 0.46f;
-                g.setColour (laneCols[l].withAlpha (on ? 0.9f : 0.22f));
-                const int w = lane.getWidth();
-                for (int x = 0; x < w; ++x)
-                {
-                    const int b = juce::jlimit (0, kPeakRes - 1, (int) ((double) x / w * kPeakRes));
-                    const float h = peaks[(size_t) l][(size_t) b] * half;
-                    if (h > 0.5f) g.drawVerticalLine (lane.getX() + x, mid - h, mid + h);
-                }
+                g.setColour (tokens::faint);
+                g.drawText (juce::String (b + 1), (int) x + 3, geo.barRow.getY(), 34, geo.barRow.getHeight(), juce::Justification::centredLeft);
             }
-            g.setColour (on ? tokens::bright : tokens::faint);
-            g.setFont (juce::Font (juce::FontOptions (10.5f, juce::Font::bold)));
-            g.drawText (host.layerName (song, l), lane.reduced (6, 0), juce::Justification::topLeft, true);
+            g.setColour (tokens::bright.withAlpha (b % 4 == 0 ? 0.10f : 0.05f));
+            g.fillRect (juce::Rectangle<float> (x, (float) geo.lanes.getY(), 1.0f, (float) geo.lanes.getHeight()));
         }
 
         // ---- loop shading ----
@@ -293,25 +547,71 @@ public:
         {
             const int b0 = arr->sectionStartBar (current), b1 = arr->sectionEndBar (current);
             g.setColour (tokens::queued.withAlpha (0.10f));
-            g.fillRect (juce::Rectangle<float> (inner.getX() + b0 * pxPerBar, (float) lanesArea.getY(), (b1 - b0) * pxPerBar, (float) lanesArea.getHeight()));
+            g.fillRect (juce::Rectangle<float> (xForBar (b0), (float) geo.lanes.getY(), (float) (b1 - b0) * geo.pxPerBar, (float) geo.lanes.getHeight()));
+        }
+
+        // ---- where a new section would go ----
+        if (hoverBar >= 0 && draggingBoundary < 0)
+        {
+            const float x = xForBar (hoverBar);
+            g.setColour (tokens::bright.withAlpha (0.35f));
+            g.fillRect (juce::Rectangle<float> (x - 0.5f, (float) geo.ruler.getY(), 1.0f, (float) (geo.lanes.getBottom() - geo.ruler.getY())));
+            const auto plus = juce::Rectangle<float> (x - 7.0f, (float) geo.barRow.getY() - 1.0f, 14.0f, 14.0f);
+            g.setColour (tokens::indigo);
+            g.fillEllipse (plus);
+            g.setColour (tokens::bright);
+            g.fillRect (plus.withSizeKeepingCentre (7.0f, 1.6f));
+            g.fillRect (plus.withSizeKeepingCentre (1.6f, 7.0f));
         }
 
         // ---- playhead ----
-        const double bar = host.currentBar();
-        const float px = inner.getX() + (float) bar * pxPerBar;
+        g.setColour (tokens::play.withAlpha (0.18f));
+        g.fillRect (juce::Rectangle<float> (playX - 3.0f, (float) geo.ruler.getY(), 6.0f, (float) (geo.lanes.getBottom() - geo.ruler.getY())));
         g.setColour (tokens::play);
-        g.fillRect (juce::Rectangle<float> (px - 1.0f, (float) ruler.getY(), 2.0f, (float) (lanesArea.getBottom() - ruler.getY())));
+        g.fillRect (juce::Rectangle<float> (playX - 1.0f, (float) geo.ruler.getY(), 2.0f, (float) (geo.lanes.getBottom() - geo.ruler.getY())));
         juce::Path tri;
-        tri.addTriangle (px - 6.0f, (float) ruler.getY() - 1.0f, px + 6.0f, (float) ruler.getY() - 1.0f, px, (float) ruler.getY() + 6.0f);
+        tri.addTriangle (playX - 6.0f, (float) geo.ruler.getY() - 1.0f, playX + 6.0f, (float) geo.ruler.getY() - 1.0f,
+                         playX, (float) geo.ruler.getY() + 6.0f);
         g.fillPath (tri);
 
         // ---- drag feedback ----
         if (draggingBoundary >= 0)
         {
             g.setColour (tokens::bright.withAlpha (0.8f));
-            const float x = inner.getX() + (float) dragBar * pxPerBar;
-            g.drawVerticalLine ((int) x, (float) ruler.getY(), (float) lanesArea.getBottom());
+            const float x = xForBar (dragBar);
+            g.fillRect (juce::Rectangle<float> (x - 0.5f, (float) geo.ruler.getY(), 1.0f, (float) (geo.lanes.getBottom() - geo.ruler.getY())));
         }
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const auto geo = geometry();
+        int hb = -1;
+        juce::String tip;
+
+        if (geo.bars > 0 && e.x >= geo.ruler.getX() && e.y >= geo.ruler.getY() && e.y < geo.lanes.getBottom())
+        {
+            hb = barAt (e.x, geo);
+            tip = e.y < geo.barRow.getBottom()
+                ? "Click a section to jump to it. Drag its left edge to move it. Double-click to add a section at bar " + juce::String (hb + 1) + "."
+                : "Click to move the playhead. Double-click to add a section at bar " + juce::String (hb + 1) + ".";
+        }
+        else if (const int slot = laneSlotAt (e.y, geo); slot >= 0 && e.x < geo.ruler.getX())
+        {
+            const auto L = headerLayout (headerRect (laneRow (slot, geo)));
+            const auto p = e.getPosition();
+            tip = L.solo.contains (p) ? "Solo this track"
+                : L.mute.contains (p) ? "Mute this track"
+                                      : "Name this track (the icon follows the name)";
+        }
+
+        if (tip != getTooltip()) setTooltip (tip);
+        if (hb != hoverBar) { hoverBar = hb; repaint(); }
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        if (hoverBar != -1) { hoverBar = -1; repaint(); }
     }
 
     void mouseDown (const juce::MouseEvent& e) override
@@ -320,67 +620,139 @@ public:
         if (arr == nullptr) return;
         const auto geo = geometry();
         if (geo.bars <= 0) return;
+        const int song = host.currentSongIndex();
+        const auto pos = e.getPosition();
+
+        // ---- lane headers ----
+        if (e.x < geo.ruler.getX())
+        {
+            const int slot = laneSlotAt (e.y, geo);
+            if (slot < 0 || song < 0) return;
+            const int l = visibleLanes[(size_t) slot];
+            const auto L = headerLayout (headerRect (laneRow (slot, geo)));
+            if (! e.mods.isPopupMenu() && L.solo.contains (pos)) { toggleSolo (song, l); return; }
+            if (! e.mods.isPopupMenu() && L.mute.contains (pos)) { host.toggleLayer (song, l); repaint(); return; }
+            if (onLaneMenu) onLaneMenu (l, e.getScreenPosition());
+            return;
+        }
 
         const int bar = barAt (e.x, geo);
+        const int s = arr->sectionAtBar (bar);
 
         if (e.mods.isPopupMenu())
         {
-            const int s = arr->sectionAtBar (bar);
-            if (s >= 0 && onSectionMenu) onSectionMenu (s, e.getScreenPosition());
+            openContextMenu (e.y < geo.ruler.getBottom(), bar, s, e.getScreenPosition());
             return;
         }
 
-        if (e.y < geo.ruler.getBottom())
+        // Touch: a hold anywhere on the timeline opens the same menu as a
+        // right-click. So that a hold never jumps the song first, jumping and
+        // seeking happen when the finger LIFTS, not when it lands.
+        pendingJump = -1;
+        pendingSeekBar = -1;
+        const bool onRuler = e.y < geo.ruler.getBottom();
+        touchHold.onLongPress = [this, onRuler, bar, s] (juce::Point<int> screen)
         {
-            // near a boundary? grab it for dragging
+            pendingJump = -1;
+            pendingSeekBar = -1;
+            draggingBoundary = -1;
+            repaint();
+            openContextMenu (onRuler, bar, s, screen);
+        };
+        touchHold.begin (e);
+
+        if (e.y < geo.barRow.getBottom())
+        {
+            // near a boundary? grab it for dragging (a finger is wider than a cursor)
             for (int i = 1; i < (int) arr->sections.size(); ++i)
             {
-                const float x = geo.inner.getX() + arr->sectionStartBar (i) * geo.pxPerBar;
-                if (std::abs ((float) e.x - x) <= 6.0f) { draggingBoundary = i; dragBar = arr->sectionStartBar (i); return; }
+                const float x = (float) geo.ruler.getX() + (float) arr->sectionStartBar (i) * geo.pxPerBar;
+                if (std::abs ((float) e.x - x) <= 10.0f) { draggingBoundary = i; dragBar = arr->sectionStartBar (i); return; }
             }
-            // otherwise a click on a block queues a jump to it
-            const int s = arr->sectionAtBar (bar);
-            if (s >= 0) host.jumpToSection (s);
+            // otherwise a tap on a block queues a jump to it, on release
+            if (s >= 0 && e.getNumberOfClicks() == 1) pendingJump = s;
             return;
         }
 
-        // lanes: click to seek (quantised by the host), click the name to mute
-        const int song = host.currentSongIndex();
-        const int lane = juce::jlimit (0, 3, (e.y - geo.lanes.getY()) / (std::max) (1, geo.lanes.getHeight() / 4));
-        if (e.x < geo.inner.getX() + 70 && song >= 0) host.toggleLayer (song, lane);
-        else host.seekToBar ((double) bar);
+        pendingSeekBar = bar;
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
+        touchHold.drag (e);
         if (draggingBoundary < 0) return;
         const auto geo = geometry();
         dragBar = barAt (e.x, geo);
         repaint();
     }
 
-    void mouseUp (const juce::MouseEvent&) override
+    void mouseUp (const juce::MouseEvent& e) override
     {
+        const bool wasHold = touchHold.end();
+        if (! wasHold && ! e.mods.isPopupMenu() && ! e.mouseWasDraggedSinceMouseDown())
+        {
+            if (pendingJump >= 0)    host.jumpToSection (pendingJump);
+            if (pendingSeekBar >= 0) host.seekToBar ((double) pendingSeekBar);
+        }
+        pendingJump = -1;
+        pendingSeekBar = -1;
+
         if (draggingBoundary < 0) return;
-        if (auto* arr = host.currentArrangement())
-            if (arr->moveSection (draggingBoundary, dragBar))
-                host.arrangementEdited();
+        if (! wasHold)
+            if (auto* arr = host.currentArrangement())
+                if (arr->moveSection (draggingBoundary, dragBar))
+                    host.arrangementEdited();
         draggingBoundary = -1;
         repaint();
+    }
+
+    /** The one context menu of the timeline, from right-click or a hold:
+        a section's own menu on the ruler, "add a section here" on the lanes. */
+    void openContextMenu (bool onRuler, int bar, int s, juce::Point<int> screen)
+    {
+        auto* arr = host.currentArrangement();
+        if (arr == nullptr) return;
+        if (onRuler && s >= 0)
+        {
+            if (onSectionMenu) onSectionMenu (s, screen);
+            return;
+        }
+        juce::PopupMenu m;
+        m.addItem (1, "Add section at bar " + juce::String (bar + 1));
+        if (s >= 0 && s < (int) arr->sections.size())
+            m.addItem (2, "Edit section \"" + juce::String (juce::CharPointer_UTF8 (arr->sections[(size_t) s].name.c_str())) + "\"");
+        m.addItem (3, "Move playhead to bar " + juce::String (bar + 1));
+        juce::Component::SafePointer<Timeline> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (screen.x, screen.y, 1, 1)),
+                         [safe, bar, s, screen] (int r)
+        {
+            if (safe == nullptr) return;
+            if (r == 1 && safe->onAddSectionAt) safe->onAddSectionAt (bar, screen);
+            if (r == 2 && safe->onSectionMenu)  safe->onSectionMenu (s, screen);
+            if (r == 3) safe->host.seekToBar ((double) bar);
+        });
     }
 
     void mouseDoubleClick (const juce::MouseEvent& e) override
     {
         const auto geo = geometry();
-        if (geo.bars <= 0 || e.y >= geo.ruler.getBottom()) return;
-        if (onAddSectionAt) onAddSectionAt (barAt (e.x, geo));
+        if (geo.bars <= 0 || e.x < geo.ruler.getX() || e.y < geo.ruler.getY() || e.y >= geo.lanes.getBottom()) return;
+        if (onAddSectionAt) onAddSectionAt (barAt (e.x, geo), e.getScreenPosition());
+    }
+
+    void resized() override
+    {
+        for (auto& img : laneImages) img = juce::Image();
     }
 
 private:
-    static constexpr int kRulerHeight = 26;
-    static constexpr int kPeakRes = 1024;
+    static constexpr int kRulerHeight   = 30;
+    static constexpr int kBarRowHeight  = 14;
+    static constexpr int kHeaderW       = 176;
+    static constexpr int kPeakRes       = 2048;
 
-    struct Geo { juce::Rectangle<int> inner, ruler, lanes; int bars { 0 }; float pxPerBar { 0 }; };
+    struct Geo { juce::Rectangle<int> inner, ruler, barRow, lanes; int bars { 0 }; float pxPerBar { 0 }; };
+    struct HeaderLayout { juce::Rectangle<int> icon, name, sub, solo, mute, edit; };
 
     Geo geometry() const
     {
@@ -388,27 +760,274 @@ private:
         const int song = host.currentSongIndex();
         g.bars = song >= 0 ? (std::max) (1, host.songLengthBars (song)) : 0;
         g.inner = getLocalBounds().reduced (12, 10);
-        g.ruler = g.inner.withHeight (kRulerHeight);
-        g.lanes = g.inner.withTrimmedTop (kRulerHeight + 6);
-        g.pxPerBar = g.bars > 0 ? (float) g.inner.getWidth() / (float) g.bars : 0.0f;
+        const auto content = g.inner.withTrimmedLeft (kHeaderW);
+        g.ruler  = content.withHeight (kRulerHeight);
+        g.barRow = content.withTrimmedTop (kRulerHeight).withHeight (kBarRowHeight);
+        g.lanes  = g.inner.withTrimmedTop (kRulerHeight + kBarRowHeight + 2);
+        g.pxPerBar = g.bars > 0 ? (float) content.getWidth() / (float) g.bars : 0.0f;
         return g;
     }
 
     int barAt (int x, const Geo& g) const
     {
         if (g.pxPerBar <= 0.0f) return 0;
-        return juce::jlimit (0, (std::max) (0, g.bars - 1), (int) std::floor ((float) (x - g.inner.getX()) / g.pxPerBar));
+        return juce::jlimit (0, (std::max) (0, g.bars - 1), (int) std::floor ((float) (x - g.ruler.getX()) / g.pxPerBar));
+    }
+
+    int laneSlotAt (int y, const Geo& g) const
+    {
+        const int count = (int) visibleLanes.size();
+        if (count <= 0 || y < g.lanes.getY() || y >= g.lanes.getBottom()) return -1;
+        const int laneH = (std::max) (1, g.lanes.getHeight() / count);
+        const int slot = (y - g.lanes.getY()) / laneH;
+        return slot < count ? slot : -1;
+    }
+
+    juce::Rectangle<int> laneRow (int slot, const Geo& g) const
+    {
+        const int count = (std::max) (1, (int) visibleLanes.size());
+        const int laneH = g.lanes.getHeight() / count;
+        return juce::Rectangle<int> (g.inner.getX(), g.lanes.getY() + slot * laneH, g.inner.getWidth(), laneH).reduced (0, 3);
+    }
+
+    static juce::Rectangle<int> headerRect (juce::Rectangle<int> row)             { return row.withWidth (kHeaderW - 8); }
+    static juce::Rectangle<int> waveRect (juce::Rectangle<int> row, const Geo& g) { return row.withLeft (g.ruler.getX()); }
+
+    /** Tall lanes (four tracks) stack S / M / pencil like the reference; short
+        ones (eight tracks) put S and M side by side and the name opens the
+        naming menu, so every control stays big enough to hit. */
+    static HeaderLayout headerLayout (juce::Rectangle<int> box)
+    {
+        HeaderLayout L;
+        auto b = box.reduced (8, 4).withTrimmedLeft (2);
+        const int bw = 22;
+        if (b.getHeight() >= 66)
+        {
+            auto stack = b.removeFromRight (bw).withSizeKeepingCentre (bw, 18 * 3 + 6);
+            L.solo = stack.removeFromTop (18); stack.removeFromTop (3);
+            L.mute = stack.removeFromTop (18); stack.removeFromTop (3);
+            L.edit = stack.removeFromTop (18);
+        }
+        else
+        {
+            const int bh = (std::min) (18, b.getHeight());
+            auto row = b.removeFromRight (bw * 2 + 3).withSizeKeepingCentre (bw * 2 + 3, bh);
+            L.solo = row.removeFromLeft (bw); row.removeFromLeft (3);
+            L.mute = row;
+        }
+        b.removeFromRight (6);
+        const int iconSize = juce::jlimit (14, 34, b.getHeight() - 8);
+        L.icon = b.removeFromLeft (iconSize).withSizeKeepingCentre (iconSize, iconSize);
+        b.removeFromLeft (10);
+        auto text = b.withSizeKeepingCentre (b.getWidth(), (std::min) (b.getHeight(), 32));
+        L.name = text.removeFromTop (text.getHeight() * 11 / 20);
+        L.sub  = text;
+        return L;
+    }
+
+    void drawLaneHeader (juce::Graphics& g, juce::Rectangle<int> box, int song, int l) const
+    {
+        const auto col = laneColour (l);
+        const bool on = host.layerEnabled (song, l);
+        const bool solo = soloLane == l && soloSong == song;
+        const bool live = ! hasAudio[(size_t) l] && host.layerIsLive (song, l);
+        const auto name = host.layerName (song, l);
+
+        g.setColour (tokens::card.withAlpha (0.9f));
+        g.fillRoundedRectangle (box.toFloat(), 8.0f);
+        g.setColour (col.withAlpha (on ? 0.95f : 0.30f));
+        g.fillRoundedRectangle (box.toFloat().removeFromLeft (3.0f).reduced (0.0f, 6.0f), 1.5f);
+
+        const auto L = headerLayout (box);
+        drawStemIcon (g, stemKindFor (name), L.icon.toFloat(), on ? col : tokens::faint);
+
+        g.setColour (on ? col.brighter (0.2f) : tokens::faint);
+        g.setFont (juce::Font (juce::FontOptions (juce::jlimit (10.0f, 13.0f, (float) L.name.getHeight() * 0.8f), juce::Font::bold))
+                       .withExtraKerningFactor (0.03f));
+        g.drawFittedText (name.toUpperCase(), L.name, juce::Justification::bottomLeft, 1, 0.8f);
+
+        g.setColour (solo ? tokens::queued : (on ? tokens::dim : tokens::danger.withAlpha (0.85f)));
+        g.setFont (juce::Font (juce::FontOptions (9.5f, juce::Font::bold)).withExtraKerningFactor (0.08f));
+        g.drawText (solo ? "SOLO" : (! on ? "MUTED" : (live ? "LIVE" : "STEM")), L.sub, juce::Justification::topLeft, true);
+
+        drawMiniButton (g, L.solo, "S", solo, tokens::queued);
+        drawMiniButton (g, L.mute, "M", ! on, tokens::danger);
+        if (! L.edit.isEmpty()) drawPencil (g, L.edit, tokens::dim);
+    }
+
+    static void drawMiniButton (juce::Graphics& g, juce::Rectangle<int> rect, const char* text, bool active, juce::Colour activeColour)
+    {
+        if (rect.isEmpty()) return;
+        const auto f = rect.toFloat();
+        g.setColour (active ? activeColour : tokens::shell);
+        g.fillRoundedRectangle (f, 4.0f);
+        g.setColour (active ? activeColour.brighter (0.3f) : tokens::border);
+        g.drawRoundedRectangle (f.reduced (0.5f), 4.0f, 1.0f);
+        g.setColour (active ? juce::Colours::black.withAlpha (0.85f) : tokens::dim);
+        g.setFont (juce::Font (juce::FontOptions (10.5f, juce::Font::bold)));
+        g.drawText (text, rect, juce::Justification::centred);
+    }
+
+    static void drawPencil (juce::Graphics& g, juce::Rectangle<int> rect, juce::Colour c)
+    {
+        const auto f = rect.toFloat().reduced (3.5f);
+        juce::Path p;
+        p.startNewSubPath (f.getX() + f.getWidth() * 0.22f, f.getBottom() - f.getHeight() * 0.22f);
+        p.lineTo (f.getRight() - f.getWidth() * 0.12f, f.getY() + f.getHeight() * 0.12f);
+        g.setColour (c);
+        g.strokePath (p, juce::PathStrokeType (2.4f, juce::PathStrokeType::curved, juce::PathStrokeType::butt));
+        juce::Path tip;
+        tip.addTriangle (f.getX(), f.getBottom(),
+                         f.getX() + f.getWidth() * 0.30f, f.getBottom() - f.getHeight() * 0.06f,
+                         f.getX() + f.getWidth() * 0.06f, f.getBottom() - f.getHeight() * 0.30f);
+        g.fillPath (tip);
+    }
+
+    void drawLaneWave (juce::Graphics& g, juce::Rectangle<int> box, int song, int l, float playX)
+    {
+        const auto col = laneColour (l);
+        const bool on = host.layerEnabled (song, l);
+        g.setColour (juce::Colour (0xff0b0b18u));
+        g.fillRoundedRectangle (box.toFloat(), 6.0f);
+        if (box.getWidth() < 4 || box.getHeight() < 6) return;
+
+        if (! hasAudio[(size_t) l])
+        {
+            g.setColour (tokens::border.withAlpha (0.6f));
+            g.fillRect (juce::Rectangle<float> ((float) box.getX() + 8.0f, (float) box.getCentreY(), (float) box.getWidth() - 16.0f, 1.0f));
+            g.setColour (tokens::faint);
+            g.setFont (juce::Font (juce::FontOptions (10.5f)));
+            g.drawText (host.layerIsLive (song, l) ? "Live -- plays from its input or your MIDI keyboard" : "No audio on this track",
+                        box.reduced (10, 0), juce::Justification::centredLeft, true);
+            return;
+        }
+
+        auto& img = laneImages[(size_t) l];
+        if (! img.isValid() || img.getWidth() != box.getWidth() || img.getHeight() != box.getHeight())
+            img = renderWave (l, box.getWidth(), box.getHeight(), col);
+
+        const int split = juce::jlimit (box.getX(), box.getRight(), juce::roundToInt (playX));
+        {
+            juce::Graphics::ScopedSaveState state (g);
+            g.reduceClipRegion (box.withRight (split));
+            g.setOpacity (on ? 1.0f : 0.20f);
+            g.drawImageAt (img, box.getX(), box.getY());
+        }
+        {
+            juce::Graphics::ScopedSaveState state (g);
+            g.reduceClipRegion (box.withLeft (split));
+            g.setOpacity (on ? 0.55f : 0.14f);
+            g.drawImageAt (img, box.getX(), box.getY());
+        }
+
+        if (box.getHeight() >= 40)
+        {
+            const auto file = host.layerFileName (song, l);
+            if (file.isNotEmpty() && file.compareIgnoreCase (host.layerName (song, l)) != 0)
+            {
+                g.setColour (tokens::bright.withAlpha (on ? 0.70f : 0.35f));
+                g.setFont (juce::Font (juce::FontOptions (10.0f)));
+                g.drawText (file, box.reduced (8, 4).removeFromTop (12), juce::Justification::centredLeft, true);
+            }
+        }
+    }
+
+    juce::Image renderWave (int l, int w, int h, juce::Colour col) const
+    {
+        w = (std::max) (1, w);
+        h = (std::max) (1, h);
+        juce::Image img (juce::Image::ARGB, w, h, true);
+        juce::Graphics g (img);
+
+        const float mid  = (float) h * 0.5f;
+        const float half = (float) h * 0.42f;
+        const auto& pk = peaks[(size_t) l];
+        const auto& rm = rms[(size_t) l];
+
+        auto at = [w] (const std::vector<float>& v, int x)
+        {
+            const int b0 = juce::jlimit (0, kPeakRes - 1, (int) ((double) x / w * kPeakRes));
+            const int b1 = juce::jlimit (b0 + 1, kPeakRes, (int) ((double) (x + 1) / w * kPeakRes));
+            float m = 0.0f;
+            for (int b = b0; b < b1; ++b) m = (std::max) (m, v[(size_t) b]);
+            return m;
+        };
+
+        std::vector<float> body ((size_t) w), core ((size_t) w);
+        for (int x = 0; x < w; ++x)
+        {
+            body[(size_t) x] = (std::min) (1.0f, at (pk, x)) * half;
+            core[(size_t) x] = (std::min) (1.0f, at (rm, x)) * half;
+        }
+
+        auto outline = [w, mid] (const std::vector<float>& t)
+        {
+            juce::Path p;
+            p.startNewSubPath (0.0f, mid - t[0]);
+            for (int x = 1; x < w; ++x) p.lineTo ((float) x, mid - t[(size_t) x]);
+            for (int x = w - 1; x >= 0; --x) p.lineTo ((float) x, mid + t[(size_t) x]);
+            p.closeSubPath();
+            return p;
+        };
+        const auto bodyPath = outline (body);
+        const auto corePath = outline (core);
+
+        g.setColour (col.withAlpha (0.16f));
+        g.strokePath (bodyPath, juce::PathStrokeType (3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+        juce::ColourGradient grad (col.withAlpha (0.35f), 0.0f, mid - half, col.withAlpha (0.35f), 0.0f, mid + half, false);
+        grad.addColour (0.5, col.withAlpha (0.80f));
+        g.setGradientFill (grad);
+        g.fillPath (bodyPath);
+
+        g.setColour (col.brighter (0.45f).withAlpha (0.95f));
+        g.fillPath (corePath);
+
+        g.setColour (col.withAlpha (0.45f));
+        g.fillRect (0.0f, mid - 0.5f, (float) w, 1.0f);
+        return img;
+    }
+
+    void toggleSolo (int song, int l)
+    {
+        auto setEnabled = [this, song] (int layer, bool on)
+        {
+            if (host.layerEnabled (song, layer) != on) host.toggleLayer (song, layer);
+        };
+        if (soloSong == song && soloLane == l)
+        {
+            for (int i = 0; i < ezdeck::kNumLayers; ++i) setEnabled (i, preSolo[(size_t) i]);
+            soloLane = soloSong = -1;
+        }
+        else
+        {
+            if (soloSong != song || soloLane < 0)
+                for (int i = 0; i < ezdeck::kNumLayers; ++i) preSolo[(size_t) i] = host.layerEnabled (song, i);
+            for (int i = 0; i < ezdeck::kNumLayers; ++i) setEnabled (i, i == l);
+            soloLane = l;
+            soloSong = song;
+        }
+        repaint();
     }
 
     PlaybackHost& host;
-    std::array<std::vector<float>, ezdeck::kNumLayers> peaks;
+    std::array<std::vector<float>, ezdeck::kNumLayers> peaks, rms;
     std::array<bool, ezdeck::kNumLayers> hasAudio {};
+    std::array<juce::Image, ezdeck::kNumLayers> laneImages;
     // PX-B: the lanes actually drawn, in order. A song with four stems
     // still looks like a four-stem song -- an empty layer is not given a
     // lane, because a row of blank lanes on a music stand is noise.
     std::vector<int> visibleLanes;
     int draggingBoundary { -1 };
     int dragBar { 0 };
+    int hoverBar { -1 };
+    eztouch::LongPress touchHold;
+    int pendingJump { -1 };       // a tap on a section block jumps on release
+    int pendingSeekBar { -1 };    // a tap on the lanes seeks on release
+    // Solo is the view's own: it remembers which tracks were on, turns the
+    // others off, and puts them back exactly as they were when released.
+    int soloLane { -1 }, soloSong { -1 };
+    std::array<bool, ezdeck::kNumLayers> preSolo {};
 };
 
 //==============================================================================
@@ -426,6 +1045,7 @@ public:
 
         list.setModel (this);
         list.setRowHeight (48);
+        list.addMouseListener (this, true);   // touch: taps and holds on rows, see mouseDown/mouseUp below
         list.setColour (juce::ListBox::backgroundColourId, juce::Colours::transparentBlack);
         addAndMakeVisible (list);
 
@@ -519,19 +1139,62 @@ private:
 
     void listBoxItemClicked (int row, const juce::MouseEvent& e) override
     {
-        if (e.mods.isPopupMenu())
+        // Selecting a song switches the music, so it happens on RELEASE (see
+        // mouseUp): JUCE calls this on press, and a hold for the row menu
+        // must never change the song first.
+        if (e.mods.isPopupMenu()) showRowMenu (row, e.getScreenPosition());
+    }
+
+    void showRowMenu (int row, juce::Point<int> screen)
+    {
+        if (row < 0 || row >= host.numSongs()) return;
+        juce::PopupMenu m;
+        m.addSectionHeader (host.songName (row));
+        m.addItem (1, "Rename...");
+        m.addItem (3, "Move up", row > 0);
+        m.addItem (4, "Move down", row + 1 < host.numSongs());
+        m.addSeparator();
+        m.addItem (2, "Remove from setlist");
+        juce::Component::SafePointer<SetlistPanel> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (screen.x, screen.y, 1, 1)),
+                         [safe, row] (int r)
         {
-            juce::PopupMenu m;
-            m.addItem (1, "Rename...");
-            m.addItem (2, "Remove from setlist");
-            m.showMenuAsync (juce::PopupMenu::Options(), [this, row] (int r)
-            {
-                if (r == 1) host.renameSong (row);
-                if (r == 2) host.removeSong (row);
-            });
-            return;
-        }
-        host.selectSong (row);
+            if (safe == nullptr) return;
+            if (r == 1) safe->host.renameSong (row);
+            if (r == 2) safe->host.removeSong (row);
+            if (r == 3) { safe->host.moveSong (row, row - 1); safe->list.selectRow (row - 1); }
+            if (r == 4) { safe->host.moveSong (row, row + 1); safe->list.selectRow (row + 1); }
+        });
+    }
+
+    int rowAt (const juce::MouseEvent& e)
+    {
+        const auto p = e.getEventRelativeTo (&list).getPosition();
+        return list.getRowContainingPosition (p.x, p.y);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.eventComponent == this || e.mods.isPopupMenu()) return;
+        pressedRow = rowAt (e);
+        if (pressedRow < 0) return;
+        rowHold.onLongPress = [this, row = pressedRow] (juce::Point<int> screen) { showRowMenu (row, screen); };
+        rowHold.begin (e);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (e.eventComponent != this) rowHold.drag (e);
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (e.eventComponent == this || e.mods.isPopupMenu()) return;
+        const bool wasHold = rowHold.end();
+        const int row = rowAt (e);
+        if (! wasHold && row >= 0 && row == pressedRow && ! e.mouseWasDraggedSinceMouseDown())
+            host.selectSong (row);
+        pressedRow = -1;
     }
 
     void listBoxItemDoubleClicked (int row, const juce::MouseEvent&) override
@@ -544,6 +1207,8 @@ private:
     juce::Label title, totalLabel;
     juce::ListBox list;
     juce::TextButton addButton, removeButton, upButton, downButton;
+    eztouch::LongPress rowHold;
+    int pressedRow { -1 };
 };
 
 //==============================================================================
@@ -558,7 +1223,8 @@ public:
         addAndMakeVisible (timeline);
 
         timeline.onSectionMenu  = [this] (int s, juce::Point<int> p) { showSectionMenu (s, p); };
-        timeline.onAddSectionAt = [this] (int bar) { addSectionAt (bar); };
+        timeline.onAddSectionAt = [this] (int bar, juce::Point<int> p) { addSectionAt (bar, p); };
+        timeline.onLaneMenu     = [this] (int layer, juce::Point<int> p) { showLaneMenu (layer, p); };
 
         auto mk = [this] (juce::TextButton& b, const char* text, std::function<void()> fn)
         {
@@ -576,6 +1242,12 @@ public:
         mk (jumpNowButton,     "Jump now",                [this] { host.jumpNow(); });
         mk (cancelButton,      "Cancel",                  [this] { host.cancelJump(); });
         mk (autoSectionButton, "Auto-section",            [this] { autoSection(); });
+        mk (addSectionButton,  "+ Section",               [this] { addSectionAtPlayhead(); });
+        addSectionButton.setTooltip ("Add a section where the playhead is");
+        mk (clickButton,       "Click",                   [this] { host.setGuideClick (! host.guideClick()); songChanged(); });
+        clickButton.setTooltip ("Native click for this song, on the CLICK mixer strip (route it to the drummer's ears)");
+        mk (cuesButton,        "Cues",                    [this] { cuesMenu(); });
+        cuesButton.setTooltip ("Spoken cues for this song, on the CUES mixer strip: the section name a couple of bars early, then a count");
 
         jumpModeBox.addItem ("Jump: next bar", 1);
         jumpModeBox.addItem ("Jump: end of section", 2);
@@ -602,6 +1274,13 @@ public:
         setlist.refresh();
         jumpModeBox.setSelectedId (host.jumpMode() + 1, juce::dontSendNotification);
         countInBox.setSelectedId (host.countInBars() + 1, juce::dontSendNotification);
+        const bool haveSong = host.currentArrangement() != nullptr;
+        clickButton.setEnabled (haveSong);
+        cuesButton.setEnabled (haveSong && host.cueBankLoaded());
+        clickButton.setColour (juce::TextButton::buttonColourId, host.guideClick() ? tokens::queued.withAlpha (0.85f) : tokens::card);
+        clickButton.setColour (juce::TextButton::textColourOffId, host.guideClick() ? juce::Colours::black : tokens::bright);
+        cuesButton.setColour (juce::TextButton::buttonColourId, host.guideCues() ? tokens::ringA.withAlpha (0.85f) : tokens::card);
+        cuesButton.setColour (juce::TextButton::textColourOffId, host.guideCues() ? juce::Colours::black : tokens::bright);
         repaint();
     }
 
@@ -647,7 +1326,7 @@ public:
             if (arr != nullptr && section >= 0 && section < (int) arr->sections.size()) name = arr->sections[(size_t) section].name;
             else if (arr != nullptr && section < 0 && cur >= 0 && host.numSongs() > host.currentSongIndex() + 1 && label[1] == 'E')
                 name = "\xe2\x86\x92 " + host.songName (host.currentSongIndex() + 1).toStdString();
-            g.drawFittedText (juce::String (juce::CharPointer_UTF8 (name.c_str())), inner, juce::Justification::centredLeft, 1);
+            drawNeonTitle (g, inner, juce::String (juce::CharPointer_UTF8 (name.c_str())), col, section >= 0);
         };
         drawTag (nowBox, "NOW", cur, false);
         drawTag (nextBox, queued >= 0 ? "NEXT (QUEUED)" : "NEXT", next, queued >= 0);
@@ -719,6 +1398,36 @@ public:
     }
 
 
+
+    /** The NOW / NEXT name: condensed, filled bright-to-deep in the section's
+        colour, with a soft glow -- readable from the back of a stage. */
+    static void drawNeonTitle (juce::Graphics& g, juce::Rectangle<int> area, const juce::String& text, juce::Colour col, bool lit)
+    {
+        if (area.getWidth() < 20 || area.getHeight() < 12 || text.isEmpty()) return;
+        const float size = (float) juce::jlimit (18, 72, area.getHeight());
+        const auto font = juce::Font (juce::FontOptions (size, juce::Font::bold)).withHorizontalScale (0.88f);
+        juce::GlyphArrangement ga;
+        ga.addFittedText (font, text, (float) area.getX(), (float) area.getY(), (float) area.getWidth(), (float) area.getHeight(),
+                          juce::Justification::centredLeft, 1, 0.55f);
+        juce::Path p;
+        ga.createPath (p);
+        if (! lit)
+        {
+            g.setColour (tokens::dim);
+            g.fillPath (p);
+            return;
+        }
+        const auto b = p.getBounds();
+        for (int i = 3; i >= 1; --i)
+        {
+            g.setColour (col.withAlpha (0.07f * (float) (4 - i)));
+            g.strokePath (p, juce::PathStrokeType ((float) i * 2.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+        juce::ColourGradient grad (col.brighter (0.8f), 0.0f, b.getY(), col.darker (0.35f), 0.0f, b.getBottom(), false);
+        grad.addColour (0.5, col.brighter (0.15f));
+        g.setGradientFill (grad);
+        g.fillPath (p);
+    }
 
     //==========================================================================
     //  The circular musical readout.
@@ -940,7 +1649,10 @@ public:
 
         // edit row
         auto e = edit;
-        autoSectionButton.setBounds (e.removeFromLeft (110)); e.removeFromLeft (8);
+        addSectionButton.setBounds (e.removeFromLeft (110)); e.removeFromLeft (8);
+        autoSectionButton.setBounds (e.removeFromLeft (110)); e.removeFromLeft (16);
+        clickButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (6);
+        cuesButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (8);
         countInBox.setBounds (e.removeFromRight (120)); e.removeFromRight (8);
         jumpModeBox.setBounds (e.removeFromRight (180));
     }
@@ -959,28 +1671,146 @@ private:
         repaint (headerArea.getUnion (dotsArea));
     }
 
-    void addSectionAt (int bar)
+    void addSectionAtPlayhead()
     {
         auto* arr = host.currentArrangement();
         if (arr == nullptr) return;
-        auto* w = new juce::AlertWindow ("New section", "Starts at bar " + juce::String (bar + 1), juce::MessageBoxIconType::NoIcon);
-        w->addTextEditor ("name", "Section " + juce::String (arr->sections.size() + 1), "Name");
-        w->addButton ("Add", 1, juce::KeyPress (juce::KeyPress::returnKey));
-        w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-        w->enterModalState (true, juce::ModalCallbackFunction::create ([this, bar, w] (int r)
+        const int last = (std::max) (0, arr->lengthBars - 1);
+        const int bar = juce::jlimit (0, last, (int) std::floor (host.currentBar() + 1.0e-6));
+        addSectionAt (bar, addSectionButton.getScreenBounds().getCentre());
+    }
+
+    /** One click: pick a name and the section exists, coloured by its name.
+        A bar that already starts a section opens that section instead. */
+    void addSectionAt (int bar, juce::Point<int> screenPos)
+    {
+        auto* arr = host.currentArrangement();
+        if (arr == nullptr) return;
+        for (int i = 0; i < (int) arr->sections.size(); ++i)
+            if (arr->sections[(size_t) i].startBar == bar) { showSectionMenu (i, screenPos); return; }
+
+        showSectionNamePicker (screenPos, "New section at bar " + juce::String (bar + 1),
+                               "Section " + juce::String ((int) arr->sections.size() + 1),
+                               [this, bar] (const std::string& name)
         {
-            std::unique_ptr<juce::AlertWindow> owner (w);
-            if (r != 1) return;
-            if (auto* a = host.currentArrangement())
+            auto* a = host.currentArrangement();
+            if (a == nullptr) return;
+            // The first section added to an empty song at bar 9 would leave
+            // bars 1-8 belonging to nothing, so they become an Intro.
+            if (a->sections.empty() && bar > 0)
             {
-                ezarr::Section s;
-                s.name = w->getTextEditorContents ("name").trim().substring (0, 40).toStdString();
-                s.startBar = bar;
-                a->addSection (s);
-                host.arrangementEdited();
-                songChanged();
+                ezarr::Section intro;
+                intro.name = "Intro";
+                intro.startBar = 0;
+                intro.colourArgb = colourForSectionName (intro.name, 0);
+                a->addSection (intro);
             }
+            ezarr::Section s;
+            s.name = name;
+            s.startBar = bar;
+            s.colourArgb = colourForSectionName (name, (int) a->sections.size());
+            a->addSection (s);
+            host.arrangementEdited();
+            songChanged();
+        });
+    }
+
+    void showSectionNamePicker (juce::Point<int> screenPos, const juce::String& title, const juce::String& customDefault,
+                                std::function<void (const std::string&)> onPicked)
+    {
+        static const char* const names[] = { "Intro", "Verse 1", "Verse 2", "Verse 3", "Pre-Chorus", "Chorus",
+                                             "Post-Chorus", "Bridge", "Instrumental", "Interlude", "Breakdown",
+                                             "Tag", "Vamp", "Outro", "Ending" };
+        juce::PopupMenu m;
+        m.addSectionHeader (title);
+        // Owner: "type v and verse comes up, so we don't have to scroll a long menu"
+        m.addItem (100, "Type a name...  (v = Verse, c = Chorus, b = Bridge)");
+        m.addSeparator();
+        for (int i = 0; i < (int) juce::numElementsInArray (names); ++i)
+            m.addColouredItem (1 + i, names[i], juce::Colour (colourForSectionName (names[i], i)));
+
+        juce::Component::SafePointer<PlaybackView> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (screenPos.x, screenPos.y, 1, 1)),
+                         [safe, onPicked, title, customDefault] (int r)
+        {
+            if (safe == nullptr || r <= 0) return;
+            if (r == 100) { safe->promptName (title, customDefault, onPicked); return; }
+            if (r - 1 < (int) juce::numElementsInArray (names)) onPicked (names[r - 1]);
+        });
+    }
+
+    void promptName (const juce::String& title, const juce::String& current, std::function<void (const std::string&)> onDone)
+    {
+        auto* w = new juce::AlertWindow (title, "Type the first letters and the name fills in - press Enter to use it.",
+                                         juce::MessageBoxIconType::NoIcon);
+
+        static const char* const known[] = {
+            "Intro", "Verse", "Verse 1", "Verse 2", "Verse 3", "Verse 4", "Pre-Chorus", "Pre-Chorus 2", "Chorus", "Chorus 2",
+            "Chorus 3", "Post-Chorus", "Bridge", "Bridge 2", "Tag", "Turnaround", "Instrumental", "Interlude", "Refrain",
+            "Vamp", "Outro", "Ending", "Breakdown", "Build", "Last Chorus", "Rap", "Solo", "Spontaneous", "Acapella",
+            "Drums In", "All In", "Worship Freely", "Exhortation", "Key Change"
+        };
+        juce::StringArray names;
+        for (auto* n : known) names.add (n);
+
+        // the field outlives the window: the callback holds it until the window is gone
+        auto field = std::make_shared<ezsections::SectionNameField> (names);
+        field->setSize (300, 30);
+        field->setText (current);
+        field->onEnter = [w] { w->exitModalState (1); };
+        w->addCustomComponent (field.get());
+        w->addButton ("OK", 1);
+        w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        w->enterModalState (true, juce::ModalCallbackFunction::create ([w, field, onDone] (int r)
+        {
+            const auto name = field->getText().trim().substring (0, 40);
+            field->onEnter = nullptr;
+            w->removeCustomComponent (0);
+            delete w;
+            if (r == 1 && name.isNotEmpty()) onDone (name.toStdString());
         }), false);
+
+        juce::Component::SafePointer<ezsections::SectionNameField> focus (field.get());
+        juce::MessageManager::callAsync ([focus] { if (focus != nullptr) focus->focusEditor(); });
+    }
+
+    void showLaneMenu (int layer, juce::Point<int> screenPos)
+    {
+        const int song = host.currentSongIndex();
+        if (song < 0) return;
+        static const char* const presets[] = { "DRUMS", "PERCUSSION", "BASS", "KEYS", "SYNTH", "PADS", "GUITARS",
+                                               "ELECTRIC GUITAR", "ACOUSTIC GUITAR", "LEAD VOCAL", "BGVS", "CHOIR",
+                                               "STRINGS", "BRASS", "CLICK", "GUIDE" };
+        const auto currentName = host.layerName (song, layer);
+        juce::PopupMenu m;
+        m.addSectionHeader ("Track " + juce::String (layer + 1) + ":  " + currentName);
+        for (int i = 0; i < (int) juce::numElementsInArray (presets); ++i)
+            m.addItem (1 + i, presets[i], true, currentName == presets[i]);
+        m.addSeparator();
+        m.addItem (100, "Type a name...");
+        m.addItem (101, "Use the file name", host.layerHasCustomName (song, layer));
+        m.addSeparator();
+        m.addItem (102, host.layerEnabled (song, layer) ? "Mute" : "Unmute");
+
+        juce::Component::SafePointer<PlaybackView> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (screenPos.x, screenPos.y, 1, 1)),
+                         [safe, song, layer, currentName] (int r)
+        {
+            if (safe == nullptr || r <= 0) return;
+            auto& h = safe->host;
+            if (r <= (int) juce::numElementsInArray (presets))
+                h.setLayerName (song, layer, presets[r - 1]);
+            else if (r == 100)
+                safe->promptName ("Name track " + juce::String (layer + 1), currentName,
+                                  [safe, song, layer] (const std::string& name)
+                                  {
+                                      if (safe != nullptr)
+                                          safe->host.setLayerName (song, layer, juce::String (juce::CharPointer_UTF8 (name.c_str())));
+                                  });
+            else if (r == 101) h.setLayerName (song, layer, {});
+            else if (r == 102) h.toggleLayer (song, layer);
+            safe->timeline.repaint();
+        });
     }
 
     void autoSection()
@@ -990,12 +1820,42 @@ private:
         juce::PopupMenu m;
         m.addSectionHeader ("Draft sections every...");
         for (int n : { 4, 8, 16 }) m.addItem (n, juce::String (n) + " bars");
-        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (autoSectionButton), [this] (int n)
+
+        // The song's own cue track, if it has one: "Guide", "Cues", "Click"
+        // are the usual names, and they are offered first.
+        const int song = host.currentSongIndex();
+        if (song >= 0 && host.songHasGuideTrack (song))
+        {
+            m.addSeparator();
+            m.addItem (99, "Listen to the song's guide track");
+        }
+        std::vector<int> cueLanes, otherLanes;
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+        {
+            const auto* s = song >= 0 ? host.layerSamples (song, l) : nullptr;
+            if (s == nullptr || s->empty()) continue;
+            const auto n = host.layerName (song, l).toLowerCase();
+            (n.contains ("guide") || n.contains ("cue") || n.contains ("click") || n.contains ("count") ? cueLanes : otherLanes).push_back (l);
+        }
+        if (! cueLanes.empty() || ! otherLanes.empty())
+        {
+            m.addSeparator();
+            m.addSectionHeader ("Listen to the cue track...");
+            for (int l : cueLanes)   m.addItem (100 + l, host.layerName (song, l));
+            if (! cueLanes.empty() && ! otherLanes.empty()) m.addSeparator();
+            for (int l : otherLanes) m.addItem (100 + l, host.layerName (song, l));
+        }
+
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (autoSectionButton), [this, song] (int n)
         {
             if (n <= 0) return;
+            if (n == 99)  { host.listenForSections (song, -1); return; }
+            if (n >= 100) { host.listenForSections (song, n - 100); return; }
             if (auto* a = host.currentArrangement())
             {
                 a->autoSection (n, ezarr::worshipSectionNames());
+                for (int i = 0; i < (int) a->sections.size(); ++i)
+                    a->sections[(size_t) i].colourArgb = colourForSectionName (a->sections[(size_t) i].name, i);
                 host.arrangementEdited();
                 songChanged();
             }
@@ -1021,11 +1881,20 @@ private:
         juce::PopupMenu colours;
         for (int i = 0; i < 8; ++i) colours.addColouredItem (100 + i, "Colour " + juce::String (i + 1), juce::Colour (ezarr::defaultSectionColour (i)));
         m.addSubMenu ("Colour", colours);
+        if (host.cueBankLoaded())
+        {
+            juce::PopupMenu cue;
+            cue.addItem (200, "Spoken from the name", true, sec.cue.empty());
+            cue.addItem (201, "Silent", true, ezguide::cueIsOff (sec.cue));
+            cue.addSeparator();
+            addCueChoices (cue, 300, juce::String (juce::CharPointer_UTF8 (sec.cue.c_str())));
+            m.addSubMenu ("Cue", cue);
+        }
         m.addSeparator();
         m.addItem (9, "Delete section", s > 0);
 
         m.showMenuAsync (juce::PopupMenu::Options().withTargetScreenArea (juce::Rectangle<int> (screenPos.x, screenPos.y, 1, 1)),
-                         [this, s] (int r)
+                         [this, s, screenPos] (int r)
         {
             auto* a = host.currentArrangement();
             if (r == 0 || a == nullptr || s >= (int) a->sections.size()) return;
@@ -1033,39 +1902,99 @@ private:
             switch (r)
             {
                 case 1: host.jumpToSection (s); return;
-                case 2: renameSection (s); return;
+                case 2: renameSection (s, screenPos); return;
                 case 3: sec.loopOnEntry = ! sec.loopOnEntry; break;
                 case 4: sec.pauseAfter  = ! sec.pauseAfter;  break;
                 case 5: sec.skip        = ! sec.skip;        break;
                 case 6: sec.optional    = ! sec.optional;    break;
                 case 9: a->removeSection (s); break;
-                default: if (r >= 100 && r < 108) sec.colourArgb = ezarr::defaultSectionColour (r - 100); break;
+                case 200: sec.cue.clear(); break;
+                case 201: sec.cue = "-"; break;
+                default:
+                    if (r >= 100 && r < 108) sec.colourArgb = ezarr::defaultSectionColour (r - 100);
+                    else if (r >= 300)
+                    {
+                        const auto names = host.cueNames();
+                        if (r - 300 < names.size())
+                        {
+                            sec.cue = names[r - 300].fromLastOccurrenceOf ("/", false, false).toStdString();
+                            host.previewCue (juce::String (sec.cue));
+                        }
+                    }
+                    break;
             }
             host.arrangementEdited();
             songChanged();
         });
     }
 
-    void renameSection (int s)
+    /** The bank's cues as submenus per group, ids from base in cueNames() order. */
+    void addCueChoices (juce::PopupMenu& into, int base, const juce::String& current)
+    {
+        const auto names = host.cueNames();
+        juce::String group;
+        juce::PopupMenu sub;
+        auto flush = [&] { if (group.isNotEmpty()) into.addSubMenu (group, sub); sub = juce::PopupMenu(); };
+        for (int i = 0; i < names.size(); ++i)
+        {
+            const auto g = names[i].upToLastOccurrenceOf ("/", false, false);
+            const auto stem = names[i].fromLastOccurrenceOf ("/", false, false);
+            if (g != group) { flush(); group = g; }
+            sub.addItem (base + i, stem.replaceCharacter ('-', ' '), true, stem == current);
+        }
+        flush();
+    }
+
+    void cuesMenu()
+    {
+        juce::PopupMenu m;
+        m.addItem (1, "Cues on for this song", true, host.guideCues());
+        m.addSeparator();
+        m.addSectionHeader ("Say the section name...");
+        for (int b : { 1, 2, 4 }) m.addItem (10 + b, juce::String (b) + (b == 1 ? " bar early" : " bars early"), true, host.cueLeadBars() == b);
+        m.addSeparator();
+        m.addItem (20, "Count \"1, 2, 3, 4\" into each section", true, host.cueCounts());
+        m.addSeparator();
+        juce::PopupMenu say;
+        addCueChoices (say, 300, {});
+        m.addSubMenu ("Say now...", say);
+        juce::Component::SafePointer<PlaybackView> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (cuesButton), [safe] (int r)
+        {
+            if (safe == nullptr || r <= 0) return;
+            auto& h = safe->host;
+            if (r == 1) h.setGuideCues (! h.guideCues());
+            else if (r >= 11 && r <= 14) h.setCueLeadBars (r - 10);
+            else if (r == 20) h.setCueCounts (! h.cueCounts());
+            else if (r >= 300)
+            {
+                const auto names = h.cueNames();
+                if (r - 300 < names.size()) h.previewCue (names[r - 300].fromLastOccurrenceOf ("/", false, false));
+                return;
+            }
+            safe->songChanged();
+        });
+    }
+
+    void renameSection (int s, juce::Point<int> screenPos)
     {
         auto* arr = host.currentArrangement();
-        if (arr == nullptr) return;
-        auto* w = new juce::AlertWindow ("Rename section", "", juce::MessageBoxIconType::NoIcon);
-        w->addTextEditor ("name", juce::String (juce::CharPointer_UTF8 (arr->sections[(size_t) s].name.c_str())), "Name");
-        w->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
-        w->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-        w->enterModalState (true, juce::ModalCallbackFunction::create ([this, s, w] (int r)
+        if (arr == nullptr || s < 0 || s >= (int) arr->sections.size()) return;
+        const auto oldName = arr->sections[(size_t) s].name;
+        showSectionNamePicker (screenPos, "Rename section", juce::String (juce::CharPointer_UTF8 (oldName.c_str())),
+                               [this, s, oldName] (const std::string& name)
         {
-            std::unique_ptr<juce::AlertWindow> owner (w);
-            if (r != 1) return;
-            if (auto* a = host.currentArrangement())
-                if (s < (int) a->sections.size())
-                {
-                    a->sections[(size_t) s].name = w->getTextEditorContents ("name").trim().substring (0, 40).toStdString();
-                    host.arrangementEdited();
-                    songChanged();
-                }
-        }), false);
+            auto* a = host.currentArrangement();
+            if (a == nullptr || s >= (int) a->sections.size()) return;
+            auto& sec = a->sections[(size_t) s];
+            // Keep a colour the performer chose by hand; follow the new name
+            // only while the colour is still the automatic one.
+            if (sec.colourArgb == 0 || sec.colourArgb == colourForSectionName (oldName, s))
+                sec.colourArgb = colourForSectionName (name, s);
+            sec.name = name;
+            host.arrangementEdited();
+            songChanged();
+        });
     }
 
     PlaybackHost& host;
@@ -1073,7 +2002,7 @@ private:
     SetlistPanel setlist;
     juce::Rectangle<int> headerArea, dotsArea;
     juce::TextButton prevSongButton, prevSectionButton, playButton, countInButton, nextSectionButton, nextSongButton,
-                     loopButton, jumpNowButton, cancelButton, autoSectionButton;
+                     loopButton, jumpNowButton, cancelButton, autoSectionButton, addSectionButton, clickButton, cuesButton;
     juce::ComboBox jumpModeBox, countInBox;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PlaybackView)

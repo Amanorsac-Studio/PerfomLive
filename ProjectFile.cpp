@@ -116,6 +116,13 @@ static juce::var deckToVar (const DeckSnapshot& d)
     auto* o = new juce::DynamicObject();
     o->setProperty ("flatIndex", d.flatIndex);
     o->setProperty ("tempoOverrideBpm", d.tempoOverrideBpm);
+    o->setProperty ("sourceBpm", d.sourceBpm);
+    o->setProperty ("stemMode", d.stemMode);
+    if (d.clickFile.isNotEmpty()) o->setProperty ("clickFile", d.clickFile);
+    if (d.guideFile.isNotEmpty()) o->setProperty ("guideFile", d.guideFile);
+    o->setProperty ("useSongClick", d.useSongClick);
+    o->setProperty ("useSongGuide", d.useSongGuide);
+    if (d.meter.isNotEmpty()) o->setProperty ("meter", d.meter);
     o->setProperty ("rowName", d.rowName);
     o->setProperty ("rowColourSet", d.rowColourSet);
     o->setProperty ("rowColourArgb", (int) d.rowColourArgb);
@@ -133,12 +140,17 @@ static juce::var deckToVar (const DeckSnapshot& d)
             so->setProperty ("optional", s.optional);
             so->setProperty ("loopOnEntry", s.loopOnEntry);
             so->setProperty ("pauseAfter", s.pauseAfter);
+            if (s.cue.isNotEmpty()) so->setProperty ("cue", s.cue);
             sections.add (juce::var (so));
         }
         o->setProperty ("sections", sections);
         o->setProperty ("arrangementLengthBars", d.arrangementLengthBars);
         o->setProperty ("endBehaviour", d.endBehaviour);
         o->setProperty ("countInBars", d.countInBars);
+        o->setProperty ("guideClick", d.guideClick);
+        o->setProperty ("guideCues", d.guideCues);
+        o->setProperty ("cueLeadBars", d.cueLeadBars);
+        o->setProperty ("cueCounts", d.cueCounts);
     }
     juce::Array<juce::var> layers;
     for (auto& l : d.layers) layers.add (layerToVar (l));
@@ -160,7 +172,15 @@ static DeckSnapshot deckFromVar (const juce::var& v)
         {
             const double bpm = (double) o->getProperty ("tempoOverrideBpm");
             d.tempoOverrideBpm = validBpm (bpm) ? bpm : -1.0;
+            const double src = (double) o->getProperty ("sourceBpm");
+            d.sourceBpm = validBpm (src) ? src : -1.0;
         }
+        d.stemMode = o->hasProperty ("stemMode") ? (bool) o->getProperty ("stemMode") : true;
+        d.clickFile    = o->getProperty ("clickFile").toString().substring (0, 1024);
+        d.guideFile    = o->getProperty ("guideFile").toString().substring (0, 1024);
+        d.useSongClick = o->hasProperty ("useSongClick") ? (bool) o->getProperty ("useSongClick") : true;
+        d.useSongGuide = o->hasProperty ("useSongGuide") ? (bool) o->getProperty ("useSongGuide") : true;
+        d.meter        = o->getProperty ("meter").toString().substring (0, 16);   // matched against the app's list; unknown is ignored
         d.rowName          = o->getProperty ("rowName").toString();
         d.rowColourSet     = (bool) o->getProperty ("rowColourSet");
         d.rowColourArgb    = (juce::uint32) (int) o->getProperty ("rowColourArgb");
@@ -184,6 +204,9 @@ static DeckSnapshot deckFromVar (const juce::var& v)
                     s.optional    = (bool) so->getProperty ("optional");
                     s.loopOnEntry = (bool) so->getProperty ("loopOnEntry");
                     s.pauseAfter  = (bool) so->getProperty ("pauseAfter");
+                    // a cue stem names a file inside the app's own bank; it is
+                    // only ever looked up in a map, never used as a path
+                    s.cue         = so->getProperty ("cue").toString().substring (0, 32);
                     d.sections.push_back (s);
                 }
             }
@@ -191,6 +214,10 @@ static DeckSnapshot deckFromVar (const juce::var& v)
         d.arrangementLengthBars = juce::jlimit (0, 100000, (int) o->getProperty ("arrangementLengthBars"));
         d.endBehaviour          = juce::jlimit (0, 2, o->hasProperty ("endBehaviour") ? (int) o->getProperty ("endBehaviour") : 2);
         d.countInBars           = juce::jlimit (0, 8, (int) o->getProperty ("countInBars"));
+        d.guideClick            = (bool) o->getProperty ("guideClick");
+        d.guideCues             = (bool) o->getProperty ("guideCues");
+        d.cueLeadBars           = juce::jlimit (1, 8, o->hasProperty ("cueLeadBars") ? (int) o->getProperty ("cueLeadBars") : 2);
+        d.cueCounts             = o->hasProperty ("cueCounts") ? (bool) o->getProperty ("cueCounts") : true;
         if (auto* layers = o->getProperty ("layers").getArray())
         {
             // PX-B: was a hard 4. Left alone, every project silently lost
@@ -332,6 +359,26 @@ static juce::var settingsToVar (const SettingsSnapshot& s)
     o->setProperty ("onePadAtATime", s.onePadAtATime);
     o->setProperty ("meterVisible", s.meterVisible);
     o->setProperty ("tempoLockEnabled", s.tempoLockEnabled);
+    juce::Array<juce::var> tIn, tSt, tId, tState, tMidi;
+    for (int i = 0; i < SettingsSnapshot::kLiveTracks; ++i)
+    {
+        tIn.add (s.trackInput[(size_t) i]);
+        tSt.add (s.trackStereo[(size_t) i]);
+        tId.add (s.trackInstrumentId[(size_t) i]);
+        tState.add (s.trackInstrumentState[(size_t) i]);
+        tMidi.add (s.trackMidiChannel[(size_t) i]);
+    }
+    o->setProperty ("trackInput", tIn);
+    o->setProperty ("trackStereo", tSt);
+    o->setProperty ("trackInstrumentId", tId);
+    o->setProperty ("trackInstrumentState", tState);
+    o->setProperty ("trackMidiChannel", tMidi);
+    juce::Array<juce::var> stripOnArr, stripStateArr;
+    for (int i = 0; i < SettingsSnapshot::kStrips; ++i) { stripOnArr.add (s.stripOn[(size_t) i]); stripStateArr.add (s.stripState[(size_t) i]); }
+    o->setProperty ("stripOn", stripOnArr);
+    o->setProperty ("stripState", stripStateArr);
+    o->setProperty ("webGain", (double) s.webGain);
+    o->setProperty ("webMute", s.webMute);
     return juce::var (o);
 }
 
@@ -344,6 +391,86 @@ static SettingsSnapshot settingsFromVar (const juce::var& v)
         s.onePadAtATime    = (bool) o->getProperty ("onePadAtATime");
         s.meterVisible     = (bool) o->getProperty ("meterVisible");
         s.tempoLockEnabled = (bool) o->getProperty ("tempoLockEnabled");
+        if (auto* ch = o->getProperty ("liveInputChannel").getArray())
+            for (int i = 0; i < ch->size() && i < SettingsSnapshot::kLiveColumns; ++i)
+                s.liveInputChannel[(size_t) i] = juce::jlimit (-1, 63, (int) (*ch)[i]);   // a device has at most 64 inputs we care about
+        if (auto* st = o->getProperty ("liveInputStereo").getArray())
+            for (int i = 0; i < st->size() && i < SettingsSnapshot::kLiveColumns; ++i)
+                s.liveInputStereo[(size_t) i] = (bool) (*st)[i];
+        // an identifier is only ever matched against the scanned plugin list,
+        // never opened as a path; the state blob is handed to the plugin
+        // whose identifier matched, capped in InstrumentSlot
+        if (auto* ids = o->getProperty ("instrumentId").getArray())
+            for (int i = 0; i < ids->size() && i < SettingsSnapshot::kLiveColumns; ++i)
+                s.instrumentId[(size_t) i] = (*ids)[i].toString().substring (0, 512);
+        if (auto* states = o->getProperty ("instrumentState").getArray())
+            for (int i = 0; i < states->size() && i < SettingsSnapshot::kLiveColumns; ++i)
+                s.instrumentState[(size_t) i] = (*states)[i].toString();
+        if (auto* on = o->getProperty ("stripOn").getArray())
+            for (int i = 0; i < on->size() && i < SettingsSnapshot::kStrips; ++i)
+                s.stripOn[(size_t) i] = (bool) (*on)[i];
+        // handed only to our own compiled-in strip, which parses it as XML
+        if (auto* st = o->getProperty ("stripState").getArray())
+            for (int i = 0; i < st->size() && i < SettingsSnapshot::kStrips; ++i)
+                s.stripState[(size_t) i] = (*st)[i].toString().substring (0, 1 << 20);
+
+        if (o->hasProperty ("trackInput"))
+        {
+            if (auto* a = o->getProperty ("trackInput").getArray())
+                for (int i = 0; i < a->size() && i < SettingsSnapshot::kLiveTracks; ++i)
+                    s.trackInput[(size_t) i] = juce::jlimit (-1, 63, (int) (*a)[i]);
+            if (auto* a = o->getProperty ("trackStereo").getArray())
+                for (int i = 0; i < a->size() && i < SettingsSnapshot::kLiveTracks; ++i)
+                    s.trackStereo[(size_t) i] = (bool) (*a)[i];
+            // matched against the scanned plugin list only, never opened as a path
+            if (auto* a = o->getProperty ("trackInstrumentId").getArray())
+                for (int i = 0; i < a->size() && i < SettingsSnapshot::kLiveTracks; ++i)
+                    s.trackInstrumentId[(size_t) i] = (*a)[i].toString().substring (0, 512);
+            if (auto* a = o->getProperty ("trackInstrumentState").getArray())
+                for (int i = 0; i < a->size() && i < SettingsSnapshot::kLiveTracks; ++i)
+                    s.trackInstrumentState[(size_t) i] = (*a)[i].toString();
+            if (auto* a = o->getProperty ("trackMidiChannel").getArray())
+                for (int i = 0; i < a->size() && i < SettingsSnapshot::kLiveTracks; ++i)
+                    s.trackMidiChannel[(size_t) i] = juce::jlimit (0, 16, (int) (*a)[i]);
+        }
+        else
+        {
+            // Owner: "the eight decks should be available for stems." A file
+            // from before the live tracks had its mics and instruments ON deck
+            // columns; each moves, in column order, onto the next free live
+            // track, and takes that column's channel strip with it. The
+            // column is left as a plain stem column.
+            int t = 0;
+            for (int col = 0; col < SettingsSnapshot::kLiveColumns && t < SettingsSnapshot::kLiveTracks; ++col)
+            {
+                const bool hasInst  = s.instrumentId[(size_t) col].isNotEmpty();
+                const bool hasInput = s.liveInputChannel[(size_t) col] >= 0;
+                if (! hasInst && ! hasInput) continue;
+                if (hasInst)
+                {
+                    s.trackInstrumentId[(size_t) t]    = s.instrumentId[(size_t) col];
+                    s.trackInstrumentState[(size_t) t] = s.instrumentState[(size_t) col];
+                }
+                else
+                {
+                    s.trackInput[(size_t) t]  = s.liveInputChannel[(size_t) col];
+                    s.trackStereo[(size_t) t] = s.liveInputStereo[(size_t) col];
+                }
+                const size_t trackStrip = (size_t) (SettingsSnapshot::kLiveColumns + t);
+                s.stripOn[trackStrip]    = s.stripOn[(size_t) col];
+                s.stripState[trackStrip] = s.stripState[(size_t) col];
+                s.stripOn[(size_t) col]  = false;
+                s.stripState[(size_t) col] = {};
+                ++t;
+            }
+        }
+        // the legacy per-column fields have done their job
+        s.liveInputChannel.fill (-1);
+        s.liveInputStereo.fill (false);
+        for (auto& x : s.instrumentId) x = {};
+        for (auto& x : s.instrumentState) x = {};
+        if (o->hasProperty ("webGain")) s.webGain = clampGain (o->getProperty ("webGain"), 1.0f);
+        s.webMute = (bool) o->getProperty ("webMute");
     }
     return s;
 }
@@ -428,18 +555,32 @@ bool fromVar (const juce::var& v, ProjectSnapshot& out)
     if (auto* mixerChannels = root->getProperty ("mixerChannels").getArray())
     {
         // A project saved before PX-B has 7 channels: Tab1-4, Pads, Fx, Metro.
-        // Tab5-8 were inserted before Pads, so those last three move from
-        // 4/5/6 to 8/9/10. Copying index for index would hand the Pads
-        // channel's output route to Deck 5 and silently re-route someone's set.
-        static constexpr int kLegacyChannels = 7;
-        const bool legacy = mixerChannels->size() == kLegacyChannels;
-        for (int i = 0; i < mixerChannels->size(); ++i)
+        // Tab5-8 and then Live1-4 were inserted before Pads, so those move
+        // from 4/5/6 to 12/13/14. 11- and 12-entry files (Tab1-8, Pads, Fx,
+        // Metro, Cues) move everything from index 8 up by the four live tracks.
+        const int count = mixerChannels->size();
+        for (int i = 0; i < count; ++i)
         {
-            const int dest = (legacy && i >= 4) ? i + 4 : i;
-            if (dest >= ProjectSnapshot::kMixerChannels)
-                break;
+            int dest = i;
+            if (count == 7 && i >= 4)                  dest = i + 8;
+            else if ((count == 11 || count == 12) && i >= 8) dest = i + 4;
+            if (dest >= ProjectSnapshot::kMixerChannels) break;
             snapshot.mixerChannels[(size_t) dest] = mixerChannelFromVar ((*mixerChannels)[i]);
         }
+    }
+
+    // Before the native click existed, Settings > Metronome worked by MUTING
+    // the Metro strip, and that mute was saved with the project. Such a file
+    // (no deck carries the guide fields yet) would load with the Click strip
+    // silently muted, so the mute is dropped: the strip's own M button is
+    // the only mute now, and the metronome setting gates the loop click.
+    {
+        bool anyGuideField = false;
+        if (auto* decks = root->getProperty ("decks").getArray())
+            for (const auto& dv : *decks)
+                if (auto* o = dv.getDynamicObject(); o != nullptr && o->hasProperty ("guideClick")) anyGuideField = true;
+        if (! anyGuideField)
+            snapshot.mixerChannels[14].mute = false;   // Metro, after the remap above
     }
 
     if (auto* decks = root->getProperty ("decks").getArray())

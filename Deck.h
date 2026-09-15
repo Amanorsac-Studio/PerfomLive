@@ -45,7 +45,10 @@ constexpr int kNumLayers = 8;
 // PLAN_ARRANGEMENT_VIEW.md M1: stem mode's hard cap -- still tempo-locked,
 // still griddable, a long loop rather than a freeform recording (the plan's
 // own §2 scope fence).
-constexpr int kMaxStemBars = 32;
+// Owner: whole songs are loaded as stems (a 5-minute song at 70 BPM is ~90
+// bars), so the cap is a sanity limit against absurd files, not a musical
+// one: 600 bars is 40 minutes at 60 BPM.
+constexpr int kMaxStemBars = 600;
 
 // PLAN_ARRANGEMENT_VIEW.md M1: the result of resolving a stem-mode layer's
 // real bar length -- `bars` is always the true detected count (even when
@@ -277,7 +280,7 @@ class Deck
 public:
     std::array<Layer, kNumLayers> layers;
 
-    DeckMode          mode            { DeckMode::loop };
+    DeckMode          mode            { DeckMode::loop };   // the app puts every row into stem mode (SessionComponent); the engine's own default stays loop
     StemEndBehavior   stemEndBehavior { StemEndBehavior::nextPlay };
 
     // Milestone 6 (M6-T2): the structural beat count of whichever signature

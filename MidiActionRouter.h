@@ -47,8 +47,13 @@ public:
     void cancelLearn() { learnButtonTarget.reset(); learnFaderTarget = nullptr; }
     bool isLearning() const { return learnButtonTarget.has_value() || (bool) learnFaderTarget; }
 
+    // PX-D: every message, on the MIDI thread, before any action mapping --
+    // hosted instruments need notes with no message-thread hop in between.
+    std::function<void (const juce::MidiMessage&)> onRawMessage;
+
     void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& message) override
     {
+        if (onRawMessage) onRawMessage (message);
         const auto msg = message;   // copy -- safe to hop threads with
         juce::MessageManager::callAsync ([this, msg] { processOnMessageThread (msg); });
     }

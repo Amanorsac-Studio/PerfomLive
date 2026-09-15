@@ -62,10 +62,12 @@ int main()
                "a 16-bar file at 120bpm resolves to 16 bars (not truncated to 4), accepted");
     }
 
-    // ---- a 32-bar file resolves to 32 -- right at the cap, still accepted --
+    // ---- a 32-bar file resolves to 32 -- right at a 32-bar cap, still accepted
+    //      (the cap is passed explicitly: the app's own kMaxStemBars is far
+    //      larger now that whole songs load as stems) ------------------------
     {
         const double dur = durationForBars (32, 120.0);   // 64.0s
-        auto fit = resolveStemBarLength (dur, 120.0);
+        auto fit = resolveStemBarLength (dur, 120.0, 32);
         CHECK (fit.accepted && fit.bars == 32,
                "a 32-bar file at 120bpm resolves to 32 bars, accepted (right at the cap)");
     }
@@ -73,17 +75,17 @@ int main()
     // ---- a file one bar over the cap is rejected, not silently clamped -----
     {
         const double dur = durationForBars (33, 120.0);   // 66.0s
-        auto fit = resolveStemBarLength (dur, 120.0);
+        auto fit = resolveStemBarLength (dur, 120.0, 32);
         CHECK (! fit.accepted && fit.bars == 33,
                "a 33-bar file at 120bpm is rejected (accepted == false), and still reports its true 33 bars, not a clamped 32");
     }
 
-    // ---- a much longer file is also rejected, not clamped to 32 ------------
+    // ---- a whole song (a real-world stem) is accepted under the app's cap --
     {
-        const double dur = durationForBars (64, 120.0);   // 128.0s
-        auto fit = resolveStemBarLength (dur, 120.0);
-        CHECK (! fit.accepted && fit.bars == 64,
-               "a 64-bar file is rejected, reporting its true 64 bars");
+        const double dur = durationForBars (96, 72.0);   // 5m20s at 72bpm
+        auto fit = resolveStemBarLength (dur, 72.0);
+        CHECK (fit.accepted && fit.bars == 96,
+               "a 96-bar song at 72bpm is accepted by the default cap, reporting its true 96 bars");
     }
 
     // ---- resolution is tempo-independent, unlike ezdsp::AnalysisResult::bars,

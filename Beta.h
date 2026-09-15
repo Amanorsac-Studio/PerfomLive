@@ -2,7 +2,7 @@
 //  Beta.h -- the public beta's label and its fixed end date.
 //
 //  The owner's decision: the beta stops opening 30 days after the RELEASE
-//  DATE (13 September 2026), the same date for every tester on every platform.
+//  DATE (15 September 2026), the same date for every tester on every platform.
 //  Not 30 days from each person's first launch -- that resets the moment
 //  someone deletes a settings file -- and not from the compile date, which
 //  would give the Windows, Mac and iPad builds different end dates depending
@@ -32,7 +32,7 @@ inline constexpr const char* kLabel = "PERFORMLIVE BETA (Testing)";
 /** The public release, in the "Mmm dd yyyy" format parseCompileDate() reads.
     package_release.ps1 and the CI workflow read this line for the installer's
     "use it until" text, so keep it on one line in exactly this form. */
-inline constexpr const char* kReleaseDate = "Sep 13 2026";
+inline constexpr const char* kReleaseDate = "Sep 15 2026";
 
 /** How long the beta stays usable, counted from the release date. */
 inline constexpr int kLifetimeDays = 30;
@@ -154,9 +154,9 @@ inline bool runSelfTest()
 
     const auto liveEnd = expiry();
     check (liveEnd.toMilliseconds() != 0,                         "the release date parses");
-    check (ymd (releaseDate(), 2026, 8, 13),                      "the release date is 13 September 2026");
-    check (ymd (liveEnd, 2026, 9, 13),                            "the beta ends at the start of 13 October 2026");
-    check (ymd (lastDay (liveEnd), 2026, 9, 12),                  "12 October 2026 is the last day it can be used");
+    check (ymd (releaseDate(), 2026, 8, 15),                      "the release date is 15 September 2026");
+    check (ymd (liveEnd, 2026, 9, 15),                            "the beta ends at the start of 15 October 2026");
+    check (ymd (lastDay (liveEnd), 2026, 9, 14),                  "14 October 2026 is the last day it can be used");
     check (! hasEnded (releaseDate(), liveEnd),                   "usable on the release date");
 
     return ok;

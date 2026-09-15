@@ -1,6 +1,13 @@
 #include <JuceHeader.h>
+#include <BinaryData.h>     // PerformLiveArt: the embedded header wordmark
 #include "ActionRegistry.h"
 #include "DeckCard.h"
+#include "Guide.h"
+#include "TouchSupport.h"   // press-and-hold = right-click, for iPad and touchscreens
+#include "InstrumentHost.h"
+#include "CueDetect.h"
+#include "CreatorsTab.h"
+#include "ChannelStrip/PerformEditor.h"   // PERFORM LIVE, compiled in
 #include "EzDSP.h"
 #include "Importer.h"
 #include "KeyBindingMap.h"
@@ -29,17 +36,33 @@
 // what keeps the two in step instead.
 static_assert (ezproject::DeckSnapshot::kDeckLayers == ezdeck::kNumLayers,
                "DeckSnapshot::layers must have one entry per engine layer");
+static_assert (ezproject::SettingsSnapshot::kLiveColumns == ezdeck::kNumLayers,
+               "legacy live-input fields: one per column");
+static_assert (ezproject::SettingsSnapshot::kLiveTracks == ezdeck::kNumLiveTracks,
+               "SettingsSnapshot's live-track arrays must have one entry per live track");
+static_assert (ezproject::SettingsSnapshot::kStrips == ezdeck::kNumLayers + ezdeck::kNumLiveTracks,
+               "one channel strip per deck and per live track");
+static_assert ((int) ezdeck::MixerChannel::Live1 == ezdeck::kNumLayers,
+               "the live-track mixer channels follow the decks, so strip index == mixer channel index");
+static_assert (ezproject::ProjectSnapshot::kMixerChannels == ezdeck::kNumMixerChannels,
+               "ProjectSnapshot::mixerChannels must have one entry per mixer channel");
 static_assert (ezproject::SceneSnapshot::kSceneTabs == ezdeck::kNumLayers,
                "SceneSnapshot::tabEnabled must have one entry per engine layer");
 static_assert (ezproject::ProjectSnapshot::kMixerChannels == ezdeck::kNumMixerChannels,
                "ProjectSnapshot::mixerChannels must have one entry per mixer channel");
 #include "PlaybackView.h"
+#include "StemImport.h"     // the window that opens when a set of stems lands on a row
+#include "SpeechCues.h"     // hearing the words on a guide track
+#include "CueReview.h"      // checking those sections before they're applied
+#include "StoreShowcase.h"  // the STORE page's preview catalogue
+#include "BrowserTab.h"
 #include "WarpIntegration.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <optional>
 #include <vector>
 
@@ -272,6 +295,7 @@ public:
                            juce::Colour (0xfff2f0ff),     // highlightedText   == kTextBright
                            juce::Colour (0xff7c5cff),     // highlightedFill   == kIndigo
                            juce::Colour (0xfff2f0ff) });  // menuText          == kTextBright
+        applyWidgetColours();
     }
 
     juce::Typeface::Ptr getTypefaceForFont (const juce::Font& font) override
@@ -284,6 +308,284 @@ public:
             if (auto tf = font.isBold() ? performfonts::monoBold() : performfonts::mono())
                 return tf;
         return juce::LookAndFeel_V4::getTypefaceForFont (font);
+    }
+
+    //==========================================================================
+    //  Owner: "make the sub-menus, pop-up menus and the download tab all feel
+    //  consistent with the app and easy to use." Everything below is the
+    //  stock JUCE widget redrawn in the app's own palette, with rows a
+    //  finger can hit on stage: 32 px menu rows, rounded cards, the indigo
+    //  highlight, and the same 1 px border every panel in the app uses.
+    //==========================================================================
+    static constexpr juce::uint32 kLafShell   = 0xff0c0c17, kLafCard = 0xff151527, kLafBorder = 0xff2b2b4d,
+                                  kLafIndigo  = 0xff7c5cff, kLafIndigoDim = 0xff3a2f6b,
+                                  kLafBright  = 0xfff2f0ff, kLafDim = 0xffa3a6cc, kLafFaint = 0xff6f7099,
+                                  kLafDanger  = 0xffff3b5c;
+
+    // ---- popup menus -----------------------------------------------------------
+    juce::Font getPopupMenuFont() override { return juce::Font (juce::FontOptions (14.0f)); }
+
+    int getPopupMenuBorderSizeWithOptions (const juce::PopupMenu::Options&) override { return 6; }
+
+    void getIdealPopupMenuItemSizeWithOptions (const juce::String& text, bool isSeparator, int standardMenuItemHeight,
+                                               int& idealWidth, int& idealHeight, const juce::PopupMenu::Options&) override
+    {
+        if (isSeparator) { idealWidth = 50; idealHeight = 9; return; }
+        auto font = getPopupMenuFont();
+        if (standardMenuItemHeight > 0 && font.getHeight() > (float) standardMenuItemHeight / 1.3f)
+            font.setHeight ((float) standardMenuItemHeight / 1.3f);
+        idealHeight = juce::jmax (32, standardMenuItemHeight);
+        idealWidth  = juce::GlyphArrangement::getStringWidthInt (font, text) + 58;
+    }
+
+    void drawPopupMenuBackgroundWithOptions (juce::Graphics& g, int width, int height, const juce::PopupMenu::Options&) override
+    {
+        const auto r = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height);
+        g.setColour (juce::Colour (kLafCard));
+        g.fillRoundedRectangle (r, 10.0f);
+        g.setColour (juce::Colour (kLafBorder));
+        g.drawRoundedRectangle (r.reduced (0.5f), 10.0f, 1.0f);
+    }
+
+    void drawPopupMenuSectionHeaderWithOptions (juce::Graphics& g, const juce::Rectangle<int>& area, const juce::String& sectionName,
+                                                const juce::PopupMenu::Options&) override
+    {
+        g.setColour (juce::Colour (kLafFaint));
+        g.setFont (juce::Font (juce::FontOptions (10.5f, juce::Font::bold)).withExtraKerningFactor (0.08f));
+        g.drawFittedText (sectionName.toUpperCase(), area.reduced (14, 0).withTrimmedTop (4), juce::Justification::bottomLeft, 1);
+    }
+
+    void drawPopupMenuItemWithOptions (juce::Graphics& g, const juce::Rectangle<int>& area, bool isHighlighted,
+                                       const juce::PopupMenu::Item& item, const juce::PopupMenu::Options&) override
+    {
+        if (item.isSeparator)
+        {
+            g.setColour (juce::Colour (kLafBorder));
+            g.fillRect (area.reduced (12, 0).withHeight (1).withY (area.getCentreY()));
+            return;
+        }
+        if (item.isSectionHeader)
+        {
+            drawPopupMenuSectionHeaderWithOptions (g, area, item.text, {});
+            return;
+        }
+
+        auto r = area.reduced (6, 1);
+        const bool enabled = item.isEnabled;
+        if (isHighlighted && enabled)
+        {
+            g.setColour (juce::Colour (kLafIndigo));
+            g.fillRoundedRectangle (r.toFloat(), 7.0f);
+        }
+
+        auto textColour = item.colour != juce::Colour() ? item.colour
+                        : juce::Colour (enabled ? (isHighlighted ? kLafBright : kLafBright) : kLafFaint);
+        if (isHighlighted && enabled && item.colour == juce::Colour()) textColour = juce::Colour (kLafBright);
+        if (isHighlighted && enabled && item.colour != juce::Colour()) textColour = item.colour.brighter (0.6f);
+
+        auto inner = r.reduced (10, 0);
+        // tick / colour swatch on the left
+        auto lead = inner.removeFromLeft (18);
+        if (item.isTicked)
+        {
+            juce::Path tick;
+            const auto t = lead.toFloat().withSizeKeepingCentre (11.0f, 9.0f);
+            tick.startNewSubPath (t.getX(), t.getCentreY());
+            tick.lineTo (t.getX() + t.getWidth() * 0.38f, t.getBottom());
+            tick.lineTo (t.getRight(), t.getY());
+            g.setColour (isHighlighted ? juce::Colour (kLafBright) : juce::Colour (kLafIndigo).brighter (0.3f));
+            g.strokePath (tick, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+        else if (item.colour != juce::Colour())
+        {
+            g.setColour (item.colour);
+            g.fillEllipse (lead.toFloat().withSizeKeepingCentre (9.0f, 9.0f));
+        }
+        inner.removeFromLeft (6);
+
+        if (item.subMenu != nullptr)
+        {
+            auto arrow = inner.removeFromRight (14).toFloat().withSizeKeepingCentre (6.0f, 10.0f);
+            juce::Path p;
+            p.startNewSubPath (arrow.getX(), arrow.getY());
+            p.lineTo (arrow.getRight(), arrow.getCentreY());
+            p.lineTo (arrow.getX(), arrow.getBottom());
+            g.setColour (juce::Colour (enabled ? (isHighlighted ? kLafBright : kLafDim) : kLafFaint));
+            g.strokePath (p, juce::PathStrokeType (1.6f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+
+        if (item.shortcutKeyDescription.isNotEmpty())
+        {
+            g.setColour (juce::Colour (isHighlighted && enabled ? kLafBright : kLafFaint).withAlpha (0.9f));
+            g.setFont (juce::Font (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 11.0f, juce::Font::plain)));
+            g.drawText (item.shortcutKeyDescription, inner.removeFromRight (70), juce::Justification::centredRight, false);
+        }
+
+        g.setColour (textColour);
+        g.setFont (getPopupMenuFont());
+        g.drawFittedText (item.text, inner, juce::Justification::centredLeft, 1);
+    }
+
+    // ---- alert windows (Rename..., New section, Recover...) -------------------
+    juce::Font getAlertWindowTitleFont() override   { return juce::Font (juce::FontOptions (17.0f, juce::Font::bold)); }
+    juce::Font getAlertWindowMessageFont() override { return juce::Font (juce::FontOptions (13.5f)); }
+    juce::Font getAlertWindowFont() override        { return juce::Font (juce::FontOptions (13.0f)); }
+
+    void drawAlertBox (juce::Graphics& g, juce::AlertWindow& alert, const juce::Rectangle<int>& textArea,
+                       juce::TextLayout& textLayout) override
+    {
+        const auto r = alert.getLocalBounds().toFloat();
+        g.setColour (juce::Colour (kLafCard));
+        g.fillRoundedRectangle (r, 12.0f);
+        g.setColour (juce::Colour (kLafIndigo).withAlpha (0.9f));
+        g.fillRoundedRectangle (r.withWidth (5.0f).reduced (0.0f, 14.0f), 2.5f);
+        g.setColour (juce::Colour (kLafBorder));
+        g.drawRoundedRectangle (alert.getLocalBounds().toFloat().reduced (0.5f), 12.0f, 1.0f);
+
+        // JUCE's AlertWindow already puts the title (bold) and the message into
+        // textLayout, laid out for textArea. Drawing the title again here is
+        // what printed it twice on top of itself ("jumbled words").
+        textLayout.draw (g, textArea.toFloat());
+    }
+
+    int getAlertWindowButtonHeight() override { return 34; }
+
+    // ---- buttons in dialogs / lists / the WEB bar -----------------------------
+    void drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour& backgroundColour,
+                               bool isHighlighted, bool isDown) override
+    {
+        const auto r = b.getLocalBounds().toFloat().reduced (0.5f);
+        const bool on = b.getToggleState();
+        auto fill = backgroundColour;
+        if (fill == juce::Colour (kLafCard) || fill.getBrightness() < 0.2f) fill = juce::Colour (on ? kLafIndigo : kLafCard);
+        if (isDown) fill = fill.brighter (0.25f);
+        else if (isHighlighted) fill = fill.brighter (0.10f);
+        g.setColour (fill);
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (juce::Colour (on ? kLafIndigo : kLafBorder).brighter (isHighlighted ? 0.3f : 0.0f));
+        g.drawRoundedRectangle (r, 8.0f, 1.0f);
+    }
+
+    juce::Font getTextButtonFont (juce::TextButton&, int buttonHeight) override
+    {
+        return juce::Font (juce::FontOptions (juce::jmin (14.0f, (float) buttonHeight * 0.45f), juce::Font::bold));
+    }
+
+    // ---- tooltips ------------------------------------------------------------------
+    static juce::TextLayout layoutTooltipText (const juce::String& text, juce::Colour colour)
+    {
+        juce::AttributedString s;
+        s.setJustification (juce::Justification::centredLeft);
+        s.append (text, juce::Font (juce::FontOptions (13.0f)), colour);
+        juce::TextLayout tl;
+        tl.createLayout (s, 340.0f);
+        return tl;
+    }
+
+    juce::Rectangle<int> getTooltipBounds (const juce::String& tipText, juce::Point<int> screenPos, juce::Rectangle<int> parentArea) override
+    {
+        const juce::TextLayout tl = layoutTooltipText (tipText, juce::Colour (kLafBright));
+        const int w = (int) (tl.getWidth() + 22.0f), h = (int) (tl.getHeight() + 14.0f);
+        return juce::Rectangle<int> (screenPos.x > parentArea.getCentreX() ? screenPos.x - (w + 12) : screenPos.x + 24,
+                                     screenPos.y > parentArea.getCentreY() ? screenPos.y - (h + 6) : screenPos.y + 6, w, h)
+                   .constrainedWithin (parentArea);
+    }
+
+    void drawTooltip (juce::Graphics& g, const juce::String& text, int width, int height) override
+    {
+        const auto r = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height);
+        g.setColour (juce::Colour (kLafShell).withAlpha (0.97f));
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (juce::Colour (kLafBorder));
+        g.drawRoundedRectangle (r.reduced (0.5f), 8.0f, 1.0f);
+        layoutTooltipText (text, juce::Colour (kLafBright)).draw (g, r.reduced (11.0f, 7.0f));
+    }
+
+    // ---- scrollbars / progress ------------------------------------------------------
+    void drawScrollbar (juce::Graphics& g, juce::ScrollBar&, int x, int y, int width, int height, bool isVertical,
+                        int thumbStart, int thumbSize, bool isMouseOver, bool isMouseDown) override
+    {
+        juce::Rectangle<int> thumb = isVertical ? juce::Rectangle<int> (x + 2, thumbStart, width - 4, thumbSize)
+                                                : juce::Rectangle<int> (thumbStart, y + 2, thumbSize, height - 4);
+        g.setColour (juce::Colour (kLafBorder).brighter (isMouseDown ? 0.5f : isMouseOver ? 0.25f : 0.0f));
+        g.fillRoundedRectangle (thumb.toFloat(), 3.0f);
+    }
+
+    int getDefaultScrollbarWidth() override { return 10; }
+
+    void drawProgressBar (juce::Graphics& g, juce::ProgressBar& bar, int width, int height, double progress,
+                          const juce::String& textToShow) override
+    {
+        const auto r = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height);
+        g.setColour (juce::Colour (kLafShell));
+        g.fillRoundedRectangle (r, 5.0f);
+        if (progress >= 0.0 && progress <= 1.0)
+        {
+            g.setColour (juce::Colour (kLafIndigo));
+            g.fillRoundedRectangle (r.withWidth ((float) width * (float) progress), 5.0f);
+        }
+        else
+        {
+            // indeterminate: a travelling indigo segment
+            const float t = (float) ((juce::Time::getMillisecondCounter() / 12) % (uint32_t) juce::jmax (1, width * 2)) / (float) juce::jmax (1, width * 2);
+            const float segW = (float) width * 0.25f;
+            const float pos = t < 0.5f ? t * 2.0f : (1.0f - t) * 2.0f;
+            g.setColour (juce::Colour (kLafIndigo));
+            g.fillRoundedRectangle (r.withX (pos * ((float) width - segW)).withWidth (segW), 5.0f);
+        }
+        if (textToShow.isNotEmpty())
+        {
+            g.setColour (juce::Colour (kLafBright));
+            g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
+            g.drawText (textToShow, r.toNearestInt(), juce::Justification::centred, false);
+        }
+        juce::ignoreUnused (bar);
+    }
+
+    // ---- combo boxes / text editors / lists: colours the stock drawers pick up ----
+    void applyWidgetColours()
+    {
+        setColour (juce::ComboBox::backgroundColourId, juce::Colour (kLafCard));
+        setColour (juce::ComboBox::outlineColourId,    juce::Colour (kLafBorder));
+        setColour (juce::ComboBox::textColourId,       juce::Colour (kLafBright));
+        setColour (juce::ComboBox::arrowColourId,      juce::Colour (kLafDim));
+        setColour (juce::ComboBox::focusedOutlineColourId, juce::Colour (kLafIndigo));
+        setColour (juce::TextEditor::backgroundColourId,     juce::Colour (kLafShell));
+        setColour (juce::TextEditor::outlineColourId,        juce::Colour (kLafBorder));
+        setColour (juce::TextEditor::focusedOutlineColourId, juce::Colour (kLafIndigo));
+        setColour (juce::TextEditor::textColourId,           juce::Colour (kLafBright));
+        setColour (juce::TextEditor::highlightColourId,      juce::Colour (kLafIndigoDim));
+        setColour (juce::TextEditor::highlightedTextColourId, juce::Colour (kLafBright));
+        setColour (juce::CaretComponent::caretColourId,      juce::Colour (kLafIndigo));
+        setColour (juce::TextButton::buttonColourId,   juce::Colour (kLafCard));
+        setColour (juce::TextButton::buttonOnColourId, juce::Colour (kLafIndigo));
+        setColour (juce::TextButton::textColourOffId,  juce::Colour (kLafBright));
+        setColour (juce::TextButton::textColourOnId,   juce::Colour (kLafBright));
+        setColour (juce::AlertWindow::backgroundColourId, juce::Colour (kLafCard));
+        setColour (juce::AlertWindow::textColourId,       juce::Colour (kLafBright));
+        setColour (juce::AlertWindow::outlineColourId,    juce::Colour (kLafBorder));
+        setColour (juce::TooltipWindow::backgroundColourId, juce::Colour (kLafShell));
+        setColour (juce::TooltipWindow::textColourId,       juce::Colour (kLafBright));
+        setColour (juce::TooltipWindow::outlineColourId,    juce::Colour (kLafBorder));
+        setColour (juce::ListBox::backgroundColourId,       juce::Colour (kLafShell));
+        setColour (juce::TableHeaderComponent::backgroundColourId, juce::Colour (kLafCard));
+        setColour (juce::TableHeaderComponent::textColourId,       juce::Colour (kLafDim));
+        setColour (juce::TableHeaderComponent::outlineColourId,    juce::Colour (kLafBorder));
+        setColour (juce::TableHeaderComponent::highlightColourId,  juce::Colour (kLafIndigoDim));
+        setColour (juce::ProgressBar::backgroundColourId, juce::Colour (kLafShell));
+        setColour (juce::ProgressBar::foregroundColourId, juce::Colour (kLafIndigo));
+        setColour (juce::ScrollBar::thumbColourId,        juce::Colour (kLafBorder));
+        setColour (juce::PopupMenu::backgroundColourId,   juce::Colour (kLafCard));
+        setColour (juce::PopupMenu::textColourId,         juce::Colour (kLafBright));
+        setColour (juce::PopupMenu::highlightedBackgroundColourId, juce::Colour (kLafIndigo));
+        setColour (juce::PopupMenu::highlightedTextColourId,       juce::Colour (kLafBright));
+        setColour (juce::PopupMenu::headerTextColourId,   juce::Colour (kLafFaint));
+        setColour (juce::Label::textColourId,             juce::Colour (kLafBright));
+        setColour (juce::ToggleButton::textColourId,      juce::Colour (kLafBright));
+        setColour (juce::ToggleButton::tickColourId,      juce::Colour (kLafIndigo));
+        setColour (juce::ToggleButton::tickDisabledColourId, juce::Colour (kLafFaint));
+        setColour (juce::DocumentWindow::backgroundColourId, juce::Colour (kLafShell));
+        setColour (juce::ResizableWindow::backgroundColourId, juce::Colour (kLafShell));
     }
 };
 
@@ -522,11 +824,16 @@ public:
     void mouseDown (const juce::MouseEvent& e) override
     {
         if (e.mods.isPopupMenu()) { if (onMenu != nullptr) onMenu(); return; }
+        touchHold.onLongPress = [this] (juce::Point<int>) { if (onMenu != nullptr) onMenu(); };
+        touchHold.begin (e);
     }
+
+    void mouseDrag (const juce::MouseEvent& e) override { touchHold.drag (e); }
 
     void mouseUp (const juce::MouseEvent& e) override
     {
         if (e.mods.isPopupMenu()) return;
+        if (touchHold.end()) return;   // the hold already opened the menu
         if (! getLocalBounds().contains (e.getPosition())) return;
         // Owner #9: a tap on the mode pill toggles stem/loop -- it must NOT
         // also trigger the row, so it's checked before onTrigger.
@@ -557,6 +864,7 @@ private:
     bool rowHasAccent { false };
     juce::Colour rowAccentColour { juce::Colours::transparentBlack };
     bool hovering { false };
+    eztouch::LongPress touchHold;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeckTriggerCell)
 };
@@ -790,11 +1098,16 @@ public:
     void mouseDown (const juce::MouseEvent& e) override
     {
         if (e.mods.isPopupMenu()) { if (onMenu != nullptr) onMenu(); return; }
+        touchHold.onLongPress = [this] (juce::Point<int>) { if (onMenu != nullptr) onMenu(); };
+        touchHold.begin (e);
     }
+
+    void mouseDrag (const juce::MouseEvent& e) override { touchHold.drag (e); }
 
     void mouseUp (const juce::MouseEvent& e) override
     {
         if (e.mods.isPopupMenu()) return;
+        if (touchHold.end()) return;
         if (! getLocalBounds().contains (e.getPosition())) return;
 
         // An empty slot's whole area IS its "+" (mirrors DeckCard's own
@@ -870,6 +1183,7 @@ private:
     bool accentSet { false };
     juce::Colour accentColour { juce::Colours::transparentBlack };
     double pulsePhase { 0.0 };   // owner: playing-pad light animation
+    eztouch::LongPress touchHold;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VoiceSlotCell)
 };
@@ -1144,6 +1458,7 @@ public:
         : channelName (label), accent (accentIn), isTabChannel (isTabChannelIn), showMuteSolo (showMuteSoloIn),
           tintColour (tintColourIn)
     {
+        touchHold.onLongPress = [this] (juce::Point<int>) { if (onStripMenu) onStripMenu(); };
         gainSlider.setLookAndFeel (&faderLookAndFeel());
         gainSlider.setSliderStyle (juce::Slider::LinearVertical);
         gainSlider.setRange (0.0, 1.5, 0.01);
@@ -1224,6 +1539,7 @@ public:
 
     ~MixerChannelStrip() override
     {
+        sourceButton.setLookAndFeel (nullptr);
         gainSlider.setLookAndFeel (nullptr);
         muteButton.setLookAndFeel (nullptr);
         soloButton.setLookAndFeel (nullptr);
@@ -1234,6 +1550,51 @@ public:
     std::function<void (bool)>  onMuteChanged;
     std::function<void (bool)>  onSoloChanged;
     std::function<void (int)>   onOutputRouteChanged;   // index into this strip's own kOutputRoutes
+    std::function<void()>       onFxToggle;             // the FX pill (DECK 5-8's PERFORM LIVE strip) was tapped
+
+    // Owner: "on the mixer I want to see the channel strip, a sign showing FX
+    // that I can click to turn it on or off." Shown only on the columns that
+    // have a strip; lit when it's on.
+    void setFxState (bool available, bool on)
+    {
+        if (fxAvailable == available && fxOn == on) return;
+        fxAvailable = available; fxOn = on;
+        repaint();
+    }
+
+    // The WEB strip has no solo and no output routing: it sets a web page's
+    // level, it doesn't carry audio through the mixer.
+    void setSoloAvailable (bool s) { soloButton.setVisible (s); }
+    void setRoutable (bool r)      { routable = r; if (! r) outputRouteBox.setVisible (false); }
+
+    std::function<void()> onStripMenu;       // right-click / hold: the channel strip's menu
+    std::function<void()> onSourceClicked;   // live tracks: the source button
+
+    /** Live tracks only: shows the source button ("Mic  In 3", "EZkeys 2", "Choose source"). */
+    void setSourceText (const juce::String& text)
+    {
+        if (! hasSource)
+        {
+            hasSource = true;
+            sourceButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff0c0c17));
+            sourceButton.setColour (juce::TextButton::textColourOffId, juce::Colour (0xfff2f0ff));
+            sourceButton.setLookAndFeel (&tactileButtonLookAndFeel());
+            sourceButton.onClick = [this] { if (onSourceClicked) onSourceClicked(); };
+            addAndMakeVisible (sourceButton);
+            resized();
+        }
+        if (sourceButton.getButtonText() != text) sourceButton.setButtonText (text);
+        sourceButton.setTooltip (text);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { if (onStripMenu) onStripMenu(); return; }
+        if (fxAvailable && fxPillArea.contains (e.getPosition()) && onFxToggle) { onFxToggle(); return; }
+        touchHold.begin (e);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override { touchHold.drag (e); }
+    void mouseUp (const juce::MouseEvent&) override    { touchHold.end(); }
 
     void setOutputRouteIndex (int index) { outputRouteBox.setSelectedItemIndex (juce::jlimit (0, ezproject::MixerChannelSnapshot::kMaxOutputRoutes - 1, index), juce::dontSendNotification); }
     int  getOutputRouteIndex() const     { return outputRouteBox.getSelectedItemIndex(); }
@@ -1242,7 +1603,7 @@ public:
     // Harmless no-op on the Master strip (showMuteSolo == false there, so
     // outputRouteBox was never added as a visible child at all -- setVisible
     // on a component with no parent just does nothing observable).
-    void setOutputRouteControlVisible (bool shown) { outputRouteBox.setVisible (shown && showMuteSolo); }
+    void setOutputRouteControlVisible (bool shown) { outputRouteBox.setVisible (shown && showMuteSolo && routable); }
 
     // Milestone 10: a lightweight post-fader level meter -- level is
     // expected in [0,1] (PRODUCT_REQUIREMENTS.md §10's own perceptual
@@ -1264,6 +1625,8 @@ public:
 
     // Milestone 13: PRD §14's "Mixer level meters" General-tab toggle.
     void setMeterVisible (bool visible) { meterShown = visible; repaint(); }
+    void setMuteState (bool muted)      { muteButton.setToggleState (muted, juce::dontSendNotification); refreshDim(); }
+    void setGainValue (float g)         { gainSlider.setValue (g, juce::dontSendNotification); repaint(); }
 
     // UI_SPEC_MIXER.md §3.1/§3.3: pushed by SessionComponent whenever ANY
     // channel's solo changes -- a single strip has no way to know another
@@ -1321,6 +1684,29 @@ public:
         g.setColour (isTabChannel ? accent : juce::Colour (0xfff2f0ff));   // accent : kTextBright
         g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
         g.drawText (channelName, nameArea, juce::Justification::centred, false);
+
+        // the FX pill: the column's PERFORM LIVE strip, tap to switch
+        if (fxAvailable)
+        {
+            const juce::Colour fxColour (0xffff7a45);
+            const auto pill = fxPillArea.toFloat();
+            if (fxOn)
+            {
+                g.setColour (fxColour.withAlpha (0.12f));
+                g.fillRoundedRectangle (pill.expanded (2.0f), 6.0f);
+                g.setColour (fxColour);
+                g.fillRoundedRectangle (pill, 4.0f);
+                g.setColour (juce::Colours::black);
+            }
+            else
+            {
+                g.setColour (juce::Colour (0xff2b2b4d));
+                g.drawRoundedRectangle (pill.reduced (0.5f), 4.0f, 1.0f);
+                g.setColour (juce::Colour (0xff6f7099));
+            }
+            g.setFont (juce::Font (juce::FontOptions (9.0f, juce::Font::bold)).withExtraKerningFactor (0.08f));
+            g.drawText ("FX", fxPillArea, juce::Justification::centred, false);
+        }
         if (armedIndicator)
         {
             juce::GlyphArrangement ga;
@@ -1372,6 +1758,13 @@ public:
         auto area = getLocalBounds().reduced (10);   // §3.1: 10px inner padding
 
         nameArea = area.removeFromTop (18);
+        fxPillArea = nameArea.removeFromRight (28).withSizeKeepingCentre (26, 16);   // the FX pill, top-right
+        if (hasSource)
+        {
+            area.removeFromTop (4);
+            sourceButton.setBounds (area.removeFromTop (26));
+            area.removeFromTop (2);
+        }
 
         // Phase 1.1 P3 "M button oversized, S button oversized... reduce
         // visual weight": was a full 44px-tall row (this app's usual
@@ -1438,15 +1831,47 @@ private:
     bool showMuteSolo;
     juce::Colour tintColour;   // Visual-polish pass -- Metro/Master's own strip wash, see constructor's own comment
 
-    juce::Rectangle<int> nameArea, valueArea, meterBounds;
+    juce::Rectangle<int> nameArea, valueArea, meterBounds, fxPillArea;
     float meterLevel { 0.0f };
     bool  meterShown { true };
     bool  silencedByOtherSolo { false };
     bool  armedIndicator { false };
+    bool  fxAvailable { false }, fxOn { false };
+    bool  routable { true };
+    bool  hasSource { false };
+    juce::TextButton sourceButton;
+    eztouch::LongPress touchHold { };
 
     juce::Slider       gainSlider;
     juce::TextButton   muteButton, soloButton;
     juce::ComboBox     outputRouteBox;   // Phase 1.1 P3 "Output routing"
+};
+
+//==============================================================================
+//  Owner: "when the window is smaller the mixer shouldn't rearrange with some
+//  coming down -- it should stay straight, with a scroll bar." The strips sit
+//  on this, in one row inside a horizontal Viewport, under a label per group
+//  (DECKS / LIVE / RETURNS). Master stays outside it, pinned on the right.
+//==============================================================================
+class MixerStripHolder : public juce::Component
+{
+public:
+    struct Group { juce::String name; juce::Rectangle<int> area; juce::Colour colour; };
+    std::vector<Group> groups;
+
+    void paint (juce::Graphics& g) override
+    {
+        for (const auto& gr : groups)
+        {
+            auto label = gr.area.withHeight (16);
+            g.setColour (gr.colour);
+            g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)).withExtraKerningFactor (0.1f));
+            g.drawText (gr.name, label.withTrimmedLeft (2), juce::Justification::centredLeft, false);
+            const int textW = juce::GlyphArrangement::getStringWidthInt (g.getCurrentFont(), gr.name) + 10;
+            g.setColour (gr.colour.withAlpha (0.25f));
+            g.fillRect (label.getX() + textW, label.getCentreY(), juce::jmax (0, label.getWidth() - textW), 1);
+        }
+    }
 };
 
 //==============================================================================
@@ -1983,13 +2408,18 @@ public:
         if (e.mods.isPopupMenu()) { if (onRightClick != nullptr) onRightClick(); return; }
         pressed = true;
         repaint();
+        touchHold.onLongPress = [this] (juce::Point<int>) { pressed = false; repaint(); if (onRightClick != nullptr) onRightClick(); };
+        touchHold.begin (e);
     }
+
+    void mouseDrag (const juce::MouseEvent& e) override { touchHold.drag (e); }
 
     void mouseUp (const juce::MouseEvent& e) override
     {
         if (e.mods.isPopupMenu()) return;
         pressed = false;
         repaint();
+        if (touchHold.end()) return;
         if (getLocalBounds().contains (e.getPosition()) && onTap != nullptr) onTap();
     }
 
@@ -1998,6 +2428,7 @@ private:
     bool selected { false };
     bool pressed  { false };
     juce::Colour accent { 0xff7c5cff };   // SPEC_PERFORM_V2 GROUP E: owner-assignable, defaults to the prior fixed kIndigo
+    eztouch::LongPress touchHold;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SignatureRailButton)
 };
@@ -3308,6 +3739,7 @@ public:
 
     std::function<void()> onTap;    // audition toggle
     std::function<void()> onMenu;   // long-press, right-click -- assign/edit/delete/re-tag
+    std::function<void()> onToggleSelect;   // ctrl/shift-click: add to or take out of the browser's selection
 
     void setEntry (const ezlibrary::LibraryEntry& e)
     {
@@ -3339,6 +3771,7 @@ public:
     void setDurationSeconds (double d) { durationSeconds = d; repaint(); }
     // §4: "alternating fill kCard / kShellBg" -- list rows only; ignored in grid mode.
     void setAlternateShade (bool alt) { if (altShade != alt) { altShade = alt; repaint(); } }
+    void setSelected (bool s) { if (selected != s) { selected = s; repaint(); } }
 
     // Message-thread only (called once per refresh, never per-frame) --
     // builds the peak cache once, exactly like DeckCard::setAudio().
@@ -3442,6 +3875,7 @@ public:
         g.setColour (juce::Colour (0xff6f7099u));   // kTextFaint
         g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::plain)));
         g.drawText (metaLine(), area, juce::Justification::centredLeft, false);
+        paintSelection (g);
     }
 
     // Phase 1.1 P2 "List view reorder: Name, Waveform, Tempo, Key, Category,
@@ -3503,6 +3937,7 @@ public:
         juce::String label = name;
         if (favorite) label = juce::String (juce::CharPointer_UTF8 ("\xe2\x98\x85 ")) + label;
         g.drawText (label, area, juce::Justification::centredLeft, true);
+        paintSelection (g);
     }
 
     void resized() override {}
@@ -3522,7 +3957,9 @@ public:
     {
         stopTimer();
         if (held || dragStarted || e.mods.isPopupMenu()) return;
-        if (getLocalBounds().contains (e.getPosition()) && onTap != nullptr) onTap();
+        if (! getLocalBounds().contains (e.getPosition())) return;
+        if ((e.mods.isCommandDown() || e.mods.isShiftDown()) && onToggleSelect != nullptr) { onToggleSelect(); return; }
+        if (onTap != nullptr) onTap();
     }
 
     // Phase 1.1 P1 "Deck Loading": drag this sample onto a deck. Same
@@ -3546,6 +3983,30 @@ public:
 
 private:
     void timerCallback() override { stopTimer(); held = true; if (onMenu != nullptr) onMenu(); }
+
+    // Selected for a folder move: an indigo wash and outline, plus a tick
+    // badge on grid cards (a list row has no spare corner for one).
+    void paintSelection (juce::Graphics& g) const
+    {
+        if (! selected) return;
+        const bool grid = mode == LayoutMode::grid;
+        const auto b = getLocalBounds().toFloat().reduced (1.0f);
+        const float radius = grid ? 8.0f : 0.0f;
+        g.setColour (juce::Colour (0xff7c5cffu).withAlpha (0.18f));   // kIndigo
+        g.fillRoundedRectangle (b, radius);
+        g.setColour (juce::Colour (0xff7c5cffu));
+        g.drawRoundedRectangle (b, radius, 2.0f);
+        if (! grid) return;
+
+        const juce::Rectangle<float> badge (b.getX() + 7.0f, b.getY() + 7.0f, 18.0f, 18.0f);
+        g.fillEllipse (badge);
+        juce::Path tick;
+        tick.startNewSubPath (badge.getX() + 5.0f, badge.getCentreY() + 0.5f);
+        tick.lineTo (badge.getX() + 8.0f, badge.getBottom() - 5.0f);
+        tick.lineTo (badge.getRight() - 4.5f, badge.getY() + 5.5f);
+        g.setColour (juce::Colours::white);
+        g.strokePath (tick, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
 
     // §3: "Show only fields that exist; omit absent segments -- no '-'
     // spam." Phase 1.1 P2-b gave LibraryEntry a real (user-entered, still
@@ -3596,6 +4057,7 @@ private:
     bool hovering    { false };
     bool held        { false };
     bool altShade    { false };
+    bool selected    { false };
     bool dragStarted { false };
     bool hasCollection { false };
     juce::Colour collectionColour { juce::Colours::transparentBlack };
@@ -3604,6 +4066,188 @@ private:
     bool hasAudio { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LibrarySampleCard)
+};
+
+//==============================================================================
+//  A folder in the LIBRARY browser: a named group of samples (usually one
+//  song's stems) with an optional picture. Tap opens it; right-click or a
+//  press-and-hold opens its menu; dropping a sample card on it moves that
+//  sample in. Same card size and list-row height as LibrarySampleCard so the
+//  two share one grid.
+//==============================================================================
+class LibraryFolderCard : public juce::Component,
+                          public juce::DragAndDropTarget,
+                          private juce::Timer
+{
+public:
+    LibraryFolderCard() = default;
+
+    std::function<void()> onOpen;
+    std::function<void()> onMenu;
+    std::function<void (const juce::String&)> onAssetDropped;
+
+    // anyMemberAssetId: dragging the folder onto a deck drags this sample, and
+    // a deck given any folder member loads the whole folder into its row
+    // (SessionComponent::loadAssetIntoDeckSlot -> loadPackIntoRow).
+    void setFolder (const juce::String& folderName, int itemCount, juce::Colour accentColour, const juce::Image& pictureIn,
+                    const juce::String& anyMemberAssetId)
+    {
+        dragAssetId = anyMemberAssetId;
+        name = folderName;
+        count = itemCount;
+        accent = accentColour;
+        picture = pictureIn;
+        repaint();
+    }
+
+    void setListMode (bool listRow) { if (listMode != listRow) { listMode = listRow; repaint(); } }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::String countText = juce::String (count) + (count == 1 ? " item" : " items");
+
+        if (listMode)
+        {
+            g.setColour (juce::Colour (hovering ? 0xff23263au : 0xff151527u));   // kCardHover / kCard
+            g.fillRect (getLocalBounds());
+            auto area = getLocalBounds().reduced (8, 4);
+            drawCover (g, area.removeFromLeft (36).toFloat(), 5.0f);
+            area.removeFromLeft (10);
+            drawChevron (g, area.removeFromRight (24).toFloat());
+            g.setColour (juce::Colour (0xff6f7099u));   // kTextFaint
+            g.setFont (juce::Font (juce::FontOptions (10.0f)));
+            g.drawText (countText, area.removeFromRight (70), juce::Justification::centredRight, false);
+            g.setColour (juce::Colour (0xfff2f0ffu));   // kTextBright
+            g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+            g.drawText (name, area, juce::Justification::centredLeft, true);
+            if (dropHover) { g.setColour (juce::Colour (0xff7c5cffu)); g.drawRect (getLocalBounds(), 2); }
+            return;
+        }
+
+        const auto bounds = getLocalBounds().toFloat().reduced (0.5f);
+        {
+            juce::Path shadowPath;
+            shadowPath.addRoundedRectangle (bounds, 8.0f);
+            juce::DropShadow (juce::Colours::black.withAlpha (0.3f), 5, { 0, 2 }).drawForPath (g, shadowPath);
+        }
+        g.setColour (juce::Colour (hovering ? 0xff23263au : 0xff151527u));
+        g.fillRoundedRectangle (bounds, 8.0f);
+
+        auto area = getLocalBounds().reduced (6);
+        drawCover (g, area.removeFromTop (area.getHeight() - 38).toFloat(), 6.0f);
+        area.removeFromTop (4);
+        g.setColour (juce::Colour (0xfff2f0ffu));
+        g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+        g.drawText (name, area.removeFromTop (16).withTrimmedLeft (2), juce::Justification::centredLeft, true);
+        g.setColour (juce::Colour (0xff6f7099u));
+        g.setFont (juce::Font (juce::FontOptions (10.0f)));
+        g.drawText (juce::String ("FOLDER") + juce::String (juce::CharPointer_UTF8 (" " "\xc2" "\xb7" " ")) + countText,
+                    area.withTrimmedLeft (2), juce::Justification::centredLeft, false);
+
+        g.setColour (dropHover ? juce::Colour (0xff7c5cffu) : accent.withAlpha (0.5f));
+        g.drawRoundedRectangle (bounds, 8.0f, dropHover ? 2.5f : 1.2f);
+    }
+
+    void mouseEnter (const juce::MouseEvent&) override { hovering = true; repaint(); }
+    void mouseExit  (const juce::MouseEvent&) override { hovering = false; repaint(); }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { if (onMenu != nullptr) onMenu(); return; }
+        held = false;
+        dragStarted = false;
+        startTimer (kHoldMs);
+    }
+
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu() || dragStarted || e.getDistanceFromDragStart() < 8) return;
+        stopTimer();
+        dragStarted = true;
+        if (dragAssetId.isEmpty()) return;
+        if (auto* container = juce::DragAndDropContainer::findParentDragContainerFor (this))
+            container->startDragging ("ezplay-asset:" + dragAssetId, this);
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        stopTimer();
+        if (held || dragStarted || e.mods.isPopupMenu()) return;
+        if (getLocalBounds().contains (e.getPosition()) && onOpen != nullptr) onOpen();
+    }
+
+    // Sample cards drag with the "ezplay-asset:" description DeckCard reads.
+    bool isInterestedInDragSource (const SourceDetails& details) override
+    {
+        return details.description.toString().startsWith ("ezplay-asset:");
+    }
+    void itemDragEnter (const SourceDetails&) override { dropHover = true; repaint(); }
+    void itemDragExit (const SourceDetails&) override  { dropHover = false; repaint(); }
+    void itemDropped (const SourceDetails& details) override
+    {
+        dropHover = false;
+        repaint();
+        if (onAssetDropped != nullptr)
+            onAssetDropped (details.description.toString().fromFirstOccurrenceOf ("ezplay-asset:", false, false));
+    }
+
+private:
+    void timerCallback() override { stopTimer(); held = true; if (onMenu != nullptr) onMenu(); }
+
+    // The folder's picture, cropped to fill; without one, the folder's own
+    // colour with a folder shape.
+    void drawCover (juce::Graphics& g, juce::Rectangle<float> r, float radius) const
+    {
+        if (r.getWidth() < 4.0f || r.getHeight() < 4.0f) return;
+        juce::Graphics::ScopedSaveState saved (g);
+        juce::Path clip;
+        clip.addRoundedRectangle (r, radius);
+        g.reduceClipRegion (clip);
+
+        if (picture.isValid())
+        {
+            g.drawImage (picture, r, juce::RectanglePlacement::centred | juce::RectanglePlacement::fillDestination);
+            return;
+        }
+
+        g.setGradientFill (juce::ColourGradient (accent.withAlpha (0.45f), r.getX(), r.getY(),
+                                                 juce::Colour (0xff0c0c17u), r.getRight(), r.getBottom(), false));
+        g.fillRect (r);
+
+        const float h = juce::jmin (r.getHeight() * 0.42f, r.getWidth() * 0.34f);
+        const auto icon = juce::Rectangle<float> (h * 1.3f, h).withCentre (r.getCentre());
+        const float tabH = icon.getHeight() * 0.2f;
+        juce::Path shape;
+        shape.addRoundedRectangle (icon.getX(), icon.getY(), icon.getWidth() * 0.42f, tabH * 2.0f, tabH * 0.5f);
+        shape.addRoundedRectangle (icon.getX(), icon.getY() + tabH, icon.getWidth(), icon.getHeight() - tabH, tabH * 0.5f);
+        g.setColour (accent.withAlpha (0.9f));
+        g.fillPath (shape);
+    }
+
+    static void drawChevron (juce::Graphics& g, juce::Rectangle<float> r)
+    {
+        const auto c = r.getCentre();
+        juce::Path p;
+        p.startNewSubPath (c.x - 3.0f, c.y - 6.0f);
+        p.lineTo (c.x + 3.0f, c.y);
+        p.lineTo (c.x - 3.0f, c.y + 6.0f);
+        g.setColour (juce::Colour (0xffa3a6ccu));   // kTextDim
+        g.strokePath (p, juce::PathStrokeType (1.8f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
+
+    static constexpr int kHoldMs = 650;   // matches LibrarySampleCard
+
+    juce::String name, dragAssetId;
+    int count { 0 };
+    juce::Colour accent { 0xff7c5cffu };
+    juce::Image picture;
+    bool listMode    { false };
+    bool hovering    { false };
+    bool held        { false };
+    bool dragStarted { false };
+    bool dropHover   { false };
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LibraryFolderCard)
 };
 
 //==============================================================================
@@ -3821,6 +4465,33 @@ public:
         emptyStateLabel.setFont (juce::Font (juce::FontOptions (15.0f)));
         addChildComponent (emptyStateLabel);
 
+        // Folders: "+ FOLDER" in the toolbar, and a bar under the filters that
+        // shows the open folder (back / name / options) or, while samples are
+        // selected, what to do with them. See updateFolderBar().
+        newFolderButton.setButtonText ("+ FOLDER");
+        newFolderButton.setTooltip ("New folder - from the selected samples, or empty");
+        newFolderButton.onClick = [this] { promptNewFolder (selectedIds); };
+        addAndMakeVisible (newFolderButton);
+
+        backButton.setButtonText ("< LIBRARY");
+        backButton.onClick = [this] { openFolder ({}); };
+        folderOptionsButton.setButtonText ("FOLDER OPTIONS");
+        folderOptionsButton.onClick = [this] { showFolderMenu (openFolderId); };
+        selectionNewFolderButton.setButtonText ("NEW FOLDER");
+        selectionNewFolderButton.onClick = [this] { promptNewFolder (selectedIds); };
+        selectionMoveButton.setButtonText ("MOVE TO FOLDER");
+        selectionMoveButton.onClick = [this] { showSelectionMoveMenu(); };
+        selectionDoneButton.setButtonText ("DONE");
+        selectionDoneButton.onClick = [this] { clearSelection(); };
+        for (auto* b : { &newFolderButton, &backButton, &folderOptionsButton, &selectionNewFolderButton, &selectionMoveButton, &selectionDoneButton })
+        {
+            b->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff151527u));   // kCard
+            if (b != &newFolderButton) addChildComponent (*b);
+        }
+        barLabel.setFont (performfonts::headingFont (13.0f).withExtraKerningFactor (0.01f));
+        barLabel.setColour (juce::Label::textColourId, juce::Colour (0xfff2f0ffu));   // kTextBright
+        addChildComponent (barLabel);
+
         viewport.setViewedComponent (&gridHolder, false);
         viewport.setScrollBarsShown (true, false);
         addChildComponent (viewport);
@@ -3845,6 +4516,8 @@ public:
         auto toolbar = area.removeFromTop (52).reduced (12, 4);
         titleLabel.setBounds (toolbar.removeFromLeft (70));
         importButton.setBounds (toolbar.removeFromRight (90));
+        toolbar.removeFromRight (8);
+        newFolderButton.setBounds (toolbar.removeFromRight (96));
         toolbar.removeFromRight (8);
         listViewButton.setBounds (toolbar.removeFromRight (44));
         toolbar.removeFromRight (4);
@@ -3889,6 +4562,28 @@ public:
             filterArea.removeFromLeft (4);
         }
 
+        if (selectMode || openFolderId.isNotEmpty())
+        {
+            auto bar = area.removeFromTop (44).reduced (12, 4);
+            if (selectMode)
+            {
+                selectionDoneButton.setBounds (bar.removeFromRight (80));
+                bar.removeFromRight (6);
+                selectionMoveButton.setBounds (bar.removeFromRight (150));
+                bar.removeFromRight (6);
+                selectionNewFolderButton.setBounds (bar.removeFromRight (120));
+                bar.removeFromRight (10);
+            }
+            else
+            {
+                backButton.setBounds (bar.removeFromLeft (110));
+                bar.removeFromLeft (12);
+                folderOptionsButton.setBounds (bar.removeFromRight (150));
+                bar.removeFromRight (10);
+            }
+            barLabel.setBounds (bar);
+        }
+
         browseArea = area.reduced (12);
         viewport.setBounds (browseArea);
 
@@ -3926,12 +4621,14 @@ private:
     {
         const int availableWidth = juce::jmax (1, viewport.getWidth());
 
+        const int count = (int) tiles.size();   // folders first, then samples
+
         if (listViewActive)
         {
             constexpr int rowHeight = 44;
-            for (int i = 0; i < cards.size(); ++i)
-                cards.getUnchecked (i)->setBounds (0, i * rowHeight, availableWidth, rowHeight);
-            gridHolder.setSize (availableWidth, juce::jmax (viewport.getHeight(), cards.size() * rowHeight));
+            for (int i = 0; i < count; ++i)
+                tiles[(size_t) i]->setBounds (0, i * rowHeight, availableWidth, rowHeight);
+            gridHolder.setSize (availableWidth, juce::jmax (viewport.getHeight(), count * rowHeight));
             return;
         }
 
@@ -3940,14 +4637,14 @@ private:
         constexpr int cardHeight = 140;
         constexpr int gap        = 12;
 
-        for (int i = 0; i < cards.size(); ++i)
+        for (int i = 0; i < count; ++i)
         {
             const int col = i % columns;
             const int row = i / columns;
-            cards.getUnchecked (i)->setBounds (col * (cardWidth + gap), row * (cardHeight + gap), cardWidth, cardHeight);
+            tiles[(size_t) i]->setBounds (col * (cardWidth + gap), row * (cardHeight + gap), cardWidth, cardHeight);
         }
 
-        const int rows = (cards.size() + columns - 1) / columns;
+        const int rows = (count + columns - 1) / columns;
         gridHolder.setSize (juce::jmax (viewport.getWidth(), columns * (cardWidth + gap)),
                              juce::jmax (viewport.getHeight(), rows * (cardHeight + gap)));
     }
@@ -3974,21 +4671,52 @@ private:
     void refreshCards()
     {
         const juce::String filter = searchBox.getText().trim().toLowerCase();
+        const bool searching = filter.isNotEmpty();
+
+        // Folders: the top level shows each folder as one card and hides its
+        // members; inside a folder only its members show; a search looks
+        // through everything, folder contents included.
+        if (openFolderId.isNotEmpty() && libraryOwningFolder (openFolderId) == nullptr) openFolderId = {};
+        const bool inFolder = openFolderId.isNotEmpty();
 
         bool anyEntries = false;
+        std::map<juce::String, int> folderTotals, folderMatches;
+        std::map<juce::String, juce::String> folderAnyMember;
         std::vector<const ezlibrary::LibraryEntry*> matched;
         for (auto& lib : libraryManager.libraries())
             for (auto& entry : lib->entries())
             {
                 anyEntries = true;
+                const bool inSomeFolder = entry.collectionId.isNotEmpty() && lib->findFolder (entry.collectionId).has_value();
+                if (inSomeFolder)
+                {
+                    ++folderTotals[entry.collectionId];
+                    if (folderAnyMember[entry.collectionId].isEmpty()) folderAnyMember[entry.collectionId] = entry.assetId;
+                }
                 if (! passesCategoryFilter (entry)) continue;
-                if (filter.isNotEmpty()
+                if (inSomeFolder) ++folderMatches[entry.collectionId];
+                if (inFolder ? entry.collectionId != openFolderId : (! searching && inSomeFolder)) continue;
+                if (searching
                     && ! entry.name.toLowerCase().contains (filter)
                     && ! entry.category.toLowerCase().contains (filter)
                     && ! entry.tags.toLowerCase().contains (filter))
                     continue;
                 matched.push_back (&entry);
             }
+
+        std::vector<std::pair<const ezlibrary::LibraryFolder*, const ezlibrary::Library*>> shownFolders;
+        if (! inFolder)
+            for (auto& lib : libraryManager.libraries())
+                for (auto& folder : lib->folders())
+                {
+                    anyEntries = true;
+                    if (searching ? ! folder.name.toLowerCase().contains (filter)
+                                  : (categoryFilter != CategoryFilter::all && folderMatches[folder.id] == 0))
+                        continue;
+                    shownFolders.push_back ({ &folder, lib.get() });
+                }
+        std::stable_sort (shownFolders.begin(), shownFolders.end(), [] (const auto& a, const auto& b)
+                          { return a.first->name.compareNatural (b.first->name) < 0; });
 
         // Phase 1.1 P2 "Sorting by Name/Tempo/Key/Date Added/Category/
         // Duration/Time Signature." stable_sort so entries that compare
@@ -4009,17 +4737,50 @@ private:
             }
         });
 
-        const bool showEmpty = matched.empty();
+        const bool showEmpty = matched.empty() && shownFolders.empty();
         emptyStateLabel.setVisible (showEmpty);
         emptyImportButton.setVisible (showEmpty && ! anyEntries);   // §5: the prominent import button only for a truly empty library, not a search miss
         viewport.setVisible (! showEmpty);
 
         if (showEmpty)
-            emptyStateLabel.setText (anyEntries ? ("No samples match \"" + searchBox.getText() + "\"")
-                                                 : juce::String ("No samples yet"),
-                                      juce::dontSendNotification);
+        {
+            juce::String text;
+            if (! anyEntries)   text = "No samples yet";
+            else if (searching) text = juce::String (inFolder ? "Nothing in this folder matches \"" : "No samples match \"") + searchBox.getText() + "\"";
+            else if (inFolder)  text = "This folder is empty - drag samples onto it";
+            else                text = "Nothing in this category";
+            emptyStateLabel.setText (text, juce::dontSendNotification);
+        }
 
+        tiles.clear();
         cards.clear();
+        folderCards.clear();
+
+        for (auto& shown : shownFolders)
+        {
+            const auto& folder = *shown.first;
+            auto* folderCard = folderCards.add (new LibraryFolderCard());
+            folderCard->setFolder (folder.name, folderTotals[folder.id],
+                                   LibrarySampleCard::collectionColorFor (folder.id), folderPicture (*shown.second, folder.id),
+                                   folderAnyMember[folder.id]);
+            folderCard->setListMode (listViewActive);
+            gridHolder.addAndMakeVisible (folderCard);
+            tiles.push_back (folderCard);
+
+            const juce::String folderId = folder.id;
+            // deferred: each of these rebuilds the cards, the calling one included
+            folderCard->onOpen = [this, folderId] { later ([this, folderId] { openFolder (folderId); }); };
+            folderCard->onMenu = [this, folderId] { later ([this, folderId] { showFolderMenu (folderId); }); };
+            folderCard->onAssetDropped = [this, folderId] (const juce::String& droppedId)
+            {
+                // dragging one card of a selection moves the whole selection
+                if (auto* owner = libraryOwningAsset (droppedId))
+                    if (owner->findById (droppedId)->collectionId == folderId) return;   // already in it (e.g. the folder dropped on itself)
+                const juce::StringArray ids = selectedIds.contains (droppedId) ? selectedIds : juce::StringArray (droppedId);
+                later ([this, ids, folderId] { moveAssetsToFolder (ids, folderId); });
+            };
+        }
+
         int index = 0;
         for (auto* entryPtr : matched)
         {
@@ -4027,7 +4788,9 @@ private:
             card->setEntry (*entryPtr);
             card->setLayoutMode (listViewActive ? LibrarySampleCard::LayoutMode::list : LibrarySampleCard::LayoutMode::grid);
             card->setAlternateShade ((index++ % 2) == 1);
+            card->setSelected (selectedIds.contains (entryPtr->assetId));
             gridHolder.addAndMakeVisible (card);
+            tiles.push_back (card);
 
             const juce::String assetId = entryPtr->assetId;
             auto loaded = getOrDecodeSamples (assetId);
@@ -4037,13 +4800,15 @@ private:
 
             card->onTap  = [this, assetId]
             {
+                if (selectMode) { toggleSelected (assetId); return; }
                 if (onCardTapMaybeLoad != nullptr && onCardTapMaybeLoad (assetId)) return;
                 toggleAudition (assetId);
             };
+            card->onToggleSelect = [this, assetId] { toggleSelected (assetId); };
             card->onMenu = [this, assetId] { showCardMenu (assetId); };
         }
 
-        layoutGrid();
+        updateFolderBar();   // re-lays out the grid too
     }
 
     // Decodes once per assetId, ever (cached for the tab's lifetime) -- the
@@ -4158,14 +4923,26 @@ private:
             if (auto e = lib->findById (assetId)) { owningLib = lib.get(); entry = *e; break; }
         if (owningLib == nullptr) return;
 
+        const bool inFolder = entry.collectionId.isNotEmpty() && owningLib->findFolder (entry.collectionId).has_value();
+        const bool isSelected = selectedIds.contains (assetId);
+        // folder moves act on the whole selection when this card is part of it
+        const juce::StringArray moveIds = isSelected ? selectedIds : juce::StringArray (assetId);
+
         juce::PopupMenu menu;
         menu.addItem (1, entry.favorite ? "Remove from Favorites" : "Add to Favorites");
         menu.addItem (3, "Edit Metadata...");
         menu.addSeparator();
+        menu.addSubMenu (moveIds.size() > 1 ? "Move " + juce::String (moveIds.size()) + " Selected to Folder" : juce::String ("Move to Folder"),
+                         buildMoveMenu (*owningLib, entry.collectionId));
+        if (inFolder) menu.addItem (21, moveIds.size() > 1 ? "Remove Selected from Folder" : "Remove from Folder");
+        menu.addItem (10, isSelected ? "Deselect" : "Select");
+        menu.addSeparator();
         menu.addItem (2, "Delete from Library");
 
-        menu.showMenuAsync (juce::PopupMenu::Options(), [this, assetId, owningLib] (int result)
+        menu.showMenuAsync (juce::PopupMenu::Options(), [this, assetId, owningLib, moveIds] (int result)
         {
+            if (handleMoveResult (result, *owningLib, moveIds)) return;
+            if (result == 10) { toggleSelected (assetId); return; }
             if (result == 1)
             {
                 if (auto e = owningLib->findById (assetId))
@@ -4322,6 +5099,353 @@ private:
             [this, assetIds, index, owningLib] { editMetadataSequentially (assetIds, index + 1, owningLib); });
     }
 
+    // ---- Folders -------------------------------------------------------------
+
+    void later (std::function<void()> fn)
+    {
+        juce::Component::SafePointer<MySamplesTab> safe (this);
+        juce::MessageManager::callAsync ([safe, fn] { if (safe != nullptr) fn(); });
+    }
+
+    ezlibrary::Library* libraryOwningFolder (const juce::String& folderId) const
+    {
+        for (auto& lib : libraryManager.libraries())
+            if (lib->findFolder (folderId).has_value()) return lib.get();
+        return nullptr;
+    }
+
+    ezlibrary::Library* libraryOwningAsset (const juce::String& assetId) const
+    {
+        for (auto& lib : libraryManager.libraries())
+            if (lib->findById (assetId).has_value()) return lib.get();
+        return nullptr;
+    }
+
+    static std::vector<ezlibrary::LibraryFolder> sortedFolders (const ezlibrary::Library& lib)
+    {
+        auto list = lib.folders();
+        std::stable_sort (list.begin(), list.end(), [] (const ezlibrary::LibraryFolder& a, const ezlibrary::LibraryFolder& b)
+                          { return a.name.compareNatural (b.name) < 0; });
+        return list;
+    }
+
+    void openFolder (const juce::String& folderId)
+    {
+        openFolderId = folderId;
+        selectedIds.clear();
+        selectMode = false;
+        refreshCards();
+        viewport.setViewPosition (0, 0);
+    }
+
+    void toggleSelected (const juce::String& assetId)
+    {
+        if (selectedIds.contains (assetId)) selectedIds.removeString (assetId);
+        else                                selectedIds.add (assetId);
+        selectMode = ! selectedIds.isEmpty();
+        for (auto* c : cards) c->setSelected (selectedIds.contains (c->getAssetId()));
+        updateFolderBar();
+    }
+
+    void clearSelection()
+    {
+        selectedIds.clear();
+        selectMode = false;
+        for (auto* c : cards) c->setSelected (false);
+        updateFolderBar();
+    }
+
+    // The bar under the filters: while samples are selected, what to do with
+    // them; otherwise, inside a folder, back / the folder's name / options.
+    void updateFolderBar()
+    {
+        const bool inFolder = openFolderId.isNotEmpty();
+        for (auto* b : { &selectionNewFolderButton, &selectionMoveButton, &selectionDoneButton }) b->setVisible (selectMode);
+        backButton.setVisible (inFolder && ! selectMode);
+        folderOptionsButton.setVisible (inFolder && ! selectMode);
+        barLabel.setVisible (selectMode || inFolder);
+
+        if (selectMode)
+        {
+            barLabel.setText (juce::String (selectedIds.size()) + " SELECTED", juce::dontSendNotification);
+        }
+        else if (auto* lib = inFolder ? libraryOwningFolder (openFolderId) : nullptr)
+        {
+            const int n = lib->folderSize (openFolderId);
+            barLabel.setText (lib->findFolder (openFolderId)->name.toUpperCase() + "     " + juce::String (n) + (n == 1 ? " ITEM" : " ITEMS"),
+                              juce::dontSendNotification);
+        }
+        resized();
+    }
+
+    // Decoded once per picture file; a new picture always gets a new file name.
+    juce::Image folderPicture (const ezlibrary::Library& lib, const juce::String& folderId)
+    {
+        const auto file = lib.folderImageFile (folderId);
+        if (! file.existsAsFile()) return {};
+        const auto key = file.getFullPathName();
+        if (auto it = folderImages.find (key); it != folderImages.end()) return it->second;
+
+        juce::Image image;
+        if (file.getSize() < 8 * 1024 * 1024)   // the app writes 512 px PNGs; anything far bigger was not written by it
+            image = juce::ImageFileFormat::loadFrom (file);
+        folderImages[key] = image;
+        return image;
+    }
+
+    // folderId empty = take the samples out of whatever folder they're in.
+    void moveAssetsToFolder (const juce::StringArray& assetIds, const juce::String& folderId)
+    {
+        int moved = 0;
+        for (auto& lib : libraryManager.libraries())
+        {
+            if (folderId.isNotEmpty() && ! lib->findFolder (folderId).has_value()) continue;
+            bool changed = false;
+            for (auto& id : assetIds)
+                if (lib->setEntryFolder (id, folderId)) { ++moved; changed = true; }
+            if (changed) lib->save();
+        }
+
+        selectedIds.clear();
+        selectMode = false;
+        refreshCards();
+
+        if (onMessage == nullptr || moved == 0) return;
+        const juce::String what = moved == 1 ? juce::String ("1 sample") : juce::String (moved) + " samples";
+        if (folderId.isEmpty())
+            onMessage (what + " taken out of the folder");
+        else if (auto* lib = libraryOwningFolder (folderId))
+            onMessage (what + " moved to \"" + lib->findFolder (folderId)->name + "\"");
+    }
+
+    // Item ids: 20 New Folder..., 21 Remove from Folder, 100 + n = the n-th of sortedFolders().
+    juce::PopupMenu buildMoveMenu (const ezlibrary::Library& lib, const juce::String& currentFolderId) const
+    {
+        juce::PopupMenu m;
+        m.addItem (20, "New Folder...");
+        const auto folders = sortedFolders (lib);
+        if (! folders.empty()) m.addSeparator();
+        for (int i = 0; i < (int) folders.size(); ++i)
+        {
+            const auto& f = folders[(size_t) i];
+            m.addItem (100 + i, f.name, f.id != currentFolderId, f.id == currentFolderId);
+        }
+        return m;
+    }
+
+    bool handleMoveResult (int result, const ezlibrary::Library& lib, const juce::StringArray& assetIds)
+    {
+        if (result == 20) { promptNewFolder (assetIds); return true; }
+        if (result == 21) { moveAssetsToFolder (assetIds, {}); return true; }
+        if (result >= 100)
+        {
+            const auto folders = sortedFolders (lib);
+            const int i = result - 100;
+            if (i < (int) folders.size()) moveAssetsToFolder (assetIds, folders[(size_t) i].id);
+            return true;
+        }
+        return false;
+    }
+
+    void showSelectionMoveMenu()
+    {
+        if (selectedIds.isEmpty()) return;
+        auto* lib = libraryOwningAsset (selectedIds[0]);
+        if (lib == nullptr) return;
+        auto m = buildMoveMenu (*lib, openFolderId);
+        if (openFolderId.isNotEmpty()) { m.addSeparator(); m.addItem (21, "Remove from This Folder"); }
+        const auto ids = selectedIds;
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&selectionMoveButton),
+                         [this, lib, ids] (int result) { handleMoveResult (result, *lib, ids); });
+    }
+
+    // New folder holding assetIds -- empty makes an empty folder to drag into.
+    void promptNewFolder (const juce::StringArray& assetIds)
+    {
+        ezlibrary::Library* lib = assetIds.isEmpty() ? nullptr : libraryOwningAsset (assetIds[0]);
+        if (lib == nullptr && ! libraryManager.libraries().empty()) lib = libraryManager.libraries().front().get();
+        if (lib == nullptr) return;
+
+        juce::StringArray names;
+        for (auto& id : assetIds) if (auto e = lib->findById (id)) names.add (e->name);
+
+        const juce::String message = assetIds.isEmpty()
+            ? juce::String ("Name the folder, then drag samples onto it.")
+            : "Put the " + juce::String (assetIds.size()) + (assetIds.size() == 1 ? " selected sample" : " selected samples") + " in a new folder.";
+        auto* aw = new juce::AlertWindow ("New Folder", message, juce::MessageBoxIconType::NoIcon);
+        aw->addTextEditor ("name", names.isEmpty() ? juce::String ("New folder") : ezlibrary::Library::suggestFolderName (names), "Folder name");
+        aw->addButton ("Create", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        aw->addButton ("Create + Picture...", 2);
+        aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        aw->enterModalState (true, juce::ModalCallbackFunction::create ([this, aw, assetIds, lib] (int result)
+        {
+            const juce::String name = aw->getTextEditorContents ("name");
+            delete aw;
+            if (result == 0) return;
+
+            const auto folder = lib->createFolder (name, assetIds);
+            lib->save();
+            selectedIds.clear();
+            selectMode = false;
+            refreshCards();
+            if (onMessage) onMessage ("Created folder \"" + folder.name + "\"");
+            if (result == 2) choosePictureForFolder (folder.id, {});
+        }), false);
+    }
+
+    void promptRenameFolder (const juce::String& folderId)
+    {
+        auto* lib = libraryOwningFolder (folderId);
+        if (lib == nullptr) return;
+        auto* aw = new juce::AlertWindow ("Rename Folder", juce::String(), juce::MessageBoxIconType::NoIcon);
+        aw->addTextEditor ("name", lib->findFolder (folderId)->name, "Folder name");
+        aw->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        aw->enterModalState (true, juce::ModalCallbackFunction::create ([this, aw, folderId] (int result)
+        {
+            const juce::String name = aw->getTextEditorContents ("name").trim();
+            delete aw;
+            if (result != 1 || name.isEmpty()) return;
+            if (auto* owner = libraryOwningFolder (folderId))
+            {
+                auto updated = *owner->findFolder (folderId);
+                updated.name = name.substring (0, ezlibrary::Library::kMaxFolderNameLength);
+                owner->upsertFolder (updated);
+                owner->save();
+                refreshCards();
+            }
+        }), false);
+    }
+
+    void showFolderMenu (const juce::String& folderId)
+    {
+        auto* lib = libraryOwningFolder (folderId);
+        if (lib == nullptr) return;
+        const bool hasPicture = lib->folderImageFile (folderId).existsAsFile();
+
+        juce::PopupMenu m;
+        if (openFolderId != folderId) m.addItem (1, "Open");
+        m.addItem (2, "Rename...");
+        m.addItem (3, hasPicture ? "Change Picture..." : "Choose Picture...");
+        if (hasPicture) m.addItem (4, "Remove Picture");
+        m.addSeparator();
+        m.addItem (5, "Delete Folder (keeps the samples)");
+
+        auto options = juce::PopupMenu::Options();
+        if (openFolderId == folderId) options = options.withTargetComponent (&folderOptionsButton);
+        m.showMenuAsync (options, [this, folderId] (int result)
+        {
+            auto* owner = libraryOwningFolder (folderId);
+            if (owner == nullptr) return;
+            if (result == 1) openFolder (folderId);
+            else if (result == 2) promptRenameFolder (folderId);
+            else if (result == 3) choosePictureForFolder (folderId, {});
+            else if (result == 4) { owner->clearFolderImage (folderId); owner->save(); refreshCards(); }
+            else if (result == 5)
+            {
+                const int n = owner->folderSize (folderId);
+                const juce::String name = owner->findFolder (folderId)->name;
+                owner->removeFolder (folderId);
+                owner->save();
+                if (openFolderId == folderId) openFolderId = {};
+                refreshCards();
+                if (onMessage) onMessage ("Deleted folder \"" + name + "\" - its " + juce::String (n)
+                                            + (n == 1 ? " sample is" : " samples are") + " still in the library");
+            }
+        });
+    }
+
+    void choosePictureForFolder (const juce::String& folderId, std::function<void()> onDone)
+    {
+        pictureChooser = std::make_unique<juce::FileChooser> ("Choose a picture for the folder...",
+                                                                juce::File::getSpecialLocation (juce::File::userPicturesDirectory),
+                                                                "*.png;*.jpg;*.jpeg");
+        constexpr auto chooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+        pictureChooser->launchAsync (chooserFlags, [this, folderId, onDone] (const juce::FileChooser& fc)
+        {
+            const auto file = fc.getResult();
+            if (file != juce::File())
+            {
+                if (auto* lib = libraryOwningFolder (folderId))
+                {
+                    juce::String error;
+                    if (lib->setFolderImage (folderId, file, error))
+                    {
+                        lib->save();
+                        refreshCards();
+                        if (onMessage) onMessage ("Folder picture set");
+                    }
+                    else if (onMessage) onMessage (error);
+                }
+            }
+            if (onDone) onDone();
+        });
+    }
+
+    // Owner: "ask when importing." Which folder the new files go in -- a new
+    // one (the default for several files), none (the default for one), or
+    // an existing folder -- with an optional picture. `then` runs afterwards
+    // either way (the metadata prompt).
+    void promptImportFolder (const juce::StringArray& assetIds, ezlibrary::Library* lib, std::function<void()> then)
+    {
+        juce::StringArray names;
+        for (auto& id : assetIds) if (auto e = lib->findById (id)) names.add (e->name);
+        const auto existing = sortedFolders (*lib);
+        const juce::String suggested = ezlibrary::Library::suggestFolderName (names);
+
+        const juce::String message = assetIds.size() == 1
+            ? "Put \"" + names[0] + "\" in a folder?"
+            : "Put the " + juce::String (assetIds.size()) + " imported files in a folder? Linked stems stay together, and you can give the folder a picture.";
+        auto* aw = new juce::AlertWindow ("Folder", message, juce::MessageBoxIconType::NoIcon);
+
+        juce::StringArray choices { "New folder", "No folder" };
+        for (auto& f : existing) choices.add ("Add to: " + f.name);
+        aw->addComboBox ("where", choices, "Where");
+        aw->addTextEditor ("name", suggested, "New folder name");
+
+        auto* combo = aw->getComboBoxComponent ("where");
+        auto* nameEditor = aw->getTextEditor ("name");
+        combo->setSelectedItemIndex (assetIds.size() >= 2 ? 0 : 1, juce::dontSendNotification);
+        nameEditor->setEnabled (combo->getSelectedItemIndex() == 0);
+        combo->onChange = [combo, nameEditor] { nameEditor->setEnabled (combo->getSelectedItemIndex() == 0); };
+
+        aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        aw->addButton ("OK + Picture...", 2);
+        aw->addButton ("Skip", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        aw->enterModalState (true, juce::ModalCallbackFunction::create (
+            [this, aw, assetIds, lib, existing, suggested, then] (int result)
+            {
+                const int choice = aw->getComboBoxComponent ("where")->getSelectedItemIndex();
+                const juce::String typed = aw->getTextEditorContents ("name").trim();
+                delete aw;
+
+                juce::String folderId;
+                if (result != 0)
+                {
+                    if (choice == 0)
+                    {
+                        folderId = lib->createFolder (typed.isEmpty() ? suggested : typed, assetIds).id;
+                    }
+                    else if (choice >= 2 && choice - 2 < (int) existing.size()
+                             && lib->findFolder (existing[(size_t) (choice - 2)].id).has_value())
+                    {
+                        folderId = existing[(size_t) (choice - 2)].id;
+                        for (auto& id : assetIds) lib->setEntryFolder (id, folderId);
+                    }
+
+                    if (folderId.isNotEmpty())
+                    {
+                        lib->save();
+                        refreshCards();
+                        if (onMessage) onMessage ("Added to folder \"" + lib->findFolder (folderId)->name + "\"");
+                    }
+                }
+
+                if (result == 2 && folderId.isNotEmpty()) choosePictureForFolder (folderId, then);
+                else if (then) then();
+            }), false);
+    }
+
     // Milestone 16-T2: picks one or more audio files and imports each into
     // the first Library root (LibraryManager always has at least one --
     // SessionComponent's constructor adds a default Documents/EzPlay/Library
@@ -4417,9 +5541,11 @@ private:
             int imported = 0, duplicates = 0, failed = 0;
             juce::String firstName;
             juce::StringArray importedAssetIds;
+            juce::StringArray folderCandidateIds;   // new files plus ones already in the library -- both can go in the folder
             for (auto& analyzed : analyzedFiles)
             {
                 auto result = eximport::registerAnalyzedImport (targetLibrary, analyzed);
+                if (result.success && result.entry.isValid()) folderCandidateIds.addIfNotAlreadyThere (result.entry.assetId);
                 if (! result.success) ++failed;
                 else if (result.wasDuplicate) ++duplicates;
                 else
@@ -4430,26 +5556,8 @@ private:
                 }
             }
 
-            // Phase 1.1 P2 "auto-detect/group a complete stem set into one
-            // logical collection with a shared color": files picked
-            // together in ONE multi-file import ARE one collection -- see
-            // LibraryEntry::collectionId's own comment for why this real
-            // signal was used instead of guessing from filenames. A single
-            // file imported alone is never "a set."
-            if (importedAssetIds.size() >= 2)
-            {
-                const juce::String collectionId = juce::Uuid().toString();
-                for (auto& assetId : importedAssetIds)
-                {
-                    if (auto e = targetLibrary.findById (assetId))
-                    {
-                        auto updated = *e;
-                        updated.collectionId = collectionId;
-                        targetLibrary.upsert (updated);
-                    }
-                }
-                targetLibrary.save();
-            }
+            // Grouping a multi-file import used to happen silently here; the
+            // user now chooses the folder (promptImportFolder() below).
 
             refreshCards();
             if (onMessage)
@@ -4463,30 +5571,37 @@ private:
                 onMessage (msg);
             }
 
-            // Owner request: "when uploading files to the library give me
-            // the option to insert the metadata." One file: straight into
-            // the existing metadata editor (Cancel skips it). Several: ask
-            // once, then walk the editor through each imported file.
-            if (importedAssetIds.size() == 1)
+            // Owner: "ask when importing" -- which folder first, then the
+            // metadata prompt (owner request: "when uploading files to the
+            // library give me the option to insert the metadata"). One file:
+            // straight into the metadata editor (Cancel skips it). Several:
+            // ask once, then walk the editor through each imported file.
+            auto* libPtr = &targetLibrary;
+            auto askMetadata = [this, importedAssetIds, libPtr]
             {
-                promptEditAssetMetadata (importedAssetIds[0], &targetLibrary);
-            }
-            else if (importedAssetIds.size() >= 2)
-            {
-                auto* ask = new juce::AlertWindow ("Add Metadata",
-                                                    "Add metadata to the " + juce::String (importedAssetIds.size())
-                                                      + " imported samples now?",
-                                                    juce::MessageBoxIconType::NoIcon);
-                ask->addButton ("Add Metadata", 1, juce::KeyPress (juce::KeyPress::returnKey));
-                ask->addButton ("Not Now", 0, juce::KeyPress (juce::KeyPress::escapeKey));
-                auto* libPtr = &targetLibrary;
-                ask->enterModalState (true, juce::ModalCallbackFunction::create (
-                    [this, ask, importedAssetIds, libPtr] (int result)
-                    {
-                        delete ask;
-                        if (result == 1) editMetadataSequentially (importedAssetIds, 0, libPtr);
-                    }), false);
-            }
+                if (importedAssetIds.size() == 1)
+                {
+                    promptEditAssetMetadata (importedAssetIds[0], libPtr);
+                }
+                else if (importedAssetIds.size() >= 2)
+                {
+                    auto* ask = new juce::AlertWindow ("Add Metadata",
+                                                        "Add metadata to the " + juce::String (importedAssetIds.size())
+                                                          + " imported samples now?",
+                                                        juce::MessageBoxIconType::NoIcon);
+                    ask->addButton ("Add Metadata", 1, juce::KeyPress (juce::KeyPress::returnKey));
+                    ask->addButton ("Not Now", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+                    ask->enterModalState (true, juce::ModalCallbackFunction::create (
+                        [this, ask, importedAssetIds, libPtr] (int result)
+                        {
+                            delete ask;
+                            if (result == 1) editMetadataSequentially (importedAssetIds, 0, libPtr);
+                        }), false);
+                }
+            };
+
+            if (folderCandidateIds.isEmpty()) askMetadata();
+            else promptImportFolder (folderCandidateIds, libPtr, askMetadata);
         }
     }
 
@@ -4515,6 +5630,16 @@ private:
     juce::Viewport viewport;
     juce::Component gridHolder;
     juce::OwnedArray<LibrarySampleCard> cards;
+    juce::OwnedArray<LibraryFolderCard> folderCards;
+    std::vector<juce::Component*> tiles;   // folder cards then sample cards, in display order
+    std::map<juce::String, juce::Image> folderImages;
+    juce::StringArray selectedIds;
+    bool selectMode { false };
+    juce::String openFolderId;             // empty = the top level
+    juce::TextButton newFolderButton, backButton, folderOptionsButton,
+                     selectionNewFolderButton, selectionMoveButton, selectionDoneButton;
+    juce::Label barLabel;
+    std::unique_ptr<juce::FileChooser> pictureChooser;
     std::map<juce::String, LoadedSample> sampleCache;
     juce::String currentlyAuditioningAssetId;
     juce::Rectangle<int> browseArea;
@@ -5987,15 +7112,121 @@ public:
 //  local coordinates. Raw hex, not performlive:: -- this class is defined
 //  before that namespace exists in this file (established convention).
 //==============================================================================
+//==============================================================================
+//  Owner: "something on the left side of the decks that shows this one has a
+//  click and a guide, and in perform mode you trigger it." One cell per row,
+//  two pills: CLICK and GUIDE. Dashed = the row has no such track; outlined
+//  = it has one, switched off; filled = on. A small word under the label says
+//  whether it's the song's own track or the app's built-in one. Tap a pill
+//  to switch it; right-click or press-and-hold for the menu.
+//==============================================================================
+class GuideSlotCell : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    GuideSlotCell()
+    {
+        touchHold.onLongPress = [this] (juce::Point<int>) { if (onMenu) onMenu(); };
+    }
+
+    std::function<void (bool isGuide)> onTapPill;
+    std::function<void()> onMenu;
+
+    void setState (bool hasClickTrack, bool clickOn, bool hasGuideTrack, bool guideOn, bool songClick, bool songGuide)
+    {
+        hasClick = hasClickTrack; clickLit = clickOn; hasGuide = hasGuideTrack; guideLit = guideOn;
+        useSongClick = songClick; useSongGuide = songGuide;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::Colour amber (0xffffc933), cyan (0xff00d9ff), card (0xff151527), dim (0xff6f7099), bright (0xfff2f0ff);
+        auto area = getLocalBounds().reduced (2);
+        const int gap = 4;
+        const int h = (area.getHeight() - gap) / 2;
+        drawPill (g, area.removeFromTop (h).toFloat(), "CLICK", amber, hasClick, clickLit, useSongClick, card, dim, bright);
+        area.removeFromTop (gap);
+        drawPill (g, area.toFloat(), "GUIDE", cyan, hasGuide, guideLit, useSongGuide, card, dim, bright);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        if (e.mods.isPopupMenu()) { if (onMenu) onMenu(); return; }
+        touchHold.begin (e);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override { touchHold.drag (e); }
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (touchHold.end() || e.mods.isPopupMenu()) return;
+        if (! getLocalBounds().contains (e.getPosition())) return;
+        if (onTapPill) onTapPill (e.getPosition().y > getHeight() / 2);
+    }
+
+private:
+    static void drawPill (juce::Graphics& g, juce::Rectangle<float> r, const char* label, juce::Colour accent,
+                          bool has, bool lit, bool song, juce::Colour card, juce::Colour dim, juce::Colour bright)
+    {
+        const float radius = 6.0f;
+        if (has && lit)
+        {
+            g.setColour (accent.withAlpha (0.10f));
+            g.fillRoundedRectangle (r.expanded (2.0f), radius + 2.0f);
+            g.setColour (accent.withAlpha (0.85f));
+            g.fillRoundedRectangle (r, radius);
+        }
+        else
+        {
+            g.setColour (card);
+            g.fillRoundedRectangle (r, radius);
+            if (has) { g.setColour (accent.withAlpha (0.8f)); g.drawRoundedRectangle (r.reduced (0.5f), radius, 1.5f); }
+            else
+            {
+                juce::Path outline, dashed;
+                outline.addRoundedRectangle (r.reduced (0.5f), radius);
+                const float dashes[] { 3.0f, 3.0f };
+                juce::PathStrokeType (1.0f).createDashedStroke (dashed, outline, dashes, 2);
+                g.setColour (dim.withAlpha (0.6f));
+                g.strokePath (dashed, juce::PathStrokeType (1.0f));
+            }
+        }
+
+        auto text = r.reduced (2.0f, 3.0f);
+        g.setColour (has && lit ? juce::Colours::black : (has ? bright : dim));
+        g.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)).withExtraKerningFactor (0.06f));
+        const bool room = r.getHeight() >= 30.0f;
+        g.drawText (label, room ? text.removeFromTop (text.getHeight() * 0.55f) : text, juce::Justification::centred, false);
+        if (room)
+        {
+            g.setFont (juce::Font (juce::FontOptions (8.0f)));
+            g.setColour (has && lit ? juce::Colours::black.withAlpha (0.7f) : dim);
+            g.drawText (! has ? "none" : (song ? "song" : "built-in"), text, juce::Justification::centred, false);
+        }
+    }
+
+    bool hasClick { false }, clickLit { false }, hasGuide { false }, guideLit { false };
+    bool useSongClick { true }, useSongGuide { true };
+    eztouch::LongPress touchHold;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (GuideSlotCell)
+};
+
 class PerformContentView : public juce::Component
 {
 public:
-    juce::Rectangle<int> sceneBarBgArea, railBgArea, deckPanelArea, sceneLabelArea;
+    juce::Rectangle<int> sceneBarBgArea, railBgArea, guideColBgArea, deckPanelArea, sceneLabelArea;
 
     void paint (juce::Graphics& g) override
     {
         g.setColour (juce::Colour (0xff0c0c17));   // == performlive::kShellBg
         g.fillRect (sceneBarBgArea);
+
+        // the song-tracks column between the rail and the decks (GuideSlotCell)
+        g.setColour (juce::Colour (0xff0c0c17));
+        g.fillRect (guideColBgArea);
+        g.setColour (juce::Colour (0xffa3a6cc));
+        g.setFont (performfonts::headingFont (9.0f).withExtraKerningFactor (0.01f));
+        g.drawFittedText ("SONG\nTRACKS", guideColBgArea.reduced (6, 18).removeFromTop (24),
+                           juce::Justification::centred, 2);
 
         g.setColour (juce::Colour (0xffa3a6cc));   // == performlive::kTextDim
         g.setFont (performfonts::headingFont (11.0f).withExtraKerningFactor (0.01f));
@@ -6044,6 +7275,8 @@ public:
     static constexpr int kHeaderHeight          = 56;    // §2.1 -- brand, nav tabs, signature indicator, master volume, project selector, gear all in this one row
     static constexpr int kTransportSceneHeight  = 64;    // §2.2 -- transport (left, fixed 420px) + scenes (right, flex), one row
     static constexpr int kRailWidth             = 88;    // §2.3
+    static constexpr int kGuideColWidth         = 68;    // the song-tracks (click/guide) column left of the decks
+    struct SongTrack;   // a row's own click or guide track -- defined with the song-track members below
     static constexpr int kStatusBarHeight       = 26;    // §2.6 -- new this step
 
     // (The old kMinPerformPanelHeight dock-clamp constant is gone: PERFORM
@@ -6055,6 +7288,16 @@ public:
     {
         formatManager.registerBasicFormats();
         session.setTempo (masterTempo);
+        loadCueBank();   // Guide.h: the spoken cue recordings, once
+        for (auto& c : trackInput) c.store (-1, std::memory_order_relaxed);
+        if (auto* settings = getAppSettings()) pluginLibrary.loadFrom (*settings);
+        for (auto& s : instruments) s.setPlayHead (&hostPlayHead);
+        for (int i = 0; i < kNumStrips; ++i)
+        {
+            strips[(size_t) i] = std::make_unique<amanorsac::perform::PerformProcessor>();
+            strips[(size_t) i]->setPlayConfigDetails (2, 2, 48000.0, 512);
+            stripOn[(size_t) i].store (false, std::memory_order_relaxed);
+        }
 
         // SPEC_PERFORM_V2 GROUP H4: -1 = "no link" for every layer -- see
         // layerLinkedPad's own declaration comment for why this can't be a
@@ -6069,9 +7312,14 @@ public:
         // environment, so this deliberately falls through to paint()'s own
         // placeholder every time until the owner hands off the file.
         {
+            // Owner: the header read "LOGO / AQUARII AUDIO" whenever logo.png
+            // wasn't beside the exe. The wordmark is embedded now (CMake
+            // PerformLiveArt); a logo.png next to the exe still overrides it.
             auto logoFile = searchFor ("logo.png");
             if (logoFile.existsAsFile())
                 logoImage = juce::ImageFileFormat::loadFrom (logoFile);
+            if (! logoImage.isValid())
+                logoImage = juce::ImageCache::getFromMemory (BinaryData::logo_png, BinaryData::logo_pngSize);
         }
 
         // Milestone 16: the default library root (MILESTONE_16_ARCHITECTURE.md's
@@ -6092,6 +7340,11 @@ public:
             {
                 auto& d = session.decks[(size_t) (sig.firstDeckIndex + slot)];
                 d.beatsPerBar = sig.beatsPerBar;
+                d.mode = ezdeck::DeckMode::stem;   // owner: every row starts in stem mode (a project can still save loop mode)
+                useSongClick[(size_t) (sig.firstDeckIndex + slot)] = true;
+                useSongGuide[(size_t) (sig.firstDeckIndex + slot)] = true;
+                liveClickTrack[(size_t) (sig.firstDeckIndex + slot)].store (nullptr, std::memory_order_relaxed);
+                liveGuideTrack[(size_t) (sig.firstDeckIndex + slot)].store (nullptr, std::memory_order_relaxed);
                 // bounds nextPlay's auto-advance to this signature's own
                 // 8-deck range -- see Deck.h's own comment on this field.
                 d.autoAdvanceRangeStart = sig.firstDeckIndex;
@@ -6187,8 +7440,12 @@ public:
                     const int flat = flatDeckIndexForSlot (slot);
                     if (! canMutateDeckState (flat)) { showToast (deckLabel (flat) + ": stop this deck first to load into it"); return; }
                     juce::String firstAudio;
-                    for (const auto& p : paths) if (isSupportedAudioPath (p)) { firstAudio = p; break; }
+                    juce::Array<juce::File> audio;
+                    for (const auto& p : paths) if (isSupportedAudioPath (p)) { audio.add (juce::File (p)); if (firstAudio.isEmpty()) firstAudio = p; }
                     if (firstAudio.isEmpty()) return;
+                    // Owner: several files at once are a set of stems -- the
+                    // import window reads their names and places them
+                    if (audio.size() > 1) { openStemImport (flat, audio, {}); return; }
                     clearLayer (flat, l);
                     loadLayer (flat, l, juce::File (firstAudio));
                     refreshSlotLabels();
@@ -6233,6 +7490,14 @@ public:
             cell->setTooltip ("Play this row now");
             performView.addAndMakeVisible (cell);
             triggerCells.add (cell);
+
+            // the row's click and guide, left of its decks
+            auto* gcell = new GuideSlotCell();
+            gcell->onTapPill = [this, slot] (bool isGuide) { toggleSongTrackPill (flatDeckIndexForSlot (slot), isGuide); };
+            gcell->onMenu    = [this, slot] { showSongTrackMenu (flatDeckIndexForSlot (slot)); };
+            gcell->setTooltip ("This row's click and guide: tap to switch on or off, hold or right-click for options");
+            performView.addAndMakeVisible (gcell);
+            guideCells.add (gcell);
         }
 
         // UI_SPEC_PERFORM.md §2.4: the panel chrome around the grid above.
@@ -6335,7 +7600,7 @@ public:
             // owner-assignable colour, lit/glowing when active."
             b->onRightClick = [this, i] { promptColorSignature (i); };
             if (signatureColourSet[(size_t) i]) b->setAccentColour (juce::Colour (signatureColourArgb[(size_t) i]));
-            b->setTooltip ("View " + signatureManager.signature (i).name + " decks · right-click to recolour");
+            b->setTooltip ("View " + juce::String (signatureManager.signature (i).name) + juce::String (juce::CharPointer_UTF8 (" decks " "\xc2" "\xb7" " right-click to recolour")));
             performView.addAndMakeVisible (b);
             signatureButtons.add (b);
         }
@@ -6483,10 +7748,16 @@ public:
         // untouched; likewise the per-layer clip editor (openClipEditor(),
         // ClipEditorContent) double-tap opens is unrelated and stays.
         static const struct { const char* label; std::function<void (SessionComponent*)> onClick; } kNavItems[] = {
+            // Owner: "perform, playback, web and store at one side, then some
+            // space, then library and mixer, since they open separately." The
+            // four full-screen views first; the two docks after a gap (see
+            // resized(), kNavDockGroupGap).
             { "PERFORM",     [] (SessionComponent* s) { s->activeNavIndex = 0; s->refreshActiveView(); } },
             // Section playback: the AbleSet-style performance screen. A full
             // view like PERFORM/STORE, not a dock -- it IS the stage screen.
             { "PLAYBACK",    [] (SessionComponent* s) { s->activeNavIndex = kNavPlayback; s->refreshActiveView(); if (s->playbackView) s->playbackView->songChanged(); } },
+            { "WEB",         [] (SessionComponent* s) { s->activeNavIndex = kNavBrowser; s->refreshActiveView(); } },
+            { "STORE",       [] (SessionComponent* s) { s->activeNavIndex = 4; s->refreshActiveView(); } },
             // Phase 1.1 P2/P3: LIBRARY and MIXER are no longer mutually-
             // exclusive full-screen views -- they're docked panels sharing
             // ONE bottom dock slot (opening one closes the other, same as
@@ -6503,7 +7774,6 @@ public:
                 { s->mixerDockOpen = ! s->mixerDockOpen;
                   if (s->mixerDockOpen) { s->libraryDockOpen = false; s->closeEditorDock(); }
                   s->refreshActiveView(); s->resized(); s->repaint(); } },
-            { "STORE",       [] (SessionComponent* s) { s->activeNavIndex = 4; s->refreshActiveView(); } },
         };
         for (auto& item : kNavItems)
         {
@@ -6581,26 +7851,45 @@ public:
         static const juce::String kChannelNames[ezdeck::kNumMixerChannels] = {
             "Deck 1", "Deck 2", "Deck 3", "Deck 4",
             "Deck 5", "Deck 6", "Deck 7", "Deck 8",
-            "Pads", "FX", "Metro"
+            "Live 1", "Live 2", "Live 3", "Live 4",
+            "Pads", "FX", "Click", "Cues"
         };
+        mixerStripViewport.setViewedComponent (&mixerStripHolder, false);
+        mixerStripViewport.setScrollBarsShown (false, true);
+        mixerStripViewport.setScrollBarThickness (10);
+        mixerView.addAndMakeVisible (mixerStripViewport);
         // UI_SPEC_MIXER.md §1: Deck 1-4 get their own deck-column accent (the
         // same cyan/green/amber/violet the deck grid uses); Pads/FX/Metro use
         // kTextDim (neutral) -- "a channel's colour matches its deck column"
         // is the whole point, so only the first 4 get a real accent.
         for (int c = 0; c < ezdeck::kNumMixerChannels; ++c)
         {
-            const bool isTab = c < ezdeck::kNumLayers;
-            auto accent = isTab ? performlive::columnAccent (c) : juce::Colour (performlive::kTextDim);
+            const bool isTab  = c < ezdeck::kNumLayers;
+            const bool isLive = c >= ezdeck::kNumLayers && c < ezdeck::kNumLayers + ezdeck::kNumLiveTracks;
+            auto accent = isTab ? performlive::columnAccent (c) : isLive ? juce::Colour (0xffff6b8a) : juce::Colour (performlive::kTextDim);
             // Visual-polish pass: Metro (last channel) gets its own amber
             // wash, matching the reference's own distinctly-tinted Metro
             // strip -- every other channel passes the default transparent.
             const bool isMetro = (c == (int) ezdeck::MixerChannel::Metro);
-            auto* strip = new MixerChannelStrip (kChannelNames[c], accent, isTab, true,
-                                                  isMetro ? juce::Colour (0xffffc933) : juce::Colours::transparentBlack);
+            const bool isCues  = (c == (int) ezdeck::MixerChannel::Cues);
+            auto* strip = new MixerChannelStrip (kChannelNames[c], accent, isTab || isLive, true,
+                                                  isMetro ? juce::Colour (0xffffc933)
+                                                : isCues  ? juce::Colour (0xff00d9ff) : juce::Colours::transparentBlack);
             const auto channel = (ezdeck::MixerChannel) c;
             strip->onGainChanged = [this, channel] (float g) { mixer.setChannelGain (channel, g); };
-            strip->onMuteChanged = [this, channel] (bool m) { mixer.setChannelMute (channel, m); };
-            strip->onSoloChanged = [this, channel] (bool s) { mixer.setChannelSolo (channel, s); refreshMixerSoloVisuals(); };
+            strip->onMuteChanged = [this, channel] (bool m) { mixer.setChannelMute (channel, m); refreshColumnHeaders(); };
+            strip->onSoloChanged = [this, channel] (bool s) { mixer.setChannelSolo (channel, s); refreshMixerSoloVisuals(); refreshColumnHeaders(); };
+            if (c < kNumStrips)
+            {
+                strip->onFxToggle  = [this, c] { setStripOn (c, ! stripOn[(size_t) c].load (std::memory_order_relaxed)); };
+                strip->onStripMenu = [this, c] { showStripMenu (c); };
+            }
+            if (isLive)
+            {
+                const int t = c - ezdeck::kNumLayers;
+                strip->setSourceText ("Choose source");
+                strip->onSourceClicked = [this, t] { showTrackSourceMenu (t); };
+            }
             // SPEC_OUTPUT_ROUTING.md: Phase 1.1 P3 built this selector and
             // its persistence with exactly one documented gap -- "this build
             // has one physical output, so audio still plays through Main."
@@ -6628,7 +7917,7 @@ public:
                         showToast (kChannelNames[(int) channel] + ": routed to \"" + label + "\" -- direct to hardware, bypasses Master");
                 }
             };
-            mixerView.addAndMakeVisible (strip);
+            mixerStripHolder.addAndMakeVisible (strip);
             mixerStrips.add (strip);
         }
         {
@@ -6639,6 +7928,21 @@ public:
             strip->onGainChanged = [this] (float g) { mixer.setMasterGain (g); };
             mixerView.addAndMakeVisible (strip);
             masterStrip.reset (strip);
+        }
+        {
+            // Owner: "the browser and YouTube should have a dedicated mixer
+            // channel." WebView2 plays through Windows, not through this
+            // mixer, so the strip sets the page's own players' level and
+            // mute (BrowserTab::setMediaLevel) -- no meter, no solo, no
+            // routing, because no audio passes through here.
+            auto* strip = new MixerChannelStrip ("Web", juce::Colour (performlive::kTextDim), false, true, juce::Colour (0xffff7a45));
+            strip->setMeterVisible (false);
+            strip->setSoloAvailable (false);
+            strip->setRoutable (false);
+            strip->onGainChanged = [this] (float g) { webGain = g; pushWebLevel(); };
+            strip->onMuteChanged = [this] (bool m) { webMute = m; pushWebLevel(); };
+            mixerStripHolder.addAndMakeVisible (strip);
+            webStrip.reset (strip);
         }
         refreshMixerSoloVisuals();
 
@@ -6746,7 +8050,7 @@ public:
             b->onTap          = [this, i] { recallScene (i); };
             b->onHoldComplete = [this, i] { saveScene (i); };
             b->onRightClick   = [this, i] { showSceneMenu (i); };
-            b->setTooltip ("Tap to recall · hold to save · right-click to recolour");
+            b->setTooltip (juce::String (juce::CharPointer_UTF8 ("Tap to recall " "\xc2" "\xb7" " hold to save " "\xc2" "\xb7" " right-click to recolour")));
             performView.addAndMakeVisible (b);
             sceneButtons.add (b);
         }
@@ -6930,13 +8234,22 @@ public:
         editorCloseButton.onClick = [this] { closeEditorDock(); resized(); };
         editorView.addAndMakeVisible (editorCloseButton);
 
-        // STORE, for the public beta: how to become a creator. No network --
-        // the online pack store is not in this build. See CreatorsTab.h.
-        {
-            auto* app = juce::JUCEApplicationBase::getInstance();   // non-const: getApplicationVersion() is not a const member
-            storeTab = std::make_unique<creators::CreatorsTab> (app != nullptr ? app->getApplicationVersion() : juce::String());
-        }
-        storeView.addAndMakeVisible (*storeTab);
+        // Owner: "build me a fake store that looks like this ... all buttons
+        // say coming soon." STORE opens on the showcase (StoreShowcase.h), with
+        // the creator sign-up at the top. Its "Creator details" opens the
+        // creators page (logo, email, Instagram, the WhatsApp group, the beta's
+        // end date); the back button returns to the showcase. The online pack
+        // store is not in this build.
+        creatorsTab = std::make_unique<creators::CreatorsTab> (juce::JUCEApplication::getInstance() != nullptr
+                                                                   ? juce::JUCEApplication::getInstance()->getApplicationVersion() : juce::String());
+        storeView.addAndMakeVisible (*creatorsTab);
+        storeShowcase = std::make_unique<ezstore::StoreShowcase>();
+        storeShowcase->onComingSoon   = [this] (const juce::String& what) { showToast (what + " -- coming soon"); };
+        storeShowcase->onOpenCreators = [this] { showStorePage (StorePage::creators); };
+        storeView.addAndMakeVisible (*storeShowcase);
+        storeBackButton.onClick = [this] { showStorePage (StorePage::showcase); };
+        storeView.addChildComponent (storeBackButton);
+        showStorePage (StorePage::showcase);
 
         // PLAYBACK: the performance screen. It owns no state -- see
         // PlaybackView.h -- everything comes through the PlaybackHost
@@ -6984,6 +8297,18 @@ public:
         // to the message thread inside MidiActionRouter itself -- see that
         // class's own header comment.
         midiRouter = std::make_unique<ezaction::MidiActionRouter> (actionRegistry);
+        // PX-D: notes reach the live tracks' instruments straight from the MIDI
+        // thread -- each track listens to every channel, or just its own.
+        midiRouter->onRawMessage = [this] (const juce::MidiMessage& m)
+        {
+            for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+            {
+                auto& s = instruments[(size_t) t];
+                if (! s.hasInstrument()) continue;
+                const int want = trackMidiChannel[(size_t) t].load (std::memory_order_relaxed);
+                if (want == 0 || m.getChannel() == 0 || m.getChannel() == want) s.addMidi (m);
+            }
+        };
         for (auto& device : juce::MidiInput::getAvailableDevices())
         {
             if (auto midiIn = juce::MidiInput::openDevice (device.identifier, midiRouter.get()))
@@ -7045,6 +8370,494 @@ public:
      * fully open, which also breaks the feedback loop: setAudioDeviceSetup()
      * itself fires the change notification that brought us here.
      */
+    /** PX-C: opens every input the device has once any column asks for a
+        live input (and leaves them closed otherwise -- an open input the app
+        never reads is just latency and CPU). */
+    void requestLiveInputChannels()
+    {
+        if (reconfiguringInputs) return;
+        auto* device = deviceManager.getCurrentAudioDevice();
+        if (device == nullptr) return;
+
+        bool wanted = false;
+        for (auto& c : trackInput) if (c.load (std::memory_order_relaxed) >= 0) wanted = true;
+
+        const int available = device->getInputChannelNames().size();
+        const int open      = device->getActiveInputChannels().countNumberOfSetBits();
+        if (! wanted || available <= 0 || open >= available) return;
+
+        const juce::ScopedValueSetter<bool> guard (reconfiguringInputs, true);
+        auto setup = deviceManager.getAudioDeviceSetup();
+        setup.useDefaultInputChannels = false;
+        setup.inputChannels.clear();
+        setup.inputChannels.setRange (0, available, true);
+        const auto error = deviceManager.setAudioDeviceSetup (setup, true);
+        if (error.isNotEmpty())
+            juce::Logger::writeToLog ("Could not open inputs on " + device->getName() + ": " + error);
+        else if (auto* now = deviceManager.getCurrentAudioDevice())
+            juce::Logger::writeToLog ("Live input: opened " + juce::String (now->getActiveInputChannels().countNumberOfSetBits())
+                                      + " of " + juce::String (available) + " inputs on " + now->getName());
+    }
+
+    /** Names the device's inputs for menus: "In 1", "In 2 (Mic/Line 2)". */
+    juce::StringArray liveInputNames() const
+    {
+        juce::StringArray out;
+        if (auto* device = deviceManager.getCurrentAudioDevice())
+            for (const auto& n : device->getInputChannelNames()) out.add (n);
+        return out;
+    }
+
+    //== live tracks (LIVE 1-4 on the mixer) =======================================
+    // Owner: "separate tracks for real instruments and microphone inputs,
+    // apart from the decks, so the eight decks stay for stems -- not on the
+    // perform view, set up in the mixer." A live track is a mic / DI input or
+    // an instrument plugin, on its own mixer channel (MixerChannel::Live1+t).
+
+    static juce::String trackLabel (int t) { return "LIVE " + juce::String (t + 1); }
+
+    void setTrackInput (int t, int channel, bool stereo)
+    {
+        if (t < 0 || t >= ezdeck::kNumLiveTracks) return;
+        if (channel >= 0 && instruments[(size_t) t].hasInstrument())
+            setTrackInstrument (t, std::nullopt);   // a track is one thing: an input or an instrument
+        trackInput[(size_t) t].store (channel, std::memory_order_relaxed);
+        trackStereo[(size_t) t].store (stereo, std::memory_order_relaxed);
+        requestLiveInputChannels();
+        if (channel >= 0) ensureChannelAudible (ezdeck::kNumLayers + t);
+        refreshTrackSourceLabels();
+        if (channel >= 0)
+            showToast (trackLabel (t) + ": "
+                       + (stereo ? "In " + juce::String (channel + 1) + "+" + juce::String (channel + 2)
+                                 : "In " + juce::String (channel + 1))
+                       + " -- level, mute, FX and output on its mixer strip");
+    }
+
+    /** "Mic  In 3", "EZkeys 2", "Choose source" -- the live strip's source button. */
+    juce::String trackSourceLabel (int t) const
+    {
+        if (instruments[(size_t) t].hasInstrument())
+        {
+            const int midi = trackMidiChannel[(size_t) t].load (std::memory_order_relaxed);
+            return instruments[(size_t) t].currentDescription().name + (midi > 0 ? "  ch " + juce::String (midi) : juce::String());
+        }
+        const int ch = trackInput[(size_t) t].load (std::memory_order_relaxed);
+        if (ch < 0) return "Choose source";
+        return trackStereo[(size_t) t].load (std::memory_order_relaxed)
+             ? "In " + juce::String (ch + 1) + "+" + juce::String (ch + 2)
+             : "Mic  In " + juce::String (ch + 1);
+    }
+
+    void refreshTrackSourceLabels()
+    {
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+            if (ezdeck::kNumLayers + t < mixerStrips.size())
+                mixerStrips[ezdeck::kNumLayers + t]->setSourceText (trackSourceLabel (t));
+    }
+
+    void showTrackSourceMenu (int t)
+    {
+        juce::PopupMenu m;
+        m.addSectionHeader (trackLabel (t) + "  -  SOURCE");
+        if (instruments[(size_t) t].hasInstrument())
+        {
+            m.addItem (8001, "Open " + instruments[(size_t) t].currentDescription().name + "...");
+            m.addItem (8002, "All notes off");
+            m.addSeparator();
+        }
+        addTrackInputMenu (m, t);
+        addInstrumentMenu (m, t);
+        {
+            juce::PopupMenu midi;
+            const int want = trackMidiChannel[(size_t) t].load (std::memory_order_relaxed);
+            midi.addItem (9500, "Every channel", true, want == 0);
+            midi.addSeparator();
+            for (int ch = 1; ch <= 16; ++ch) midi.addItem (9500 + ch, "Channel " + juce::String (ch), true, want == ch);
+            m.addSubMenu ("MIDI channel", midi, instruments[(size_t) t].hasInstrument());
+        }
+        m.addSeparator();
+        m.addItem (9990, "No source", instruments[(size_t) t].hasInstrument() || trackInput[(size_t) t].load (std::memory_order_relaxed) >= 0);
+
+        auto options = juce::PopupMenu::Options();
+        if (ezdeck::kNumLayers + t < mixerStrips.size()) options = options.withTargetComponent (mixerStrips[ezdeck::kNumLayers + t]);
+        m.showMenuAsync (options, [this, t] (int r)
+        {
+            if (r <= 0) return;
+            if (r == 9990) { setTrackInstrument (t, std::nullopt); setTrackInput (t, -1, false); refreshTrackSourceLabels(); return; }
+            if (r >= 9500 && r <= 9516)
+            {
+                trackMidiChannel[(size_t) t].store (r - 9500, std::memory_order_relaxed);
+                refreshTrackSourceLabels();
+                showToast (trackLabel (t) + ": MIDI " + (r == 9500 ? juce::String ("every channel") : "channel " + juce::String (r - 9500)));
+                return;
+            }
+            if (handleTrackInputMenu (t, r)) return;
+            handleInstrumentMenu (t, r);
+        });
+    }
+
+    // Owner: "the mic input receives signal, I see it in the channel strip,
+    // but I don't hear any sound and the mixer shows nothing." The column's
+    // mixer channel was muted (the strip sits before the mixer, so its meter
+    // still moved). Putting a mic or an instrument on a column is asking to
+    // hear it, so a mute on that channel is lifted and said out loud.
+    void ensureChannelAudible (int channel)
+    {
+        if (channel < 0 || channel >= ezdeck::kNumMixerChannels) return;
+        const auto ch = (ezdeck::MixerChannel) channel;
+        if (mixer.getChannelMute (ch))
+        {
+            mixer.setChannelMute (ch, false);
+            if (channel < mixerStrips.size()) mixerStrips[channel]->setMuteState (false);
+            showToast (stripLabel (channel) + ": its mixer channel was muted -- unmuted so you can hear it");
+        }
+    }
+
+    /** DECK 1-8, LIVE 1-4 -- one name per channel strip / mixer channel. */
+    static juce::String stripLabel (int i)
+    {
+        return i < ezdeck::kNumLayers ? "DECK " + juce::String (i + 1) : trackLabel (i - ezdeck::kNumLayers);
+    }
+
+    /** "MUTED" for the deck header when the column's mixer channel can't be heard. */
+    bool columnSilenced (int layer) const
+    {
+        const auto ch = (ezdeck::MixerChannel) layer;
+        if (mixer.getChannelMute (ch)) return true;
+        bool anySolo = false;
+        for (int c = 0; c < ezdeck::kNumMixerChannels; ++c) if (mixer.getChannelSolo ((ezdeck::MixerChannel) c)) anySolo = true;
+        return anySolo && ! mixer.getChannelSolo (ch) && ! mixer.isExemptFromSolo (ch);
+    }
+
+    void refreshColumnHeaders() { setDeckPage (deckPage); }   // the header text is built in setDeckPage()
+
+    /** The "Mic / DI input" part of a live track's source menu. */
+    void addTrackInputMenu (juce::PopupMenu& into, int t)
+    {
+        juce::PopupMenu m;
+        const auto names = liveInputNames();
+        const int current = trackInput[(size_t) t].load (std::memory_order_relaxed);
+        const bool stereo = trackStereo[(size_t) t].load (std::memory_order_relaxed);
+        m.addItem (9000, "None", true, current < 0);
+        if (names.isEmpty())
+        {
+            m.addItem (9001, "This audio device has no inputs -- choose an interface in Settings > Audio", false);
+        }
+        else
+        {
+            m.addSeparator();
+            for (int i = 0; i < names.size(); ++i)
+                m.addItem (9100 + i, "In " + juce::String (i + 1) + "  " + names[i], true, current == i && ! stereo);
+            if (names.size() >= 2)
+            {
+                m.addSeparator();
+                for (int i = 0; i + 1 < names.size(); i += 2)
+                    m.addItem (9300 + i, "In " + juce::String (i + 1) + "+" + juce::String (i + 2) + "  stereo", true, current == i && stereo);
+            }
+        }
+        into.addSubMenu ("Mic / DI input", m);
+    }
+
+    // ---- PX-D: instruments (on the live tracks) -----------------------------------
+
+    void addInstrumentMenu (juce::PopupMenu& into, int t)
+    {
+        juce::PopupMenu m;
+        auto& slot = instruments[(size_t) t];
+        const auto list = pluginLibrary.instruments();
+        m.addItem (8000, "None", true, ! slot.hasInstrument());
+        if (slot.hasInstrument())
+        {
+            m.addItem (8001, "Open " + slot.currentDescription().name + "...");
+            m.addItem (8002, "All notes off");
+        }
+        m.addSeparator();
+        if (list.isEmpty())
+            m.addItem (8003, "No instruments found yet -- scan for plugins");
+        else
+            for (int i = 0; i < list.size() && i < 500; ++i)
+                m.addItem (8100 + i, list[i].name + "  (" + list[i].pluginFormatName + ")", true,
+                           slot.hasInstrument() && slot.currentDescription().createIdentifierString() == list[i].createIdentifierString());
+        m.addSeparator();
+        m.addItem (8003, "Scan for plugins...");
+        m.addItem (8004, "Plugin list...");
+        into.addSubMenu ("Instrument (VST3)", m);
+    }
+
+    bool handleInstrumentMenu (int t, int result)
+    {
+        if (result == 8000) { setTrackInstrument (t, std::nullopt); return true; }
+        if (result == 8001) { openInstrumentEditor (t); return true; }
+        if (result == 8002) { instruments[(size_t) t].allNotesOff(); return true; }
+        if (result == 8003) { startPluginScan(); return true; }
+        if (result == 8004) { showPluginScanner(); return true; }
+        if (result >= 8100 && result < 8600)
+        {
+            const auto list = pluginLibrary.instruments();
+            if (result - 8100 < list.size()) setTrackInstrument (t, list[result - 8100]);
+            return true;
+        }
+        return false;
+    }
+
+    /** Loads (or clears) a live track's instrument. Message thread; the plugin
+        is created and prepared before the audio thread ever sees it. */
+    void setTrackInstrument (int t, std::optional<juce::PluginDescription> desc, const juce::String& state = {})
+    {
+        if (t < 0 || t >= ezdeck::kNumLiveTracks) return;
+        if (desc.has_value() && ! desc->isInstrument)
+        {
+            showToast (desc->name + " is an effect. Live tracks take instrument plugins only -- every track has the built-in PERFORM LIVE channel strip (FX) for effects.");
+            return;
+        }
+        instrumentWindows[(size_t) t] = nullptr;
+        auto& slot = instruments[(size_t) t];
+        if (! desc.has_value())
+        {
+            slot.clear();
+            refreshTrackSourceLabels();
+            return;
+        }
+        juce::String error;
+        std::unique_ptr<juce::AudioPluginInstance> instance;
+        // A plugin that throws while loading must not take the show down.
+        try
+        {
+            instance = pluginLibrary.formatManager().createPluginInstance (*desc, currentSampleRate > 0.0 ? currentSampleRate : 44100.0,
+                                                                            juce::jmax (64, mixerScratchCapacity), error);
+            if (instance == nullptr)
+            {
+                showToast ("Couldn't load " + desc->name + ": " + error);
+                juce::Logger::writeToLog ("Instrument load failed: " + desc->name + " -- " + error);
+                return;
+            }
+            slot.install (std::move (instance), *desc);
+            slot.setStateFromString (state);
+        }
+        catch (const std::exception& e)
+        {
+            juce::Logger::writeToLog ("Instrument threw while loading: " + desc->name + " -- " + juce::String (e.what()));
+            showToast (desc->name + " failed while loading (" + juce::String (e.what()) + ") -- not added");
+            return;
+        }
+        catch (...)
+        {
+            juce::Logger::writeToLog ("Instrument threw while loading: " + desc->name);
+            showToast (desc->name + " failed while loading -- not added");
+            return;
+        }
+        if (trackInput[(size_t) t].load (std::memory_order_relaxed) >= 0)
+        {
+            trackInput[(size_t) t].store (-1, std::memory_order_relaxed);   // a track is one thing: instrument or input
+            trackStereo[(size_t) t].store (false, std::memory_order_relaxed);
+        }
+        ensureChannelAudible (ezdeck::kNumLayers + t);
+        refreshTrackSourceLabels();
+        if (state.isEmpty())
+        {
+            showToast (trackLabel (t) + ": " + desc->name + " -- play it from your MIDI keyboard; its source button opens it again");
+            openInstrumentEditor (t);   // the first thing anyone wants after loading an instrument is its window
+        }
+    }
+
+    void openInstrumentEditor (int t)
+    {
+        auto& slot = instruments[(size_t) t];
+        auto* instance = slot.instanceForEditor();
+        if (instance == nullptr) return;
+        auto& win = instrumentWindows[(size_t) t];
+        if (win != nullptr) { win->toFront (true); return; }
+        win = std::make_unique<ezinst::InstrumentEditorWindow> (*instance, slot.currentDescription().name + "  --  " + trackLabel (t),
+                                                                 [this, t] { instrumentWindows[(size_t) t] = nullptr; });
+    }
+
+    /** Scans the standard VST3 folders straight away, with a progress window
+        and a Cancel button -- no folder dialog. Each file is probed in the
+        separate scanner process (InstrumentHost.h). */
+    void startPluginScan()
+    {
+        if (pluginScan != nullptr) return;
+
+        class Scan final : public juce::ThreadWithProgressWindow
+        {
+        public:
+            explicit Scan (SessionComponent& o)
+                : juce::ThreadWithProgressWindow ("Scanning for instruments...", true, true, 10000, "Cancel"), owner (o) {}
+
+            void run() override
+            {
+                const auto pedal = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                                       .getChildFile ("EzPlay").getChildFile ("plugin-scan-dead-mans-pedal.txt");
+                pedal.getParentDirectory().createDirectory();
+                for (auto* format : owner.pluginLibrary.formatManager().getFormats())
+                {
+                    juce::PluginDirectoryScanner scanner (owner.pluginLibrary.list(), *format,
+                                                          format->getDefaultLocationsToSearch(), true, pedal, true);
+                    juce::String name;
+                    for (;;)
+                    {
+                        if (threadShouldExit()) return;
+                        setStatusMessage ("Testing " + scanner.getNextPluginFileThatWillBeScanned().fromLastOccurrenceOf ("\\", false, false));
+                        if (! scanner.scanNextFile (true, name)) break;
+                        setProgress (scanner.getProgress());
+                    }
+                }
+            }
+
+            void threadComplete (bool cancelled) override
+            {
+                const int effects = owner.pluginLibrary.keepInstrumentsOnly();
+                if (effects > 0) juce::Logger::writeToLog ("Plugin scan: ignored " + juce::String (effects) + " effect plugins (instruments only)");
+                if (auto* settings = owner.getAppSettings()) owner.pluginLibrary.saveTo (*settings);
+                const int n = owner.pluginLibrary.instruments().size();
+                owner.showToast (juce::String (cancelled ? "Scan stopped. " : "Scan finished. ") + juce::String (n)
+                                 + (n == 1 ? " instrument available" : " instruments available") + " -- MIXER, a LIVE strip's source button");
+                juce::MessageManager::callAsync ([o = &owner] { o->pluginScan = nullptr; });
+            }
+
+        private:
+            SessionComponent& owner;
+        };
+
+        pluginScan = std::make_unique<Scan> (*this);
+        pluginScan->launchThread();
+    }
+
+    /** JUCE's plugin list with its scan button; the scan itself runs in a
+        separate process (InstrumentHost.h), so a bad plugin cannot take the
+        app down. The list is saved to the app settings when the window closes. */
+    void showPluginScanner()
+    {
+        if (pluginListWindow != nullptr) { pluginListWindow->toFront (true); return; }
+
+        class ListWindow final : public juce::DocumentWindow
+        {
+        public:
+            ListWindow (SessionComponent& o, juce::PluginListComponent* content)
+                : juce::DocumentWindow ("Plugins", juce::Colour (0xff0c0c17), juce::DocumentWindow::closeButton), owner (o)
+            {
+                setUsingNativeTitleBar (true);
+                setContentOwned (content, true);
+                setResizable (true, false);
+                centreWithSize (720, 480);
+                setVisible (true);
+            }
+            void closeButtonPressed() override
+            {
+                if (auto* settings = owner.getAppSettings()) owner.pluginLibrary.saveTo (*settings);
+                owner.pluginListWindow = nullptr;   // deletes this
+            }
+        private:
+            SessionComponent& owner;
+        };
+
+        const auto pedal = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                               .getChildFile ("EzPlay").getChildFile ("plugin-scan-dead-mans-pedal.txt");
+        pedal.getParentDirectory().createDirectory();
+        auto* content = new juce::PluginListComponent (pluginLibrary.formatManager(), pluginLibrary.list(), pedal, getAppSettings(), true);
+        content->setSize (720, 480);
+        pluginListWindow = std::make_unique<ListWindow> (*this, content);
+    }
+
+    // ---- PERFORM LIVE channel strip ----------------------------------------------
+
+    // Every deck and every live track has one (strip index == mixer channel
+    // index: 0-7 the decks, 8-11 LIVE 1-4), off until switched on.
+
+    void showStripMenu (int i)
+    {
+        if (i < 0 || i >= kNumStrips) return;
+        juce::PopupMenu m;
+        m.addSectionHeader (stripLabel (i) + "  -  CHANNEL STRIP");
+        addStripMenu (m, i, false);
+        auto options = juce::PopupMenu::Options();
+        if (i < mixerStrips.size() && mixerStrips[i]->isShowing()) options = options.withTargetComponent (mixerStrips[i]);
+        m.showMenuAsync (options, [this, i] (int r) { handleStripMenu (i, r); });
+    }
+
+    void addStripMenu (juce::PopupMenu& into, int i, bool asSubmenu = true)
+    {
+        if (i < 0 || i >= kNumStrips) return;
+        const bool on = stripOn[(size_t) i].load (std::memory_order_relaxed);
+        juce::PopupMenu m;
+        m.addItem (7001, "On", true, on);
+        m.addItem (7002, "Open PERFORM LIVE...");
+        m.addSeparator();
+        const auto& presets = amanorsac::perform::factoryPresets();
+        juce::PopupMenu byCat;
+        for (const auto& cat : amanorsac::perform::presetCategoryOrder())
+        {
+            juce::PopupMenu sub;
+            for (int p = 0; p < (int) presets.size(); ++p)
+                if (presets[(size_t) p].category == cat)
+                    sub.addItem (7100 + p, presets[(size_t) p].name, true, strips[(size_t) i]->presetName() == presets[(size_t) p].name);
+            byCat.addSubMenu (cat, sub);
+        }
+        m.addSubMenu ("Preset", byCat);
+        if (! asSubmenu) { into.addSubMenu ("Preset", byCat); into.addItem (7001, "On", true, on); into.addItem (7002, "Open PERFORM LIVE..."); return; }
+        into.addSubMenu (juce::String ("Channel strip (PERFORM LIVE)") + (on ? juce::String (juce::CharPointer_UTF8 ("  \xe2\x97\x8f")) : juce::String()), m);
+    }
+
+    bool handleStripMenu (int i, int result)
+    {
+        if (i < 0 || i >= kNumStrips || result < 7001 || result >= 7400) return false;
+        if (result == 7001) { setStripOn (i, ! stripOn[(size_t) i].load (std::memory_order_relaxed)); return true; }
+        if (result == 7002) { if (! stripOn[(size_t) i].load (std::memory_order_relaxed)) setStripOn (i, true); openStripEditor (i); return true; }
+        if (result >= 7100)
+        {
+            strips[(size_t) i]->loadFactory (result - 7100);
+            if (! stripOn[(size_t) i].load (std::memory_order_relaxed)) setStripOn (i, true);
+            showToast (stripLabel (i) + " channel strip: " + strips[(size_t) i]->presetName());
+            return true;
+        }
+        return false;
+    }
+
+    void setStripOn (int i, bool on)
+    {
+        if (i < 0 || i >= kNumStrips) return;
+        if (on) strips[(size_t) i]->reset();   // no stale reverb tail from last time it was on
+        stripOn[(size_t) i].store (on, std::memory_order_relaxed);
+        refreshColumnHeaders();
+        showToast (stripLabel (i) + ": channel strip " + (on ? "on -- right-click its mixer strip for presets" : "off"));
+    }
+
+    void openStripEditor (int i)
+    {
+        if (i < 0 || i >= kNumStrips) return;
+        auto& win = stripWindows[(size_t) i];
+        if (win != nullptr) { win->toFront (true); return; }
+
+        class StripWindow final : public juce::DocumentWindow
+        {
+        public:
+            StripWindow (juce::AudioProcessor& p, const juce::String& title, std::function<void()> onClosed)
+                : juce::DocumentWindow (title, juce::Colour (0xff0c0c17), juce::DocumentWindow::closeButton), onClose (std::move (onClosed))
+            {
+                setUsingNativeTitleBar (true);
+                if (auto* ed = p.createEditorIfNeeded()) setContentOwned (ed, true);
+                setResizable (true, false);
+                centreWithSize (getWidth(), getHeight());
+                setVisible (true);
+            }
+            void closeButtonPressed() override { if (onClose) onClose(); }
+        private:
+            std::function<void()> onClose;
+        };
+
+        win = std::make_unique<StripWindow> (*strips[(size_t) i], "PERFORM LIVE  --  " + stripLabel (i),
+                                             [this, i] { stripWindows[(size_t) i] = nullptr; });
+    }
+
+    /** Returns true if result was one of addTrackInputMenu's items. */
+    bool handleTrackInputMenu (int t, int result)
+    {
+        if (result == 9000) { setTrackInput (t, -1, false); return true; }
+        if (result >= 9300 && result < 9400) { setTrackInput (t, result - 9300, true); return true; }
+        if (result >= 9100 && result < 9300) { setTrackInput (t, result - 9100, false); return true; }
+        return result == 9001;
+    }
+
     void requestAllOutputChannels()
     {
         if (reconfiguringOutputs)
@@ -7080,6 +8893,7 @@ public:
         if (source == &deviceManager)
         {
             requestAllOutputChannels();
+            requestLiveInputChannels();
             saveAudioDeviceState();
         }
     }
@@ -7272,7 +9086,7 @@ public:
         actionRegistry.setAction (ActionId::ToggleMetronome, [this]
         {
             metronomeEnabled = ! metronomeEnabled;
-            mixer.setChannelMute (ezdeck::MixerChannel::Metro, ! metronomeEnabled);
+            metronomeGate.store (metronomeEnabled, std::memory_order_relaxed);   // gates the loop-mode metronome only; the Click strip mute is the strip's own
         });
 
         actionRegistry.setAction (ActionId::ToggleTempoLock, [this]
@@ -7327,6 +9141,25 @@ public:
         {
             userTriggeredSave();
             return true;
+        }
+
+        // Owner: popular shortcuts to open the views and the docks (Ctrl on
+        // Windows, Cmd on a Mac). Ctrl+1-4 follow the nav bar left to right;
+        // L and M for the Library and Mixer docks, which toggle like their
+        // buttons. They go through the buttons' own onClick, so a shortcut and
+        // a click can never behave differently.
+        {
+            const auto cmd = juce::ModifierKeys::commandModifier;
+            static const struct { int key; int position; } kNavShortcuts[] = {
+                { '1', 0 }, { '2', 1 }, { '3', 2 }, { '4', 3 }, { 'l', kNavLibraryPos }, { 'm', kNavMixerPos }
+            };
+            for (const auto& s : kNavShortcuts)
+                if ((key == juce::KeyPress (s.key, cmd, 0) || key == juce::KeyPress (juce::CharacterFunctions::toUpperCase ((juce::juce_wchar) s.key), cmd, 0))
+                    && s.position < navButtons.size() && navButtons[s.position]->onClick)
+                {
+                    navButtons[s.position]->onClick();
+                    return true;
+                }
         }
 
         // Owner #3: "delete key removes sample on deck and pads." Scoped to
@@ -7395,7 +9228,7 @@ public:
     void recallScene (int idx)
     {
         auto& scene = scenes[(size_t) idx];
-        if (! scene.filled) { showToast ("Empty — hold to save the current setup"); return; }
+        if (! scene.filled) { showToast (juce::String (juce::CharPointer_UTF8 ("Empty " "\xe2" "\x80" "\x94" " hold to save the current setup"))); return; }
 
         // Defensive bounds check -- currently unreachable (no custom
         // signature can be deleted yet, Milestone 6's own documented scope
@@ -7544,7 +9377,7 @@ public:
         content->general().onMetronomeChanged = [this] (bool enabled)
         {
             metronomeEnabled = enabled;
-            mixer.setChannelMute (ezdeck::MixerChannel::Metro, ! enabled);
+            metronomeGate.store (enabled, std::memory_order_relaxed);
         };
         content->general().onTempoLockChanged = [this] (bool enabled)
         {
@@ -7939,6 +9772,8 @@ public:
     void triggerRowSlot (int slot)
     {
         const int flat = flatDeckIndexForSlot (slot);
+        // the row played from the grid gets the click/guide (see rebuildGuideSchedule)
+        if (guideRowOverride != flat) { guideRowOverride = flat; rebuildGuideSchedule(); }
         if (auto t = deckTempoOverride[(size_t) flat]; t.has_value() && *t > 0.0
              && std::abs (*t - masterTempo.bpm) > 0.01)
         {
@@ -8018,9 +9853,34 @@ public:
         // visibility); the schema already carried these fields since
         // Milestone 12, so no file-format change was needed here.
         snap.settings.metronomeEnabled = metronomeEnabled;
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+        {
+            snap.settings.trackInput[(size_t) t]           = trackInput[(size_t) t].load (std::memory_order_relaxed);
+            snap.settings.trackStereo[(size_t) t]          = trackStereo[(size_t) t].load (std::memory_order_relaxed);
+            snap.settings.trackMidiChannel[(size_t) t]     = trackMidiChannel[(size_t) t].load (std::memory_order_relaxed);
+            snap.settings.trackInstrumentId[(size_t) t]    = instruments[(size_t) t].hasInstrument()
+                                                               ? instruments[(size_t) t].currentDescription().createIdentifierString() : juce::String();
+            snap.settings.trackInstrumentState[(size_t) t] = instruments[(size_t) t].stateAsString();
+        }
+        for (int i = 0; i < kNumStrips; ++i)
+        {
+            const bool on = stripOn[(size_t) i].load (std::memory_order_relaxed);
+            snap.settings.stripOn[(size_t) i] = on;
+            // Owner: "the default channel strip preset should be Stage
+            // Ready." Only a strip that's switched on keeps its sound; one
+            // that's off comes back as Stage Ready next time.
+            if (on)
+            {
+                juce::MemoryBlock mb;
+                strips[(size_t) i]->getStateInformation (mb);
+                snap.settings.stripState[(size_t) i] = mb.toBase64Encoding();
+            }
+        }
         snap.settings.onePadAtATime    = padBank.exclusive;
         snap.settings.meterVisible     = true;   // no longer user-toggleable -- see SettingsGeneralTab's own comment
         snap.settings.tempoLockEnabled = tempoLockEnabled;
+        snap.settings.webGain          = webGain;
+        snap.settings.webMute          = webMute;
 
         snap.masterTempoBpm  = masterTempo.bpm;
         snap.viewedSignature = viewedSignature;
@@ -8046,6 +9906,13 @@ public:
             ezproject::DeckSnapshot ds;
             ds.flatIndex = d;
             ds.tempoOverrideBpm = deckTempoOverride[(size_t) d].has_value() ? *deckTempoOverride[(size_t) d] : -1.0;
+            ds.sourceBpm      = deckSourceBpm[(size_t) d].has_value() ? *deckSourceBpm[(size_t) d] : -1.0;
+            ds.stemMode       = session.decks[(size_t) d].mode == ezdeck::DeckMode::stem;
+            ds.meter          = rowMeter[(size_t) d];
+            ds.clickFile      = songClickTrack[(size_t) d] != nullptr ? songClickTrack[(size_t) d]->filePath : juce::String();
+            ds.guideFile      = songGuideTrack[(size_t) d] != nullptr ? songGuideTrack[(size_t) d]->filePath : juce::String();
+            ds.useSongClick   = useSongClick[(size_t) d];
+            ds.useSongGuide   = useSongGuide[(size_t) d];
             ds.rowName        = rowName[(size_t) d];
             ds.rowColourSet   = rowColourSet[(size_t) d];
             ds.rowColourArgb  = rowColourArgb[(size_t) d];
@@ -8059,11 +9926,16 @@ public:
                     ss.name = juce::String (juce::CharPointer_UTF8 (sec.name.c_str()));
                     ss.startBar = sec.startBar; ss.colourArgb = sec.colourArgb;
                     ss.skip = sec.skip; ss.optional = sec.optional; ss.loopOnEntry = sec.loopOnEntry; ss.pauseAfter = sec.pauseAfter;
+                    ss.cue = juce::String (juce::CharPointer_UTF8 (sec.cue.c_str()));
                     ds.sections.push_back (ss);
                 }
                 ds.arrangementLengthBars = a.lengthBars;
                 ds.endBehaviour = (int) a.atEnd;
                 ds.countInBars = a.countInBars;
+                ds.guideClick  = a.guideClick;
+                ds.guideCues   = a.guideCues;
+                ds.cueLeadBars = a.cueLeadBars;
+                ds.cueCounts   = a.cueCounts;
             }
             for (int l = 0; l < ezdeck::kNumLayers; ++l)
             {
@@ -8159,7 +10031,41 @@ public:
         // Milestone 13: apply the EFFECTS of the two settings that have real
         // behavior behind them, not just restore the flag.
         metronomeEnabled = snap.settings.metronomeEnabled;
-        mixer.setChannelMute (ezdeck::MixerChannel::Metro, ! metronomeEnabled);
+        webGain = snap.settings.webGain;
+        webMute = snap.settings.webMute;
+        if (webStrip != nullptr) { webStrip->setGainValue (webGain); webStrip->setMuteState (webMute); }
+        pushWebLevel();
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+        {
+            trackInput[(size_t) t].store (snap.settings.trackInput[(size_t) t], std::memory_order_relaxed);
+            trackStereo[(size_t) t].store (snap.settings.trackStereo[(size_t) t], std::memory_order_relaxed);
+            trackMidiChannel[(size_t) t].store (snap.settings.trackMidiChannel[(size_t) t], std::memory_order_relaxed);
+        }
+        requestLiveInputChannels();
+        for (int i = 0; i < kNumStrips; ++i)
+        {
+            const bool on = snap.settings.stripOn[(size_t) i];
+            juce::MemoryBlock mb;
+            if (on && snap.settings.stripState[(size_t) i].isNotEmpty() && mb.fromBase64Encoding (snap.settings.stripState[(size_t) i]))
+                strips[(size_t) i]->setStateInformation (mb.getData(), (int) mb.getSize());
+            else
+                strips[(size_t) i]->loadFactory (0);   // Stage Ready -- the strip's default preset
+            stripOn[(size_t) i].store (on, std::memory_order_relaxed);
+        }
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+        {
+            const auto& id = snap.settings.trackInstrumentId[(size_t) t];
+            const bool same = instruments[(size_t) t].hasInstrument()
+                           && instruments[(size_t) t].currentDescription().createIdentifierString() == id;
+            if (id.isEmpty()) { if (instruments[(size_t) t].hasInstrument()) setTrackInstrument (t, std::nullopt); continue; }
+            if (same) { instruments[(size_t) t].setStateFromString (snap.settings.trackInstrumentState[(size_t) t]); continue; }
+            if (auto desc = pluginLibrary.find (id)) setTrackInstrument (t, desc, snap.settings.trackInstrumentState[(size_t) t].isNotEmpty()
+                                                                                    ? snap.settings.trackInstrumentState[(size_t) t] : juce::String (" "));
+            else showToast (trackLabel (t) + ": its instrument is not in the plugin list on this computer -- scan for plugins, then reopen the project");
+        }
+        refreshTrackSourceLabels();
+        refreshColumnHeaders();
+        metronomeGate.store (metronomeEnabled, std::memory_order_relaxed);   // gates the loop-mode metronome only; the Click strip mute is the strip's own
 
         masterTempo.bpm = snap.masterTempoBpm;
         session.setTempo (masterTempo);
@@ -8181,10 +10087,19 @@ public:
             // the owner having to re-pick it from the dropdown.
             mixer.setChannelOutputPair (channel, routeIndexToOutputPair (ch.outputRoute));
         }
+        // a saved mute on a live track would leave the mic silent with its
+        // channel strip's meter still moving -- see ensureChannelAudible()
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+            if (trackInput[(size_t) t].load (std::memory_order_relaxed) >= 0 || instruments[(size_t) t].hasInstrument())
+                ensureChannelAudible (ezdeck::kNumLayers + t);
 
         for (auto& ds : snap.decks)
         {
             if (ds.flatIndex < 0 || ds.flatIndex >= kNumDecks) continue;
+            // mode and original tempo first: loadLayer() below reads both
+            session.decks[(size_t) ds.flatIndex].mode = ds.stemMode ? ezdeck::DeckMode::stem : ezdeck::DeckMode::loop;
+            if (ds.meter.isNotEmpty()) setRowMeter (ds.flatIndex, ds.meter, true);   // an unknown name is ignored
+            if (ds.sourceBpm > 0.0) deckSourceBpm[(size_t) ds.flatIndex] = ds.sourceBpm;
             for (int l = 0; l < ezdeck::kNumLayers; ++l)
             {
                 auto& ls = ds.layers[(size_t) l];
@@ -8220,6 +10135,12 @@ public:
                 layer.enabled        = ls.enabled;
             }
             if (ds.tempoOverrideBpm > 0.0) deckTempoOverride[(size_t) ds.flatIndex] = ds.tempoOverrideBpm;
+            if (ds.sourceBpm > 0.0) deckSourceBpm[(size_t) ds.flatIndex] = ds.sourceBpm;
+            // the song's own click/guide tracks (SECURITY: never a remote path -- see ezlibrary::isRemotePath)
+            if (ds.clickFile.isNotEmpty() && ! ezlibrary::isRemotePath (ds.clickFile)) loadSongTrack (ds.flatIndex, false, juce::File (ds.clickFile), true);
+            if (ds.guideFile.isNotEmpty() && ! ezlibrary::isRemotePath (ds.guideFile)) loadSongTrack (ds.flatIndex, true,  juce::File (ds.guideFile), true);
+            useSongClick[(size_t) ds.flatIndex] = ds.useSongClick;
+            useSongGuide[(size_t) ds.flatIndex] = ds.useSongGuide;
             rowName[(size_t) ds.flatIndex]       = ds.rowName;
             rowColourSet[(size_t) ds.flatIndex]  = ds.rowColourSet;
             rowColourArgb[(size_t) ds.flatIndex] = ds.rowColourArgb;
@@ -8233,12 +10154,17 @@ public:
                     ezarr::Section sec;
                     sec.name = ss.name.toStdString(); sec.startBar = ss.startBar; sec.colourArgb = ss.colourArgb;
                     sec.skip = ss.skip; sec.optional = ss.optional; sec.loopOnEntry = ss.loopOnEntry; sec.pauseAfter = ss.pauseAfter;
+                    sec.cue = ss.cue.toStdString();
                     a.sections.push_back (sec);
                 }
                 a.sortSections();
                 a.lengthBars  = ds.arrangementLengthBars;
                 a.atEnd       = (ezarr::EndBehaviour) juce::jlimit (0, 2, ds.endBehaviour);
                 a.countInBars = ds.countInBars;
+                a.guideClick  = ds.guideClick;
+                a.guideCues   = ds.guideCues;
+                a.cueLeadBars = juce::jlimit (1, 8, ds.cueLeadBars);
+                a.cueCounts   = ds.cueCounts;
             }
         }
 
@@ -8313,6 +10239,7 @@ public:
             signatureButtons[i]->setAccentColour (signatureColourSet[(size_t) i] ? juce::Colour (signatureColourArgb[(size_t) i]) : juce::Colour (0xff7c5cff));
 
         refreshSlotLabels();
+        rebuildGuideSchedule();   // the loaded setlist song's click and cues, before Play is ever pressed
     }
 
     void loadProjectFile()
@@ -8389,6 +10316,15 @@ public:
                 layerAssetIds[(size_t) d][(size_t) l]     = {};
             }
             deckTempoOverride[(size_t) d].reset();
+            deckSourceBpm[(size_t) d].reset();
+            deckBufferBpm[(size_t) d] = 0.0;
+            session.decks[(size_t) d].mode = ezdeck::DeckMode::stem;
+            rowMeter[(size_t) d] = {};
+            session.decks[(size_t) d].beatsPerBar = groupBeatsForDeck (d);
+            clearSongTrack (d, false, true);
+            clearSongTrack (d, true, true);
+            useSongClick[(size_t) d] = true;
+            useSongGuide[(size_t) d] = true;
             arrangements[(size_t) d] = ezarr::Arrangement();
             rowName[(size_t) d].clear();
             rowColourSet[(size_t) d]  = false;
@@ -8773,6 +10709,49 @@ public:
     // an unconditional write of a small JSON snapshot once a minute is cheap
     // enough that the correctness/simplicity trade is worth it over that
     // much invasive plumbing for a minor efficiency gain.
+    // Owner: "when quitting, ask to save." True when what's open differs from
+    // the project file on disk. Both sides go through the same toVar(), so a
+    // file that simply round-trips reads as unchanged; anything unreadable
+    // counts as changed, which only ever means one extra question.
+    bool hasUnsavedChanges() const
+    {
+        ezproject::ProjectSnapshot onDisk;
+        if (! ezproject::loadFromFile (projectFilePath(), onDisk)) return true;
+        return juce::JSON::toString (ezproject::toVar (captureSnapshot()), true)
+            != juce::JSON::toString (ezproject::toVar (onDisk), true);
+    }
+
+    /** Asks Save / Don't Save / Cancel when there are changes, then calls
+        quitNow -- or does nothing on Cancel. */
+    void requestQuit (std::function<void()> quitNow)
+    {
+        if (quitPromptOpen) return;
+        if (! hasUnsavedChanges()) { quitNow(); return; }
+
+        quitPromptOpen = true;
+        auto* aw = new juce::AlertWindow ("Save changes?",
+                                           "Save your changes to \"" + projectFilePath().getFileNameWithoutExtension() + "\" before quitting?\n\n"
+                                           "If you don't save, the project opens next time as it was when you last saved.",
+                                           juce::MessageBoxIconType::NoIcon);
+        aw->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        aw->addButton ("Don't Save", 2);
+        aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+        aw->enterModalState (true, juce::ModalCallbackFunction::create ([this, aw, quitNow] (int result)
+        {
+            delete aw;
+            quitPromptOpen = false;
+            if (result == 0) return;
+            if (result == 1) saveProjectFile();
+            else
+            {
+                autosaveFilePath().deleteFile();   // discarded on purpose: no recovery offer next launch
+                juce::Logger::writeToLog ("Quit without saving");
+            }
+            saveHandledOnExit = true;
+            quitNow();
+        }), false);
+    }
+
     void autosaveIfDue()
     {
         const bool ok = ezproject::saveToFile (captureSnapshot(), autosaveFilePath());
@@ -8944,12 +10923,17 @@ public:
                                                                               : side + juce::String (rowNum);
             const int sigIdx = signatureManager.signatureIndexForDeck (flat);
             triggerCells[(size_t) slot]->setSlotName (bigName);
-            triggerCells[(size_t) slot]->setSigText (signatureManager.signature (sigIdx).name);
+            juce::ignoreUnused (sigIdx);
+            triggerCells[(size_t) slot]->setSigText (rowMeterName (flat));   // the song's own time signature, else its group's
             triggerCells[(size_t) slot]->setRowAccentColour (rowColourSet[(size_t) flat], juce::Colour (rowColourArgb[(size_t) flat]));
             triggerCells[(size_t) slot]->setTempoText (effective.has_value()
                                                         ? (juce::String (*effective, 1) + " BPM")
                                                         : juce::String ("as rec."));
             triggerCells[(size_t) slot]->setModeIsStem (session.decks[(size_t) flat].mode == ezdeck::DeckMode::stem);
+            if (slot < guideCells.size())
+                guideCells[slot]->setState (songClickTrack[(size_t) flat] != nullptr, arrangements[(size_t) flat].guideClick,
+                                            songGuideTrack[(size_t) flat] != nullptr, arrangements[(size_t) flat].guideCues,
+                                            useSongClick[(size_t) flat], useSongGuide[(size_t) flat]);
         }
     }
 
@@ -8987,7 +10971,12 @@ public:
         for (int c = 0; c < kColsPerPage; ++c)
         {
             const int layer = deckPage * kColsPerPage + c;
-            deckColumnHeaders[(size_t) c].setText ("DECK " + juce::String (layer + 1),
+            juce::String live;
+            if (stripOn[(size_t) layer].load (std::memory_order_relaxed))
+                live = (live.isEmpty() ? juce::String() : live + "  ") + "FX";
+            if (columnSilenced (layer))
+                live = (live.isEmpty() ? juce::String() : live + "  ") + "MUTED";
+            deckColumnHeaders[(size_t) c].setText ("DECK " + juce::String (layer + 1) + (live.isEmpty() ? juce::String() : juce::String (juce::CharPointer_UTF8 ("  " "\xc2" "\xb7" " ")) + live),
                                                    juce::dontSendNotification);
             deckColumnHeaders[(size_t) c].setColour (juce::Label::textColourId,
                                                       performlive::columnAccent (layer));
@@ -9018,6 +11007,11 @@ public:
     void refreshActiveView()
     {
         const bool navChanged = (activeNavIndex != lastAnimatedNavIndex);
+
+        // Owner: "anytime I close the browser, stop playing anything" -- a
+        // video left playing behind PERFORM was the sound that kept going
+        // after Stop. Leaving WEB pauses the page's players.
+        if (navChanged && lastAnimatedNavIndex == kNavBrowser && browserTab) browserTab->pauseMedia();
 
         performScroll.setVisible   (activeNavIndex == 0);
         storeView.setVisible       (activeNavIndex == 4);
@@ -9055,8 +11049,15 @@ public:
     ~SessionComponent() override
     {
         deviceManager.removeChangeListener (this);   // before anything else is torn down
-        saveProjectFile();   // Milestone 12: save-on-exit -- see this class's own captureSnapshot()
+        // Milestone 12: save-on-exit -- unless the quit prompt already saved
+        // or the owner chose "Don't Save" (requestQuit()).
+        if (! saveHandledOnExit) saveProjectFile();
         shutdownAudio();
+        // PX-D: editors before instances, instances after the audio is stopped
+        for (auto& w : instrumentWindows) w = nullptr;
+        pluginListWindow = nullptr;
+        for (auto& s : instruments) { s.clear(); s.collectRetired(); }
+        for (auto& w : stripWindows) w = nullptr;   // editors before their processors
     }
 
     //== loading ==============================================================
@@ -9172,13 +11173,25 @@ public:
         // further down) is completely untouched by this branch.
         const bool stemMode = session.decks[(size_t) deckIdx].mode == ezdeck::DeckMode::stem;
         int detectedStemBars = 0;
-        double stemBpm = 0.0;
+
+        // Owner: the tempo is never detected from the audio -- every stem of a
+        // song shares the row's one tempo. A DAW-written tempo tag is trusted
+        // to pre-fill a row that has none yet; otherwise the row's tempo is
+        // whatever the user set (or the master tempo, only for the bar count
+        // shown on the timeline, until they set it).
+        {
+            const double tag = embeddedTempoFrom (*reader);
+            if (tag > 0.0 && ! deckSourceBpm[(size_t) deckIdx].has_value())
+            {
+                deckSourceBpm[(size_t) deckIdx] = juce::jlimit (1.0, 999.0, tag);
+                showToast (deckLabel (deckIdx) + ": tempo " + juce::String (tag, 1) + " BPM read from the file's tag");
+            }
+        }
+        const double stemBpm = deckBpm (deckIdx);
+        juce::ignoreUnused (analysisSamples);
+
         if (stemMode)
         {
-            // Owner #14: an embedded (DAW-authored) tempo beats detection.
-            stemBpm = embeddedTempoFrom (*reader);
-            if (stemBpm <= 0.0)
-                stemBpm = ezdsp::analyze (newL.data(), analysisSamples, reader->sampleRate).bpm;
             auto stemFit = ezdeck::resolveStemBarLength (duration, stemBpm);
 
             if (! stemFit.accepted)
@@ -9235,12 +11248,8 @@ public:
         // detection no longer changes what plays.
         else if (! layer.trimmed)
         {
-            double tag = embeddedTempoFrom (*reader);
-            if (tag <= 0.0)
-                // reads the LAYER, not the staging buffer: the swap above has
-                // already moved the audio across and left newL holding whatever
-                // the layer previously had.
-                tag = ezdsp::analyze (layer.left.data(), analysisSamples, reader->sampleRate).bpm;
+            // the row's tempo, if the user has set one; no detection
+            const double tag = deckSourceBpm[(size_t) deckIdx].value_or (0.0);
             taggedBpm[(size_t) deckIdx][(size_t) layerIdx] = tag;
 
             // Owner round 4: "if I haven't set the tempo of the deck there's
@@ -9407,15 +11416,19 @@ public:
         std::sort (members.begin(), members.end(),
                    [] (const ezlibrary::LibraryEntry* a, const ezlibrary::LibraryEntry* b) { return a->name < b->name; });
 
-        const int n = juce::jmin ((int) members.size(), ezdeck::kNumLayers);
-        for (int l = 0; l < n; ++l)
-            loadSingleAssetIntoDeckSlot (flat, l, members[(size_t) l]->assetId);
-
-        if ((int) members.size() > ezdeck::kNumLayers)
-            showToast (deckLabel (flat) + ": pack has " + juce::String (members.size())
-                       + " items, only the first " + juce::String (ezdeck::kNumLayers) + " were loaded");
-        else
-            showToast (deckLabel (flat) + ": pack loaded (" + juce::String (n) + " items)");
+        // Owner: a folder of stems opens the import window, which reads the
+        // names, picks the click and guide out, and places up to eight.
+        juce::Array<juce::File> files;
+        juce::StringArray ids;
+        for (auto* m : members)
+        {
+            const auto f = libraryManager.resolve (m->assetId);
+            if (! f.existsAsFile()) continue;
+            files.add (f);
+            ids.add (m->assetId);
+        }
+        if (files.isEmpty()) { showToast (deckLabel (flat) + ": none of the folder's files could be found"); return; }
+        openStemImport (flat, files, ids);
     }
 
     // Phase 1.1 P1 "Deck Management": unloads exactly one stem/layer (the
@@ -9607,6 +11620,9 @@ public:
 
             layerFilePaths[(size_t) targetFlat][(size_t) l]    = layerFilePaths[(size_t) deckIdx][(size_t) l];
             taggedBpm[(size_t) targetFlat][(size_t) l]         = taggedBpm[(size_t) deckIdx][(size_t) l];
+            deckSourceBpm[(size_t) targetFlat]                 = deckSourceBpm[(size_t) deckIdx];
+            deckBufferBpm[(size_t) targetFlat]                 = deckBufferBpm[(size_t) deckIdx];
+            if (rowMeter[(size_t) deckIdx].isNotEmpty()) setRowMeter (targetFlat, rowMeter[(size_t) deckIdx], true);
             layerNameOverride[(size_t) targetFlat][(size_t) l] = layerDisplayName (deckIdx, l);
             setIndexed (layerNames[(size_t) targetFlat], l, layerNames[(size_t) deckIdx][l]);
             setIndexed (layerStatus[(size_t) targetFlat], l, layerStatus[(size_t) deckIdx][l]);
@@ -9647,6 +11663,7 @@ public:
         menu.addItem (8, "Link Pad...", layer.loaded);     // SPEC_PERFORM_V2 GROUP H4
         menu.addItem (2, "Replace Audio...", canMutate);
         menu.addItem (3, "Clear Deck", layer.loaded && canMutate);
+        addStripMenu (menu, layerIdx);       // PERFORM LIVE channel strip (mics and instruments live on the mixer's LIVE tracks)
         menu.addSeparator();
         // Owner request: "link to MIDI device from the right-click menu for
         // pads and deck" -- arms the router's existing learn mode for this
@@ -9661,6 +11678,7 @@ public:
 
         menu.showMenuAsync (juce::PopupMenu::Options(), [this, deckIdx, layerIdx] (int result)
         {
+            if (handleStripMenu (layerIdx, result)) return;
             switch (result)
             {
                 case 1: promptRenameLayer (deckIdx, layerIdx); return;
@@ -9851,7 +11869,7 @@ public:
                                            ? nameOverride[(size_t) idx]
                                            : juce::File (filePaths[(size_t) idx]).getFileNameWithoutExtension();
         const juce::String stats = (isPad ? juce::String ("Pad ") : juce::String ("FX ")) + juce::String (idx + 1)
-                                    + " · key " + keyForAction (action);
+                                    + juce::String (juce::CharPointer_UTF8 (" " "\xc2" "\xb7" " key ")) + keyForAction (action);
 
         clipEditorContent.reset();
         voiceEditorContent.reset();
@@ -10024,8 +12042,13 @@ public:
                 refreshDeckPanelChrome(); repaint();
             }), nullptr);
         menu.addSeparator();
-        menu.addItem (1, "Set deck tempo...");
-        menu.addItem (2, "Clear deck tempo", deckTempoOverride[(size_t) deckIdx].has_value());
+        menu.addItem (1, deckSourceBpm[(size_t) deckIdx].has_value()
+                            ? "Tempo & time signature... (" + rowMeterName (deckIdx) + ", original " + juce::String (*deckSourceBpm[(size_t) deckIdx], 1) + " BPM)"
+                            : "Tempo & time signature... (" + rowMeterName (deckIdx) + ", original not set)");
+        menu.addItem (2, "Play as recorded (clear play-at tempo)", deckTempoOverride[(size_t) deckIdx].has_value());
+        menu.addSeparator();
+        menu.addItem (12, "Load stems into this row...", canChangeMode);
+        menu.addItem (13, "Click & guide tracks...");
         // Owner #16: "there's no MIDI learn for the A1 A2 A3 -- we need that."
         menu.addItem (11, "MIDI Learn (trigger)...");
         menu.addSeparator();
@@ -10057,13 +12080,16 @@ public:
                 case 1: promptSetDeckTempo (deckIdx); return;
                 case 2:
                     deckTempoOverride[(size_t) deckIdx].reset();
+                    applyDeckSourceTempo (deckIdx);
                     reWarpDeckToEffectiveTempo (deckIdx);
-                    showToast (deckLabel (deckIdx) + ": tempo override cleared");   // Milestone 15: no silent state changes
+                    showToast (deckLabel (deckIdx) + ": playing as recorded");   // Milestone 15: no silent state changes
                     repaint();
                     return;
                 case 7: promptRenameRow (deckIdx); return;
                 case 9: promptRowNotes (deckIdx); return;
                 case 10: promptRowTags (deckIdx); return;
+                case 12: promptLoadStemsIntoRow (deckIdx); return;
+                case 13: showSongTrackMenu (deckIdx); return;
                 case 11:
                 {
                     // Owner #16: bind the next MIDI note/CC press to this
@@ -10172,43 +12198,78 @@ public:
     // value before explicitly deleting the AlertWindow at the end of the
     // callback, avoiding the use-after-free that deleteWhenDismissed=true
     // would cause by deleting the window before invoking the callback).
+    // Owner: "I have to set the actual tempo first, and then when I want to
+    // change the tempo the time-stretch comes in." Two fields: the song's
+    // original tempo (a record of the recording -- it never changes the
+    // audio) and an optional "play at" tempo, which is the only thing that
+    // ever stretches the stems, all by one ratio.
     void promptSetDeckTempo (int deckIdx)
     {
-        auto* aw = new juce::AlertWindow ("Set Deck " + deckLabel (deckIdx) + " Tempo",
-                                           "Enter a target tempo (BPM), or clear the field to remove the override "
-                                           "(\"play as recorded\"):",
+        auto* aw = new juce::AlertWindow (deckLabel (deckIdx) + ": Tempo & time signature",
+                                           "Original is the tempo the stems were recorded at - the app never guesses it. "
+                                           "Play at stretches every stem together; leave it empty to play as recorded. "
+                                           "Time signature is how many beats make a bar in this song.",
                                            juce::MessageBoxIconType::NoIcon);
-        const auto& existing = deckTempoOverride[(size_t) deckIdx];
-        aw->addTextEditor ("bpm", existing.has_value() ? juce::String (*existing, 1) : juce::String());
+        const auto& original = deckSourceBpm[(size_t) deckIdx];
+        const auto& playAt   = deckTempoOverride[(size_t) deckIdx];
+        aw->addTextEditor ("original", original.has_value() ? juce::String (*original, 1) : juce::String(), "Original tempo (BPM)");
+        aw->addTextEditor ("playAt", playAt.has_value() ? juce::String (*playAt, 1) : juce::String(), "Play at (BPM) - optional");
+        {
+            juce::StringArray meters;
+            meters.add ("Same as the " + juce::String (signatureManager.signature (signatureManager.signatureIndexForDeck (deckIdx)).name) + " group");
+            for (const auto& m : ezstems::meterChoices()) meters.add (m.name);
+            aw->addComboBox ("meter", meters, "Time signature");
+            const int idx = rowMeter[(size_t) deckIdx].isEmpty() ? 0 : meters.indexOf (rowMeter[(size_t) deckIdx]);
+            aw->getComboBoxComponent ("meter")->setSelectedItemIndex (juce::jmax (0, idx), juce::dontSendNotification);
+        }
         aw->addButton ("OK", 1, juce::KeyPress (juce::KeyPress::returnKey));
+        if (songClickTrack[(size_t) deckIdx] != nullptr) aw->addButton ("Read from click track", 2);
         aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
 
         aw->enterModalState (true, juce::ModalCallbackFunction::create (
             [this, aw, deckIdx] (int result)
             {
-                if (result == 1)
-                {
-                    const juce::String text = aw->getTextEditorContents ("bpm").trim();
-                    if (text.isEmpty())
-                    {
-                        // "clearing the field reverts to play as recorded" (PRODUCT_REQUIREMENTS.md §5) --
-                        // identical resulting state to the "Clear deck tempo" menu item
-                        deckTempoOverride[(size_t) deckIdx].reset();
-                        showToast (deckLabel (deckIdx) + ": tempo override cleared (play as recorded)");
-                    }
-                    else
-                    {
-                        const double v = text.getDoubleValue();
-                        if (v > 0.0)
-                        {
-                            deckTempoOverride[(size_t) deckIdx] = juce::jlimit (1.0, 999.0, v);
-                            showToast (deckLabel (deckIdx) + ": tempo set to " + juce::String (*deckTempoOverride[(size_t) deckIdx], 1) + " BPM");
-                        }
-                    }
-                    reWarpDeckToEffectiveTempo (deckIdx);
-                    repaint();
-                }
+                const juce::String originalText = aw->getTextEditorContents ("original").trim();
+                const juce::String playAtText   = aw->getTextEditorContents ("playAt").trim();
+                const int meterIndex            = aw->getComboBoxComponent ("meter")->getSelectedItemIndex();
+                const juce::String chosenMeter  = meterIndex <= 0 ? juce::String() : aw->getComboBoxComponent ("meter")->getText();
                 delete aw;
+                if (result == 1 && chosenMeter != rowMeter[(size_t) deckIdx]) setRowMeter (deckIdx, chosenMeter);
+                if (result == 2) { readTempoFromRowClick (deckIdx); promptSetDeckTempo (deckIdx); return; }
+                if (result != 1) return;
+
+                const double o = originalText.getDoubleValue();
+                if (o > 0.0)
+                {
+                    const double v = juce::jlimit (1.0, 999.0, o);
+                    // the buffers are still at the old original's tempo only if
+                    // they were never stretched; a corrected original just
+                    // relabels them
+                    if (deckBufferBpm[(size_t) deckIdx] > 0.0
+                         && deckSourceBpm[(size_t) deckIdx].has_value()
+                         && std::abs (deckBufferBpm[(size_t) deckIdx] - *deckSourceBpm[(size_t) deckIdx]) < 0.01)
+                        deckBufferBpm[(size_t) deckIdx] = v;
+                    deckSourceBpm[(size_t) deckIdx] = v;
+                }
+                else if (originalText.isEmpty() && ! playAtText.isEmpty())
+                {
+                    showToast (deckLabel (deckIdx) + ": enter the original tempo first - nothing was stretched");
+                    return;
+                }
+
+                const double p = playAtText.getDoubleValue();
+                if (playAtText.isEmpty() || p <= 0.0) deckTempoOverride[(size_t) deckIdx].reset();
+                else deckTempoOverride[(size_t) deckIdx] = juce::jlimit (1.0, 999.0, p);
+
+                applyDeckSourceTempo (deckIdx);
+                reWarpDeckToEffectiveTempo (deckIdx);
+
+                juce::String msg = deckLabel (deckIdx) + ": " + rowMeterName (deckIdx) + ", original " + juce::String (deckSourceBpm[(size_t) deckIdx].value_or (0.0), 1) + " BPM";
+                if (deckTempoOverride[(size_t) deckIdx].has_value())
+                    msg += ", playing at " + juce::String (*deckTempoOverride[(size_t) deckIdx], 1) + " BPM";
+                else msg += ", playing as recorded";
+                showToast (msg);
+                repaint();
             }), false);
     }
 
@@ -10282,26 +12343,41 @@ public:
     // deck and some future re-warp trigger fires for it normally -- a
     // documented, narrow limitation (project/KNOWN_BUGS.md), not silently
     // worked around with new Session API surface.
+    //
+    // Owner: "don't play with the tempo until you are asked to." The stretch
+    // is one ratio for the whole row: from the tempo the buffers are at now
+    // (deckBufferBpm, or the user-set original) to the target. A row with no
+    // original tempo set is never touched. With no target (no "play at", LOCK
+    // off) a row that was stretched earlier is stretched back to its original.
     void reWarpDeckToEffectiveTempo (int deckIdx)
     {
-        const auto target = resolveEffectiveTempo (deckTempoOverride[(size_t) deckIdx], tempoLockEnabled, masterTempo.bpm);
-        if (! target.has_value()) return;
+        const auto& original = deckSourceBpm[(size_t) deckIdx];
+        if (! original.has_value() || *original <= 0.0) return;
+
+        auto target = resolveEffectiveTempo (deckTempoOverride[(size_t) deckIdx], tempoLockEnabled, masterTempo.bpm);
+        if (! target.has_value()) target = *original;   // "play as recorded"
+
+        const double from = deckBufferBpm[(size_t) deckIdx] > 0.0 ? deckBufferBpm[(size_t) deckIdx] : *original;
+        if (std::abs (*target - from) < 0.01) return;   // already there -- don't re-process the audio for nothing
 
         auto& deck = session.decks[(size_t) deckIdx];
         const bool needsSwapPrimitive = session.isDeckAudible (deckIdx);
         const bool isTrueActiveDeck   = (session.activeDeck() == deckIdx);
-        bool anyStaged = false;
+        const bool stemMode = deck.mode == ezdeck::DeckMode::stem;
+        bool anyStaged = false, allApplied = true;
 
         for (int l = 0; l < ezdeck::kNumLayers; ++l)
         {
             auto& layer = deck.layers[(size_t) l];
             if (! layer.loaded) continue;
 
-            const double sourceBpm = taggedBpm[(size_t) deckIdx][(size_t) l];
             auto warped = ezdsp::reWarpLayer (layer.left, layer.right,
                                                deckFileSampleRate[(size_t) deckIdx],
-                                               sourceBpm, *target);
-            if (warped.left.empty()) continue;   // defensive -- reWarpLayer's own no-op-on-bad-input guard
+                                               from, *target);
+            if (warped.left.empty()) { allApplied = false; continue; }   // defensive -- reWarpLayer's own no-op-on-bad-input guard
+
+            // a stem plays its whole length; only loop mode wants the fitted region
+            const int region = stemMode ? 0 : warped.regionLength;
 
             if (needsSwapPrimitive)
             {
@@ -10309,26 +12385,619 @@ public:
                 // applied yet, stagePendingSwap() returns false and this
                 // request is dropped rather than overwriting an in-flight
                 // buffer (M4-T1's concurrent-request policy) -- the next
-                // triggering event will simply try again. taggedBpm is only
-                // updated when the stage actually succeeds, so it never
-                // claims a tempo the audio itself hasn't (yet, or ever)
-                // actually reached.
-                if (layer.stagePendingSwap (std::move (warped.left), std::move (warped.right), warped.regionLength))
+                // triggering event will simply try again.
+                if (layer.stagePendingSwap (std::move (warped.left), std::move (warped.right), region))
                 {
-                    taggedBpm[(size_t) deckIdx][(size_t) l] = warped.bpm;
+                    taggedBpm[(size_t) deckIdx][(size_t) l] = *target;
                     anyStaged = true;
                 }
+                else allApplied = false;
             }
             else
             {
                 layer.left         = std::move (warped.left);
                 layer.right        = std::move (warped.right);
-                layer.regionLength = warped.regionLength;
-                taggedBpm[(size_t) deckIdx][(size_t) l] = warped.bpm;
+                layer.regionLength = region;
+                taggedBpm[(size_t) deckIdx][(size_t) l] = *target;
             }
         }
 
+        // the song's own click and guide stretch with the stems, so they stay on the beat
+        if (allApplied && ! needsSwapPrimitive)
+            for (bool isGuide : { false, true })
+            {
+                auto& slot = isGuide ? songGuideTrack[(size_t) deckIdx] : songClickTrack[(size_t) deckIdx];
+                if (slot == nullptr) continue;
+                auto warped = ezdsp::reWarpLayer (slot->mono, {}, slot->rate, from, *target);
+                if (warped.left.empty()) continue;
+                auto fresh = std::make_shared<SongTrack>();
+                fresh->filePath = slot->filePath;
+                fresh->rate = slot->rate;
+                fresh->mono = std::move (warped.left);
+                retiredSongTracks.push_back (slot);
+                slot = fresh;
+                (isGuide ? liveGuideTrack : liveClickTrack)[(size_t) deckIdx].store (fresh.get(), std::memory_order_release);
+            }
+
+        if (allApplied) deckBufferBpm[(size_t) deckIdx] = *target;
         if (isTrueActiveDeck && anyStaged) session.scheduleActiveDeckRewarp();
+    }
+
+    //== a song's own click and guide tracks =====================================
+
+    bool decodeMono (const juce::File& file, std::vector<float>& mono, double& rate, juce::String& error)
+    {
+        if (ezlibrary::isRemotePath (file.getFullPathName())) { error = "not a local file"; return false; }
+        std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
+        if (reader == nullptr) { error = "could not open " + file.getFileName(); return false; }
+        if (! eximport::readerGeometryIsSane (*reader, error)) return false;
+        const int len = (int) reader->lengthInSamples;
+        if (len <= 0) { error = file.getFileName() + " is empty"; return false; }
+        mono.assign ((size_t) len, 0.0f);
+        float* chans[1] { mono.data() };
+        juce::AudioBuffer<float> dest (chans, 1, len);
+        reader->read (&dest, 0, len, 0, true, false);
+        rate = reader->sampleRate;
+        return true;
+    }
+
+    /** Loads a click or guide track beside the row. quiet: no toast and the
+        row's on/off switches are left alone (project load restores them). */
+    bool loadSongTrack (int deck, bool isGuide, const juce::File& file, bool quiet = false)
+    {
+        if (deck < 0 || deck >= kNumDecks) return false;
+        if (! canMutateDeckState (deck)) { showToast (deckLabel (deck) + ": stop this row first"); return false; }
+        auto fresh = std::make_shared<SongTrack>();
+        juce::String error;
+        if (! decodeMono (file, fresh->mono, fresh->rate, error))
+        {
+            if (! quiet) showToast (juce::String (isGuide ? "Guide" : "Click") + " track: " + error);
+            return false;
+        }
+        fresh->filePath = file.getFullPathName();
+
+        auto& slot = isGuide ? songGuideTrack[(size_t) deck] : songClickTrack[(size_t) deck];
+        auto& live = isGuide ? liveGuideTrack[(size_t) deck] : liveClickTrack[(size_t) deck];
+        if (slot != nullptr) retiredSongTracks.push_back (slot);
+        slot = fresh;
+        live.store (fresh.get(), std::memory_order_release);
+
+        if (! quiet)
+        {
+            // they brought it, so it plays: on, and the song's own
+            (isGuide ? arrangements[(size_t) deck].guideCues : arrangements[(size_t) deck].guideClick) = true;
+            (isGuide ? useSongGuide : useSongClick)[(size_t) deck] = true;
+            showToast (deckLabel (deck) + ": " + (isGuide ? "guide" : "click") + " track " + file.getFileName());
+        }
+        rebuildGuideSchedule();
+        refreshSlotLabels();
+        return true;
+    }
+
+    void clearSongTrack (int deck, bool isGuide, bool quiet = false)
+    {
+        if (deck < 0 || deck >= kNumDecks) return;
+        auto& slot = isGuide ? songGuideTrack[(size_t) deck] : songClickTrack[(size_t) deck];
+        auto& live = isGuide ? liveGuideTrack[(size_t) deck] : liveClickTrack[(size_t) deck];
+        live.store (nullptr, std::memory_order_release);
+        if (slot != nullptr) { retiredSongTracks.push_back (slot); slot = nullptr; }
+        if (! quiet) { rebuildGuideSchedule(); refreshSlotLabels(); showToast (deckLabel (deck) + ": " + (isGuide ? "guide" : "click") + " track removed"); }
+    }
+
+    /** Audio thread: adds the track to out, following the deck's playhead
+        (deck file samples) at the deck's own speed. */
+    void renderSongTrack (const SongTrack& t, float* outL, float* outR, int n, double deckPos, double deckFileRate) const
+    {
+        if (t.mono.size() < 2 || t.rate <= 0.0 || deckFileRate <= 0.0 || currentSampleRate <= 0.0) return;
+        double idx = deckPos * (t.rate / deckFileRate);
+        const double step = t.rate / currentSampleRate;
+        const double last = (double) (t.mono.size() - 1);
+        for (int i = 0; i < n; ++i, idx += step)
+        {
+            if (idx < 0.0 || idx >= last) continue;
+            const size_t a = (size_t) idx;
+            const float f = (float) (idx - (double) a);
+            const float s = t.mono[a] + (t.mono[a + 1] - t.mono[a]) * f;
+            outL[i] += s;
+            outR[i] += s;
+        }
+    }
+
+    ezcue::ClickReading readClickAudio (const std::vector<float>& mono, double rate) const
+    {
+        if (mono.empty() || rate <= 0.0) return {};
+        // the first two minutes are plenty, and keep this quick
+        const size_t n = juce::jmin (mono.size(), (size_t) (rate * 120.0));
+        return ezcue::readClickTrack (mono.data(), n, rate);
+    }
+
+    ezcue::ClickReading readClickFile (const juce::File& file)
+    {
+        std::vector<float> mono; double rate = 0.0; juce::String error;
+        if (! decodeMono (file, mono, rate, error)) return {};
+        return readClickAudio (mono, rate);
+    }
+
+    /** Owner: "use that click from the stems to get the tempo" -- and the time
+        signature, from the accented downbeat, when the click has one. */
+    void readTempoFromRowClick (int deck)
+    {
+        const auto& t = songClickTrack[(size_t) deck];
+        if (t == nullptr) { showToast (deckLabel (deck) + ": load a click track first"); return; }
+        if (! canMutateDeckState (deck)) { showToast (deckLabel (deck) + ": stop this row first"); return; }
+        const auto reading = readClickAudio (t->mono, t->rate);
+        if (reading.bpm <= 0.0) { showToast (deckLabel (deck) + ": no steady clicks heard - type the tempo instead"); return; }
+        // alternating clicks are eighth notes when the file's name says the song is half that
+        const double named = ezcue::tempoFromName (t->filePath.toStdString());
+        const bool eighths = reading.alternating && named > 0.0 && std::abs (named * 2.0 - reading.clicksPerMinute) < 1.0;
+        const double bpm = eighths ? named : reading.bpm;
+        if (deckBufferBpm[(size_t) deck] > 0.0 && deckSourceBpm[(size_t) deck].has_value()
+             && std::abs (deckBufferBpm[(size_t) deck] - *deckSourceBpm[(size_t) deck]) < 0.01)
+            deckBufferBpm[(size_t) deck] = bpm;
+        deckSourceBpm[(size_t) deck] = bpm;
+
+        juce::String meterNote;
+        const auto meter = ezstems::meterForBeats (reading.beatsPerBar);
+        if (meter.isNotEmpty() && setRowMeter (deck, meter, true)) meterNote = ", " + meter + " from its accented beat one";
+        else if (reading.alternating)
+            meterNote = juce::String (eighths ? " (eighth-note clicks, as the file name says" : " (the click alternates two sounds -- " + juce::String (reading.clicksPerMinute * 0.5, 0) + " BPM if they're eighth notes")
+                      + "; no beat-one click, so check the time signature, now " + rowMeterName (deck) + ")";
+        else meterNote = " (no beat-one accent -- check the time signature, now " + rowMeterName (deck) + ")";
+
+        applyDeckSourceTempo (deck);
+        reWarpDeckToEffectiveTempo (deck);
+        rebuildGuideSchedule();
+        showToast (deckLabel (deck) + ": original tempo " + juce::String (bpm, 1) + " BPM" + meterNote);
+        repaint();
+    }
+
+    //== sections from a guide / cue track: speech recognition, then a review =====
+    // Owner: "when it says bridge I see rap, or chorus I see chorus 3 -- work on
+    // the speech to text so you don't write something wrong ... and I should be
+    // able to make changes if the detection is wrong." The words are heard by
+    // the operating system's recognizer (SpeechCues.h), listening only for
+    // section names; matching the Motion Worship recordings is the fallback
+    // where there is no recognizer. Nothing replaces the song's sections until
+    // the review window's Apply.
+
+    static std::vector<float> clip16k (const std::vector<float>& x, double rate, double startSec, double lenSec)
+    {
+        std::vector<float> out;
+        if (x.size() < 2 || rate <= 0.0) return out;
+        const double step = rate / 16000.0;
+        const double a = juce::jmax (0.0, startSec * rate);
+        const double b = juce::jmin ((double) x.size() - 1.0, (startSec + lenSec) * rate);
+        out.reserve ((size_t) juce::jmax (0.0, (b - a) / step) + 1);
+        for (double p = a; p < b; p += step)
+        {
+            const size_t i = (size_t) p;
+            const float t = (float) (p - (double) i);
+            out.push_back (x[i] + (x[i + 1] - x[i]) * t);
+        }
+        return out;
+    }
+
+    /** The recordings that name sections (matching fallback); counts are found by rhythm. */
+    std::vector<ezcue::Reference> songFormReferences() const
+    {
+        std::vector<ezcue::Reference> refs;
+        for (const auto& [stem, id] : cueIds)
+        {
+            const bool songForm = std::find_if (cueMenuNames.begin(), cueMenuNames.end(),
+                                                [&stem] (const juce::String& nm) { return nm.startsWith ("Song Form/") && nm.endsWith ("/" + juce::String (stem)); })
+                                  != cueMenuNames.end();
+            if (! songForm || id < 0 || id >= (int) cueSources.size()) continue;
+            const auto& src = cueSources[(size_t) id];
+            refs.push_back ({ stem, ezcue::envelopeDb (src.mono.data(), src.mono.size(), src.rate) });
+        }
+        return refs;
+    }
+
+    std::vector<std::string> songFormStems() const
+    {
+        std::vector<std::string> stems;
+        for (const auto& n : cueMenuNames)
+            if (n.startsWith ("Song Form/")) stems.push_back (n.fromLastOccurrenceOf ("/", false, false).toStdString());
+        return stems;
+    }
+
+    /** Any thread. The spoken bursts, heard by the recognizer when there is one. */
+    static std::vector<ezcue::DraftSection> detectSections (const std::vector<float>& mono, double rate, const ezcue::DetectSettings& st,
+                                                          int lengthBars, const std::vector<ezcue::Reference>& refs,
+                                                          const std::vector<std::string>& stems)
+    {
+        const auto env    = ezcue::envelopeDb (mono.data(), mono.size(), rate);
+        const auto bursts = ezcue::findBursts (env);
+        if (bursts.empty()) return {};
+
+        const auto table = ezcue::cuePhrases (stems);
+        std::vector<ezspeech::Heard> heard;
+        if (ezspeech::available())
+        {
+            std::vector<std::string> phrases;
+            for (const auto& p : table) phrases.push_back (p.phrase);
+            std::vector<std::vector<float>> clips;
+            clips.reserve (bursts.size());
+            for (const auto& b : bursts)
+                clips.push_back (clip16k (mono, rate, b.startSeconds - 0.08, juce::jmin (4.0, b.lengthSeconds) + 0.2));
+            std::string error;
+            heard = ezspeech::recognise (clips, phrases, error);
+            if (! error.empty()) juce::Logger::writeToLog ("Cue speech: " + juce::String (error) + " -- matching recordings instead");
+        }
+        juce::Logger::writeToLog ("Cue track: " + juce::String ((int) bursts.size()) + " bursts, "
+                                  + (heard.empty() ? juce::String ("matched against the cue recordings") : juce::String ("heard by speech recognition")));
+
+        std::function<ezcue::Match (size_t, const ezcue::Burst&)> nameBurst;
+        if (! heard.empty())
+            nameBurst = [&heard, &table] (size_t i, const ezcue::Burst&)
+            {
+                ezcue::Match m;
+                if (i >= heard.size() || heard[i].text.empty()) return m;
+                m.heard = heard[i].text;
+                const auto name = ezcue::nameForPhrase (table, heard[i].text);
+                if (name == "#count") { m.isCount = true; return m; }
+                m.stem = name;
+                // the engine's own "not sure" stays not sure in the review window
+                m.score = heard[i].rejected ? juce::jmin (0.45f, 0.15f + heard[i].confidence * 0.3f)
+                                            : juce::jmax (0.5f, heard[i].confidence);
+                return m;
+            };
+        return ezcue::draftSections (bursts, env, refs, st, lengthBars, nameBurst);
+    }
+
+    /** Owner: "listen to the guide and get the sections of the song." */
+    void buildSectionsFromRowGuide (int deck) { listenForSectionsOnDeck (deck, -1); }
+
+    /** layer -1 = the row's own guide track, else that deck column. */
+    void listenForSectionsOnDeck (int deck, int layer)
+    {
+        if (deck < 0 || deck >= kNumDecks) return;
+        if (listeningForSections) { showToast ("Still listening to the last guide track -- one moment"); return; }
+
+        auto audio = std::make_shared<std::vector<float>>();
+        double rate = 0.0;
+        juce::String label;
+        if (layer < 0)
+        {
+            const auto t = songGuideTrack[(size_t) deck];
+            if (t == nullptr) { showToast (deckLabel (deck) + ": load a guide track first"); return; }
+            *audio = t->mono;
+            rate = t->rate;
+            label = "the guide track";
+        }
+        else
+        {
+            if (layer >= ezdeck::kNumLayers) return;
+            const auto& lay = session.decks[(size_t) deck].layers[(size_t) layer];
+            if (! lay.loaded || lay.left.empty()) return;
+            *audio = lay.left;
+            rate = deckFileSampleRate[(size_t) deck] > 0.0 ? deckFileSampleRate[(size_t) deck] : currentSampleRate;
+            label = "\"" + layerDisplayName (deck, layer) + "\"";
+        }
+        if (! deckSourceBpm[(size_t) deck].has_value())
+        {
+            showToast (deckLabel (deck) + ": set the original tempo first (or read it from the click) so the cues land on bars");
+            return;
+        }
+        ensureArrangementLength (deck);
+
+        // bars in the audio's own tempo: stretched to "play at", or as recorded
+        const double audioBpm = deckBufferBpm[(size_t) deck] > 0.0 ? deckBufferBpm[(size_t) deck] : *deckSourceBpm[(size_t) deck];
+        ezcue::DetectSettings st;
+        st.beatsPerBar   = juce::jmax (1, session.deckTempo (deck).beatsPerBar);
+        st.secondsPerBar = (60.0 / audioBpm) * (double) st.beatsPerBar;
+        st.leadBars      = arrangements[(size_t) deck].cueLeadBars;
+        const int lengthBars = deckLengthBars (deck);
+        auto refs  = std::make_shared<std::vector<ezcue::Reference>> (songFormReferences());
+        auto stems = std::make_shared<std::vector<std::string>> (songFormStems());
+
+        listeningForSections = true;
+        showToast (deckLabel (deck) + ": listening to " + label + " for its cues...");
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        juce::Thread::launch ([safe, deck, audio, rate, st, lengthBars, refs, stems, label]
+        {
+            auto drafts = std::make_shared<std::vector<ezcue::DraftSection>> (detectSections (*audio, rate, st, lengthBars, *refs, *stems));
+            juce::MessageManager::callAsync ([safe, deck, audio, rate, drafts, label]
+            {
+                if (safe == nullptr) return;
+                safe->listeningForSections = false;
+                safe->openCueReview (deck, *drafts, audio, rate, label);
+            });
+        });
+    }
+
+    void openCueReview (int deck, const std::vector<ezcue::DraftSection>& drafts,
+                        std::shared_ptr<std::vector<float>> audio, double rate, const juce::String& label)
+    {
+        if (drafts.empty())
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::NoIcon, "No cues heard",
+                "Nothing on " + label + " sounded like spoken cues.\n\nTry another track, or use Auto-section in PLAYBACK and name the sections.",
+                "OK", this);
+            return;
+        }
+
+        juce::StringArray names;
+        for (const auto& p : ezcue::cuePhrases (songFormStems()))
+            if (p.name != "#count") names.addIfNotAlreadyThere (juce::String (p.name));
+        names.sortNatural();
+
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        auto* content = new ezcuereview::CueReviewDialog (drafts, deckLabel (deck) + ": sections from " + label, names,
+            [safe, audio, rate] (double start, double length)
+            {
+                // the spoken cue itself, a little either side, through the Library's audition voice
+                if (safe == nullptr || audio == nullptr || rate <= 0.0) return;
+                const size_t a = (size_t) juce::jmax (0.0, (start - 0.15) * rate);
+                const size_t b = (size_t) juce::jmin ((double) audio->size(), (start + length + 0.35) * rate);
+                if (b <= a) return;
+                auto clip = std::make_shared<std::vector<float>> (audio->begin() + (long) a, audio->begin() + (long) b);
+                safe->startLibraryPreview (clip, nullptr, safe->currentSampleRate > 0.0 ? rate / safe->currentSampleRate : 1.0);
+            },
+            [safe, deck] (const std::vector<ezcuereview::Choice>& chosen)
+            {
+                if (safe != nullptr) safe->applyReviewedSections (deck, chosen);
+            });
+
+        juce::DialogWindow::LaunchOptions options;
+        options.dialogTitle = "Review sections";
+        options.content.setOwned (content);
+        options.escapeKeyTriggersCloseButton = true;
+        options.useNativeTitleBar = true;
+        options.resizable = false;
+        options.launchAsync();
+    }
+
+    void applyReviewedSections (int deck, const std::vector<ezcuereview::Choice>& chosen)
+    {
+        if (deck < 0 || deck >= kNumDecks || chosen.empty()) return;
+        auto& a = arrangements[(size_t) deck];
+        a.sections.clear();
+        for (const auto& c : chosen)
+        {
+            ezarr::Section s;
+            s.name = c.name.toStdString();
+            s.startBar = c.startBar;
+            s.colourArgb = ezplayback::colourForSectionName (s.name, (int) a.sections.size());
+            a.addSection (s);
+        }
+        rebuildGuideSchedule();
+        if (playbackView) playbackView->songChanged();
+        showToast (deckLabel (deck) + ": " + juce::String ((int) chosen.size()) + " sections applied -- see PLAYBACK");
+    }
+
+    void toggleSongTrackPill (int deck, bool isGuide)
+    {
+        const bool has = (isGuide ? songGuideTrack : songClickTrack)[(size_t) deck] != nullptr;
+        if (! has && isGuide && cueBank.empty()) { showSongTrackMenu (deck); return; }
+        auto& a = arrangements[(size_t) deck];
+        bool& flag = isGuide ? a.guideCues : a.guideClick;
+        flag = ! flag;
+        if (flag && ! has) (isGuide ? useSongGuide : useSongClick)[(size_t) deck] = false;   // nothing of the song's to use: the app's
+        rebuildGuideSchedule();
+        refreshSlotLabels();
+        showToast (deckLabel (deck) + ": " + (isGuide ? "guide " : "click ") + (flag ? "on" : "off")
+                   + (flag ? (has && (isGuide ? useSongGuide : useSongClick)[(size_t) deck] ? " (the song's own)" : " (built-in)") : ""));
+    }
+
+    void showSongTrackMenu (int deck)
+    {
+        const bool hasClick = songClickTrack[(size_t) deck] != nullptr;
+        const bool hasGuide = songGuideTrack[(size_t) deck] != nullptr;
+        const auto& a = arrangements[(size_t) deck];
+        const bool canLoad = canMutateDeckState (deck);
+
+        juce::PopupMenu m;
+        m.addSectionHeader (deckLabel (deck) + "  -  CLICK");
+        m.addItem (30, "Click on", true, a.guideClick);
+        m.addItem (10, hasClick ? "Replace click track..." : "Load the song's click track...", canLoad);
+        m.addItem (11, "Use the song's click (not the built-in one)", hasClick, hasClick && useSongClick[(size_t) deck]);
+        m.addItem (12, "Read the original tempo from the click", hasClick);
+        m.addItem (13, "Remove click track", hasClick && canLoad);
+        m.addSeparator();
+        m.addSectionHeader ("GUIDE");
+        m.addItem (31, "Guide on", true, a.guideCues);
+        m.addItem (20, hasGuide ? "Replace guide track..." : "Load the song's guide track...", canLoad);
+        m.addItem (21, "Use the song's guide (not the built-in cues)", hasGuide, hasGuide && useSongGuide[(size_t) deck]);
+        m.addItem (22, "Build the sections from the guide", hasGuide);
+        m.addItem (23, "Remove guide track", hasGuide && canLoad);
+        m.addSeparator();
+        m.addItem (1, "Load stems into this row...", canLoad);
+
+        const int sigIdx = signatureManager.signatureIndexForDeck (deck);
+        const int slot   = deck - signatureManager.firstDeckIndex (sigIdx);
+        auto options = juce::PopupMenu::Options();
+        if (slot >= 0 && slot < guideCells.size() && guideCells[slot]->isShowing()) options = options.withTargetComponent (guideCells[slot]);
+
+        m.showMenuAsync (options, [this, deck] (int r)
+        {
+            switch (r)
+            {
+                case 1:  promptLoadStemsIntoRow (deck); break;
+                case 10: promptLoadSongTrack (deck, false); break;
+                case 11: useSongClick[(size_t) deck] = ! useSongClick[(size_t) deck]; rebuildGuideSchedule(); refreshSlotLabels(); break;
+                case 12: readTempoFromRowClick (deck); break;
+                case 13: if (canMutateDeckState (deck)) clearSongTrack (deck, false); break;
+                case 20: promptLoadSongTrack (deck, true); break;
+                case 21: useSongGuide[(size_t) deck] = ! useSongGuide[(size_t) deck]; rebuildGuideSchedule(); refreshSlotLabels(); break;
+                case 22: buildSectionsFromRowGuide (deck); break;
+                case 23: if (canMutateDeckState (deck)) clearSongTrack (deck, true); break;
+                case 30: toggleSongTrackPill (deck, false); break;
+                case 31: toggleSongTrackPill (deck, true); break;
+                default: break;
+            }
+        });
+    }
+
+    void promptLoadSongTrack (int deck, bool isGuide)
+    {
+        rowFileChooser = std::make_unique<juce::FileChooser> (juce::String ("Choose the song's ") + (isGuide ? "guide" : "click") + " track...",
+                                                               juce::File(), "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
+        constexpr auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+        rowFileChooser->launchAsync (flags, [this, deck, isGuide] (const juce::FileChooser& fc)
+        {
+            const auto f = fc.getResult();
+            if (f != juce::File()) loadSongTrack (deck, isGuide, f);
+        });
+    }
+
+    void promptLoadStemsIntoRow (int deck)
+    {
+        rowFileChooser = std::make_unique<juce::FileChooser> ("Choose the song's stems (the click and guide too, if it has them)...",
+                                                               juce::File(), "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg");
+        constexpr auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
+                             | juce::FileBrowserComponent::canSelectMultipleItems;
+        rowFileChooser->launchAsync (flags, [this, deck] (const juce::FileChooser& fc)
+        {
+            auto files = fc.getResults();
+            if (! files.isEmpty()) openStemImport (deck, files, {});
+        });
+    }
+
+    // Owner: "when we are importing, a window where you can select this is
+    // a click, this is a guide, read the names of the elements and put them
+    // in the decks in a way that makes sense." StemImport.h.
+    void openStemImport (int deck, juce::Array<juce::File> files, juce::StringArray assetIds)
+    {
+        if (! canMutateDeckState (deck)) { showToast (deckLabel (deck) + ": stop this row first to load into it"); return; }
+        if (files.isEmpty()) return;
+
+        // a tempo the files carry themselves (a DAW tag), else the row's own
+        double hint = deckSourceBpm[(size_t) deck].value_or (0.0);
+        if (hint <= 0.0)
+            for (auto& f : files)
+            {
+                std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (f));
+                if (reader == nullptr) continue;
+                const double tag = embeddedTempoFrom (*reader);
+                if (tag > 0.0) { hint = tag; break; }
+            }
+
+        if (hint <= 0.0)   // a tempo in the folder or file name: MultiTracks' "...-G-66.00bpm"
+            for (auto& f : files)
+                if (const double named = ezcue::tempoFromName (f.getFullPathName().toStdString()); named > 0.0) { hint = named; break; }
+
+        auto plan = ezstems::planStemImport (files, assetIds, hint);
+        plan.meter = rowMeter[(size_t) deck];
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        auto* content = new ezstems::StemImportDialog (std::move (plan), deckLabel (deck),
+            [safe] (const juce::File& click) { return safe != nullptr ? safe->readClickFile (click) : ezcue::ClickReading(); },
+            [safe, deck] (const ezstems::Plan& p) { if (safe != nullptr) safe->applyStemImport (deck, p); });
+
+        juce::DialogWindow::LaunchOptions options;
+        options.dialogTitle = "Load stems";
+        options.content.setOwned (content);
+        options.escapeKeyTriggersCloseButton = true;
+        options.useNativeTitleBar = true;
+        options.resizable = false;
+        options.launchAsync();
+    }
+
+    void applyStemImport (int deck, const ezstems::Plan& plan)
+    {
+        if (! canMutateDeckState (deck)) { showToast (deckLabel (deck) + ": stop this row first to load into it"); return; }
+
+        // the row starts clean: every deck, both song tracks
+        for (int l = 0; l < ezdeck::kNumLayers; ++l) { clearLayer (deck, l); layerNameOverride[(size_t) deck][(size_t) l] = {}; layerAssetIds[(size_t) deck][(size_t) l] = {}; }
+        clearSongTrack (deck, false, true);
+        clearSongTrack (deck, true, true);
+        deckRateSet[(size_t) deck] = false;
+        deckBufferBpm[(size_t) deck] = 0.0;
+        session.decks[(size_t) deck].mode = ezdeck::DeckMode::stem;
+        if (plan.tempo > 0.0) deckSourceBpm[(size_t) deck] = plan.tempo;
+        setRowMeter (deck, plan.meter, true);   // before the stems load: their bar counts use it
+
+        int loaded = 0;
+        bool click = false, guide = false;
+        for (const auto& it : plan.items)
+        {
+            if (it.role >= 0 && it.role < ezdeck::kNumLayers)
+            {
+                loadLayer (deck, it.role, it.file);
+                if (session.decks[(size_t) deck].layers[(size_t) it.role].loaded)
+                {
+                    ++loaded;
+                    layerAssetIds[(size_t) deck][(size_t) it.role] = it.assetId;
+                    layerNameOverride[(size_t) deck][(size_t) it.role] = it.name;
+                }
+            }
+            else if (it.role == ezstems::kClick && ! click) click = loadSongTrack (deck, false, it.file, true);
+            else if (it.role == ezstems::kGuide && ! guide) guide = loadSongTrack (deck, true, it.file, true);
+        }
+        if (click) { arrangements[(size_t) deck].guideClick = true; useSongClick[(size_t) deck] = true; }
+        if (guide) { arrangements[(size_t) deck].guideCues  = true; useSongGuide[(size_t) deck] = true; }
+
+        applyDeckSourceTempo (deck);
+        rebuildGuideSchedule();
+        refreshSlotLabels();
+        if (playbackView) playbackView->songChanged();
+
+        juce::String msg = deckLabel (deck) + ": " + juce::String (loaded) + (loaded == 1 ? " stem" : " stems");
+        if (click) msg += " + click";
+        if (guide) msg += " + guide";
+        msg += plan.tempo > 0.0 ? ", original tempo " + juce::String (plan.tempo, 1) + " BPM" : ", tempo not set (playing as recorded)";
+        showToast (msg);
+        repaint();
+    }
+
+    //== a song's own time signature ============================================
+    // Owner: "songs have different time signatures and the app should
+    // accommodate that." A row plays in its signature group's meter unless the
+    // song sets its own (rowMeter, one of ezstems::meterChoices()). Bars, cue
+    // placement, counts, the built-in click, PLAYBACK and the stems' bar
+    // lengths all read it through Deck::beatsPerBar (Session::effectiveTempo).
+
+    int groupBeatsForDeck (int deck) const
+    {
+        return signatureManager.signature (signatureManager.signatureIndexForDeck (deck)).beatsPerBar;
+    }
+
+    juce::String rowMeterName (int deck) const
+    {
+        return rowMeter[(size_t) deck].isNotEmpty() ? rowMeter[(size_t) deck]
+                                                    : juce::String (signatureManager.signature (signatureManager.signatureIndexForDeck (deck)).name);
+    }
+
+    /** meter "" = follow the row's group. quiet: no toast and nothing
+        re-derived (project load, stem import -- the caller does that). */
+    bool setRowMeter (int deck, const juce::String& meter, bool quiet = false)
+    {
+        if (deck < 0 || deck >= kNumDecks) return false;
+        const int beats = meter.isEmpty() ? groupBeatsForDeck (deck) : ezstems::beatsForMeter (meter);
+        if (beats <= 0) return false;
+        if (! quiet && ! canMutateDeckState (deck)) { showToast (deckLabel (deck) + ": stop this row to change its time signature"); return false; }
+        rowMeter[(size_t) deck] = meter;
+        session.decks[(size_t) deck].beatsPerBar = beats;
+        if (quiet) return true;
+        applyDeckSourceTempo (deck);   // the stems' bar counts follow
+        rebuildGuideSchedule();
+        refreshSlotLabels();
+        showToast (deckLabel (deck) + ": time signature " + rowMeterName (deck) + " (" + juce::String (beats) + " beats to the bar)");
+        return true;
+    }
+
+    // The user set (or changed) a row's original tempo: every stem's tag and
+    // bar count follow it, and the timeline/guide are told.
+    void applyDeckSourceTempo (int deckIdx)
+    {
+        const double bpm = deckBpm (deckIdx);
+        auto& deck = session.decks[(size_t) deckIdx];
+        const int bpb = session.deckTempo (deckIdx).beatsPerBar > 0 ? session.deckTempo (deckIdx).beatsPerBar : 4;
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+        {
+            auto& layer = deck.layers[(size_t) l];
+            if (! layer.loaded) continue;
+            taggedBpm[(size_t) deckIdx][(size_t) l] = deckBufferBpm[(size_t) deckIdx] > 0.0 ? deckBufferBpm[(size_t) deckIdx] : bpm;
+            if (deck.mode == ezdeck::DeckMode::stem && deckFileSampleRate[(size_t) deckIdx] > 0.0)
+            {
+                const double seconds = (double) layer.left.size() / deckFileSampleRate[(size_t) deckIdx];
+                layer.stemBarLength = juce::jmax (1, (int) std::llround (seconds * bpm / 60.0 / bpb));
+            }
+        }
+        ensureArrangementLength (deckIdx);
+        if (currentSongDeck() == deckIdx) { adoptSongTempo (deckIdx); rebuildGuideSchedule(); }
+        if (playbackView) playbackView->songChanged();
+        refreshSlotLabels();
     }
 
     //== ui events =============================================================
@@ -10394,7 +13063,26 @@ public:
         // Mixer::updateAndGetMeterLevel() is explicitly message-thread-only
         // (it owns the peak-hold decay state), matching that contract.
         for (int c = 0; c < ezdeck::kNumMixerChannels && c < mixerStrips.size(); ++c)
+        {
             mixerStrips[c]->setMeterLevel (mixer.updateAndGetMeterLevel ((ezdeck::MixerChannel) c));
+            if (c < kNumStrips)
+                mixerStrips[c]->setFxState (true, stripOn[(size_t) c].load (std::memory_order_relaxed));
+        }
+        for (auto& s : instruments) s.collectRetired();   // PX-D: free swapped-out plugins once the audio thread let go
+
+        // Diagnostics for the native click/cues, on demand: set
+        // PERFORMLIVE_GUIDE_DEBUG=1 and read the session log.
+        static const bool guideDebug = juce::SystemStats::getEnvironmentVariable ("PERFORMLIVE_GUIDE_DEBUG", "0") == "1";
+        if (guideDebug && ++guideDebugTicks % 30 == 0)
+            juce::Logger::writeToLog ("guide: running=" + juce::String ((int) transportRunning.load())
+                                      + " flags=" + juce::String (guideFlags.load()) + " guideDeck=" + juce::String (guideDeck.load())
+                                      + " activeDeck=" + juce::String (session.activeDeck()) + " songDeck=" + juce::String (currentSongDeck())
+                                      + " spb=" + juce::String (guideSamplesPerBar.load(), 1)
+                                      + " clickMuted=" + juce::String ((int) mixer.getChannelMute (ezdeck::MixerChannel::Metro))
+                                      + " cuesMuted=" + juce::String ((int) mixer.getChannelMute (ezdeck::MixerChannel::Cues))
+                                      + " clickPeak=" + juce::String (guideDebugPeak.load(), 3)
+                                      + " sched=" + juce::String (currentSchedule != nullptr ? (int) currentSchedule->size() : -1)
+                                      + " bank=" + juce::String ((int) cueBank.size()));
 
         serviceSectionPlayback();
 
@@ -10435,11 +13123,11 @@ public:
         // instead -- caught live: opening the Mixer dock highlighted STORE.
         for (int i = 0; i < navButtons.size(); ++i)
         {
-            // positions: 0 PERFORM, 1 PLAYBACK, 2 LIBRARY (dock), 3 MIXER (dock), 4 STORE
-            static const int kNavIndexForPosition[] = { 0, kNavPlayback, -1, -1, 4 };
-            const bool selected = (i == 2) ? libraryDockOpen
-                                : (i == 3) ? mixerDockOpen
-                                : (i < 5 && kNavIndexForPosition[i] == activeNavIndex);
+            // positions: 0 PERFORM, 1 PLAYBACK, 2 WEB, 3 STORE | 4 LIBRARY (dock), 5 MIXER (dock)
+            static const int kNavIndexForPosition[] = { 0, kNavPlayback, kNavBrowser, 4, -1, -1 };
+            const bool selected = (i == kNavLibraryPos) ? libraryDockOpen
+                                : (i == kNavMixerPos)   ? mixerDockOpen
+                                : (i < 6 && kNavIndexForPosition[i] == activeNavIndex);
             navButtons[i]->setColour (juce::TextButton::buttonColourId,
                                        selected ? juce::Colour (performlive::kIndigo)
                                                 : juce::Colours::transparentBlack);
@@ -10626,6 +13314,11 @@ public:
             tabScratchL[(size_t) t].assign ((size_t) samplesPerBlockExpected, 0.0f);
             tabScratchR[(size_t) t].assign ((size_t) samplesPerBlockExpected, 0.0f);
         }
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+        {
+            trackScratchL[(size_t) t].assign ((size_t) samplesPerBlockExpected, 0.0f);
+            trackScratchR[(size_t) t].assign ((size_t) samplesPerBlockExpected, 0.0f);
+        }
         mixerScratchCapacity = samplesPerBlockExpected;
 
         // Milestone 8: pads' own stop-envelope timing constants are
@@ -10644,6 +13337,29 @@ public:
         metro.prepare (sampleRate);
         metroScratchL.assign ((size_t) samplesPerBlockExpected, 0.0f);
         metroScratchR.assign ((size_t) samplesPerBlockExpected, 0.0f);
+
+        // Guide.h: the click's envelope is in device samples; the cue
+        // recordings are resampled to the device rate here (message thread,
+        // audio stopped) so render() is a plain copy.
+        {
+            // PX-C: one scratch buffer per input channel the device has open.
+            int inputs = 0;
+            if (auto* dev = deviceManager.getCurrentAudioDevice()) inputs = dev->getActiveInputChannels().countNumberOfSetBits();
+            liveInScratch.assign ((size_t) inputs, std::vector<float> ((size_t) samplesPerBlockExpected, 0.0f));
+            liveInputCount.store (inputs, std::memory_order_relaxed);
+        }
+        songClick.prepare (sampleRate);
+        for (auto& s : instruments) s.prepare (sampleRate, samplesPerBlockExpected);
+        for (auto& strip : strips)
+        {
+            strip->releaseResources();
+            strip->setPlayConfigDetails (2, 2, sampleRate, samplesPerBlockExpected);
+            strip->prepareToPlay (sampleRate, samplesPerBlockExpected);
+        }
+        cueScratchL.assign ((size_t) samplesPerBlockExpected, 0.0f);
+        cueScratchR.assign ((size_t) samplesPerBlockExpected, 0.0f);
+        prepareCueBank (sampleRate);
+        rebuildGuideSchedule();
 
         // SPEC_OUTPUT_ROUTING.md: sized HERE (message thread, prepareToPlay
         // is called again whenever the device changes), never resized
@@ -10668,6 +13384,24 @@ public:
         // slots with this block's own pointers.
         const int numChannels = info.buffer->getNumChannels();
         const int numPairs    = (int) outputPairPtrsL.size();
+
+        // PX-C: JUCE's AudioSourcePlayer copies each open input channel into
+        // the same-numbered channel of this buffer before we run, and the
+        // mix below overwrites those channels -- so the inputs are kept
+        // aside first. Same-block, so a mic or DI adds no latency beyond
+        // the device's own.
+        {
+            const int nIn = juce::jmin (liveInputCount.load (std::memory_order_relaxed), numChannels, (int) liveInScratch.size());
+            for (int c = 0; c < nIn; ++c)
+            {
+                auto& dst = liveInScratch[(size_t) c];
+                const int n = juce::jmin (info.numSamples, (int) dst.size());
+                const float* src = info.buffer->getReadPointer (c, info.startSample);
+                std::copy (src, src + n, dst.begin());
+                for (int i = n; i < (int) dst.size(); ++i) dst[(size_t) i] = 0.0f;
+            }
+        }
+
         for (int p = 0; p < numPairs; ++p)
         {
             const int lCh = p * 2, rCh = p * 2 + 1;
@@ -10729,6 +13463,14 @@ public:
         // in-flight crossfade simply freezes wherever it was and resumes
         // correctly once transportRunning goes true again, same as every
         // other piece of Deck-internal state.
+        // Guide.h: where the song's playhead stood before this block, so the
+        // cues can fire for exactly the span this block plays.
+        const int guideDeckNow = guideDeck.load (std::memory_order_relaxed);
+        const double guideDeckPosBefore = (guideDeckNow >= 0 && guideDeckNow < kNumDecks)
+                                        ? session.decks[(size_t) guideDeckNow].playheadPosition() : 0.0;
+        const int64_t guideCountInBefore = session.countInSamplesLeft();
+        juce::ignoreUnused (guideCountInBefore);
+
         if (transportRunning.load())
         {
             session.renderPerTab (tabPtrsL, tabPtrsR, numSamples);
@@ -10767,13 +13509,54 @@ public:
         // while stopped, a real once-per-beat click while playing --
         // matching every other DAW/looper's own metronome behavior, not
         // just papering over the symptom.
-        if (transportRunning.load())
+        renderGuide (numSamples, masterPosAtStart, guideDeckPosBefore);
+
+        // PX-D: the song clock as plugins want it, then each instrument column
+        // renders in place of its file -- playing or stopped, keys must sound.
         {
-            metro.render (metroScratchL.data(), metroScratchR.data(), numSamples, masterPosAtStart, session.getTempo().bpm);
+            const auto tempo = session.getTempo();
+            const double beatLen = tempo.bpm > 0.0 ? (60.0 / tempo.bpm) * currentSampleRate : 0.0;
+            hostPlayHead.update (transportRunning.load(), tempo.bpm, tempo.beatsPerBar,
+                                 beatLen > 0.0 ? (double) masterPosAtStart / beatLen : 0.0, masterPosAtStart);
         }
-        else
+
+        // The live tracks, playing or stopped -- a mic or keys must work
+        // between songs. Each renders into its own buffer (never a deck's):
+        // an instrument, or the device input it was given, else silence.
         {
-            for (int i = 0; i < numSamples; ++i) { metroScratchL[(size_t) i] = 0.0f; metroScratchR[(size_t) i] = 0.0f; }
+            const int nIn = juce::jmin (liveInputCount.load (std::memory_order_relaxed), (int) liveInScratch.size());
+            for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+            {
+                auto* dstL = trackScratchL[(size_t) t].data();
+                auto* dstR = trackScratchR[(size_t) t].data();
+                if (instruments[(size_t) t].hasInstrument())
+                {
+                    instruments[(size_t) t].render (dstL, dstR, numSamples);
+                    continue;
+                }
+                for (int i = 0; i < numSamples; ++i) { dstL[i] = 0.0f; dstR[i] = 0.0f; }
+                const int ch = trackInput[(size_t) t].load (std::memory_order_relaxed);
+                if (ch < 0 || ch >= nIn) continue;
+                const bool stereo = trackStereo[(size_t) t].load (std::memory_order_relaxed) && ch + 1 < nIn;
+                const auto& inL = liveInScratch[(size_t) ch];
+                const auto& inR = liveInScratch[(size_t) (stereo ? ch + 1 : ch)];
+                const int n = juce::jmin (numSamples, (int) inL.size());
+                for (int i = 0; i < n; ++i) { dstL[i] = inL[(size_t) i]; dstR[i] = inR[(size_t) i]; }
+            }
+        }
+
+        // PERFORM LIVE on every deck and live track: in place, before the
+        // mixer. It keeps running while stopped so reverb and delay tails
+        // ring out.
+        for (int i = 0; i < kNumStrips; ++i)
+        {
+            if (! stripOn[(size_t) i].load (std::memory_order_relaxed)) continue;
+            const bool isDeck = i < ezdeck::kNumLayers;
+            const size_t k = (size_t) (isDeck ? i : i - ezdeck::kNumLayers);
+            float* chans[2] { isDeck ? tabPtrsL[k] : trackScratchL[k].data(), isDeck ? tabPtrsR[k] : trackScratchR[k].data() };
+            juce::AudioBuffer<float> view (chans, 2, numSamples);
+            stripMidi.clear();
+            strips[(size_t) i]->processBlock (view, stripMidi);
         }
 
         // Filled by loop, not by an initialiser list. The list version named
@@ -10787,12 +13570,19 @@ public:
             mixInL[(size_t) t] = tabScratchL[(size_t) t].data();
             mixInR[(size_t) t] = tabScratchR[(size_t) t].data();
         }
+        for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
+        {
+            mixInL[(size_t) ((int) ezdeck::MixerChannel::Live1 + t)] = trackScratchL[(size_t) t].data();
+            mixInR[(size_t) ((int) ezdeck::MixerChannel::Live1 + t)] = trackScratchR[(size_t) t].data();
+        }
         mixInL[(size_t) ezdeck::MixerChannel::Pads]  = padScratchL.data();
         mixInR[(size_t) ezdeck::MixerChannel::Pads]  = padScratchR.data();
         mixInL[(size_t) ezdeck::MixerChannel::Fx]    = fxScratchL.data();
         mixInR[(size_t) ezdeck::MixerChannel::Fx]    = fxScratchR.data();
         mixInL[(size_t) ezdeck::MixerChannel::Metro] = metroScratchL.data();
         mixInR[(size_t) ezdeck::MixerChannel::Metro] = metroScratchR.data();
+        mixInL[(size_t) ezdeck::MixerChannel::Cues]  = cueScratchL.data();
+        mixInR[(size_t) ezdeck::MixerChannel::Cues]  = cueScratchR.data();
         mixer.mixDown (mixInL, mixInR, outputPairPtrsL, outputPairPtrsR, numSamples);
         renderPreview (outL, outR, numSamples);
         renderLibraryPreview (outL, outR, numSamples);
@@ -11054,13 +13844,11 @@ public:
             g.setColour (juce::Colour (performlive::kBorder));
             g.strokePath (dashed, juce::PathStrokeType (1.0f));
 
+            // Only reachable if the embedded logo failed to decode: the
+            // product name in text, never a "LOGO" placeholder.
             g.setColour (juce::Colour (performlive::kTextBright));
-            g.setFont (juce::Font (juce::FontOptions (13.0f, juce::Font::bold)).withExtraKerningFactor (0.01f));
-            g.drawText ("LOGO", box.removeFromTop (box.getHeight() / 2), juce::Justification::centred, false);
-
-            g.setColour (juce::Colour (performlive::kTextDim));
-            g.setFont (juce::Font (juce::FontOptions (8.0f, juce::Font::plain)).withExtraKerningFactor (0.12f));
-            g.drawText ("AMANORSAC STUDIO", box, juce::Justification::centred, false);
+            g.setFont (juce::Font (juce::FontOptions (20.0f, juce::Font::bold)).withExtraKerningFactor (0.04f));
+            g.drawText ("PERFORMLIVE", box, juce::Justification::centred, false);
         }
 
         // Mirror resized()'s right-to-left removals so these display-only
@@ -11223,6 +14011,7 @@ public:
         juce::Font navFont (juce::FontOptions (12.0f, juce::Font::bold));
         for (int i = 0; i < navButtons.size(); ++i)
         {
+            if (i == kNavLibraryPos) navArea.removeFromLeft (kNavDockGroupGap);   // the views, a gap, then the docks
             const int w = juce::GlyphArrangement::getStringWidthInt (navFont, navButtons[i]->getButtonText()) + 36;
             navButtons[i]->setBounds (navArea.removeFromLeft (w));
         }
@@ -11383,49 +14172,57 @@ public:
             // Bug report: meters are always on now, no toggle -- the 44px
             // heading row that used to hold the METERS button is reclaimed
             // for the strips themselves instead of standing empty.
-            mixerArea = mixerArea.reduced (16);
+            mixerArea = mixerArea.reduced (16, 12);
 
-            juce::Array<juce::Component*> allMixerStrips;
-            for (auto* s : mixerStrips) allMixerStrips.add (s);
-            if (masterStrip != nullptr) allMixerStrips.add (masterStrip.get());
+            // Owner: "the mixer should still be straight, with a scroll bar to
+            // see the rest when we're not full screen." One row, never wrapped:
+            // strips widen to fill a big window and stop at a minimum width,
+            // after which the row scrolls sideways. Master is pinned right.
+            constexpr int gap = 10, groupGap = 24, labelH = 22;
+            constexpr int minStripW = 96, maxStripW = 150;
 
-            auto layoutStripRow = [] (juce::Rectangle<int> row, const juce::Array<juce::Component*>& strips)
+            juce::Array<juce::Component*> decks, live, returns;
+            for (int c = 0; c < mixerStrips.size(); ++c)
+                (c < ezdeck::kNumLayers ? decks : c < ezdeck::kNumLayers + ezdeck::kNumLiveTracks ? live : returns).add (mixerStrips[c]);
+            if (webStrip != nullptr) returns.add (webStrip.get());
+
+            juce::Rectangle<int> masterCol;
+            if (masterStrip != nullptr)
             {
-                const int gap = 12;
-                const int n = strips.size();
-                if (n == 0) return;
-                const int stripW = juce::jmin (160, (row.getWidth() - (n - 1) * gap) / n);
-                const int totalW = stripW * n + gap * (n - 1);
-                auto centred = row.withSizeKeepingCentre (juce::jmin (totalW, row.getWidth()), row.getHeight());
-                for (int i = 0; i < n; ++i)
-                {
-                    strips[i]->setBounds (centred.removeFromLeft (stripW));
-                    if (i < n - 1) centred.removeFromLeft (gap);
-                }
+                masterCol = mixerArea.removeFromRight (minStripW + 10);
+                mixerArea.removeFromRight (gap + 6);
+            }
+
+            const int nStrips = decks.size() + live.size() + returns.size();
+            constexpr int nGroups = 3;
+            const int availW = mixerArea.getWidth();
+            const int fixedW = (nStrips - nGroups) * gap + (nGroups - 1) * groupGap;
+            const int stripW = nStrips > 0 ? juce::jlimit (minStripW, maxStripW, (availW - fixedW) / nStrips) : minStripW;
+            const int contentW = nStrips * stripW + fixedW;
+            const bool scrolls = contentW > availW;
+
+            mixerStripViewport.setBounds (mixerArea);
+            const int holderH = mixerArea.getHeight() - (scrolls ? mixerStripViewport.getScrollBarThickness() + 4 : 0);
+            mixerStripHolder.setSize (juce::jmax (contentW, availW), holderH);
+            mixerStripHolder.groups.clear();
+
+            int x = scrolls ? 0 : (availW - contentW) / 2;
+            auto placeGroup = [&] (const juce::String& name, juce::Colour colour, const juce::Array<juce::Component*>& items)
+            {
+                if (items.isEmpty()) return;
+                const int w = items.size() * stripW + (items.size() - 1) * gap;
+                mixerStripHolder.groups.push_back ({ name, { x, 0, w, holderH }, colour });
+                int sx = x;
+                for (auto* comp : items) { comp->setBounds (sx, labelH, stripW, holderH - labelH); sx += stripW + gap; }
+                x += w + groupGap;
             };
+            placeGroup ("DECKS",   juce::Colour (performlive::kTextDim), decks);
+            placeGroup ("LIVE",    juce::Colour (0xffff6b8a), live);
+            placeGroup ("RETURNS", juce::Colour (performlive::kTextDim), returns);
+            mixerStripHolder.repaint();
 
-            const int n = allMixerStrips.size();
-            const int oneRowStripW = n > 0 ? (mixerArea.getWidth() - (n - 1) * 12) / n : 0;
-            // 84, not 96: with eight tab strips plus Pads/FX/Metro/Master
-            // there are twelve of them, and a slightly narrower strip in one
-            // row reads far better than a wrapped grid -- a desk is a row.
-            if (oneRowStripW >= 84)
-            {
-                layoutStripRow (mixerArea, allMixerStrips);
-            }
-            else
-            {
-                auto row1Area = mixerArea.removeFromTop (mixerArea.getHeight() / 2);
-                mixerArea.removeFromTop (12);
-                juce::Array<juce::Component*> row1, row2;
-                // Split evenly rather than at a hardcoded 4. That literal was
-                // written when there were eight strips and silently became a
-                // lopsided 4/8 the moment the mixer grew.
-                const int firstRow = (n + 1) / 2;
-                for (int i = 0; i < n; ++i) (i < firstRow ? row1 : row2).add (allMixerStrips[i]);
-                layoutStripRow (row1Area, row1);
-                layoutStripRow (mixerArea, row2);
-            }
+            if (masterStrip != nullptr)
+                masterStrip->setBounds (masterCol.getX(), masterCol.getY() + labelH, masterCol.getWidth(), holderH - labelH);
         }
 
         // ---- LIBRARY: docked panel (Phase 1.1 P2) -- its own header strip
@@ -11440,7 +14237,9 @@ public:
             libraryMaximizeButton.setBounds (headerStrip.removeFromRight (92).reduced (4));
             libraryTab->setBounds (dockLocal);
         }
-        storeTab->setBounds (storeView.getLocalBounds());
+        creatorsTab->setBounds (storeView.getLocalBounds());
+        if (storeShowcase) storeShowcase->setBounds (storeView.getLocalBounds());
+        storeBackButton.setBounds (storeView.getLocalBounds().removeFromTop (44).removeFromRight (140).reduced (8, 6));
 
         // ---- EDITOR: docked panel (PerformLive UI/UX Design Notes: same
         // resize/maximize behaviour as Library/Mixer, never a floating
@@ -11504,6 +14303,10 @@ public:
         // spec's own "+" button below the 7 signature buttons.
         auto railAreaOuter = pFull.removeFromLeft (kRailWidth);
         performView.railBgArea = railAreaOuter;
+
+        // the song-tracks column (click / guide per row), aligned with the rows below
+        const auto guideColOuter = pFull.removeFromLeft (kGuideColWidth);
+        performView.guideColBgArea = guideColOuter;
         auto railArea = railAreaOuter.reduced (8, 12);
         railArea.removeFromTop (24);   // clear the two-line "TIME SIGNATURE" label painted in paint()
         for (int i = 0; i < signatureButtons.size(); ++i)
@@ -11579,11 +14382,14 @@ public:
             for (int l = 0; l < kNumCols; ++l)
                 deckCards[(size_t) slot][l]->setVisible (visible && (l / kColsPerPage) == deckPage);
             triggerCells[(size_t) slot]->setVisible (visible);
+            if (slot < guideCells.size()) guideCells[slot]->setVisible (visible);
             if (! visible) continue;
 
             auto rowArea = juce::Rectangle<int> (deckPanelInner.getX(),
                                                   deckPanelInner.getY() + row * (cardH + 8),
                                                   deckPanelInner.getWidth(), cardH);
+            if (slot < guideCells.size())
+                guideCells[slot]->setBounds (guideColOuter.getX() + 6, rowArea.getY(), guideColOuter.getWidth() - 10, cardH);
             for (int c = 0; c < kColsPerPage; ++c)
             {
                 const int l = deckPage * kColsPerPage + c;
@@ -11657,6 +14463,16 @@ private:
     ezdeck::Mixer mixer;
     juce::OwnedArray<MixerChannelStrip> mixerStrips;
     std::unique_ptr<MixerChannelStrip> masterStrip;
+    std::unique_ptr<MixerChannelStrip> webStrip;   // the browser's level/mute -- see its construction
+    juce::Viewport   mixerStripViewport;           // one straight row that scrolls sideways
+    MixerStripHolder mixerStripHolder;             // every strip but Master, under its group label
+    float webGain { 1.0f };
+    bool  webMute { false };
+
+    void pushWebLevel()
+    {
+        if (browserTab) browserTab->setMediaLevel (juce::jlimit (0.0f, 1.0f, webGain), webMute);
+    }
     // Phase 1.1 P3 "Output routing" -- persisted selection per channel (see
     // MixerChannelStrip's own comment for why only index 0/"Main" is real).
     std::array<int, ezdeck::kNumMixerChannels> channelOutputRoute {};
@@ -11747,7 +14563,25 @@ private:
     juce::Viewport     performScroll; // hosts performView; vertical scrollbar appears whenever a dock/short window squeezes PERFORM below requiredPerformHeight()
     juce::Component    storeView;
     DockShellView mixerView, libraryView, editorView;   // Phase 1.1 P2/P3 + SPEC_PERFORM_V2 GROUP: self-painting dock containers -- see DockShellView's own comment
-    std::unique_ptr<creators::CreatorsTab> storeTab;   // the STORE page for the beta -- see CreatorsTab.h
+    std::unique_ptr<creators::CreatorsTab> creatorsTab;       // how to become a creator -- see CreatorsTab.h
+    std::unique_ptr<ezstore::StoreShowcase> storeShowcase;   // what STORE opens on
+    juce::TextButton storeBackButton;
+
+    enum class StorePage { showcase, creators };
+    StorePage storePage { StorePage::showcase };
+
+    void showStorePage (StorePage p)
+    {
+        storePage = p;
+        if (storeShowcase) storeShowcase->setVisible (p == StorePage::showcase);
+        if (creatorsTab) creatorsTab->setVisible (p == StorePage::creators);
+        storeBackButton.setButtonText (juce::String (juce::CharPointer_UTF8 ("\xe2\x80\xb9 Store")));
+        storeBackButton.setVisible (p != StorePage::showcase);
+        storeBackButton.toFront (false);
+    }
+    bool saveHandledOnExit { false };   // the quit prompt saved, or the owner chose Don't Save
+    bool quitPromptOpen { false };
+    bool listeningForSections { false };   // a guide track is being heard on a worker thread
     int autosaveTickCounter { 0 };   // roadmap "Sprint 5: reliability" -- ticks at 15Hz; fires autosaveIfDue() once a minute
     juce::File currentProjectFile;   // Bug report: Save/Save As -- see projectFilePath()/saveProjectAs()'s own comments
     bool reconfiguringOutputs { false };   // re-entrancy guard -- see requestAllOutputChannels()
@@ -11838,6 +14672,33 @@ private:
     // three bullets above remain exactly true post-Group-A/B.
     std::array<std::optional<double>, kNumDecks> deckTempoOverride;
 
+    // Owner: "all the stems have the same tempo... I have to set the actual
+    // tempo first, and then when I want to change the tempo the time-stretch
+    // comes in." One tempo per row/song, entered by the user (a DAW-written
+    // tempo tag may pre-fill it; detection never does). Until it's set,
+    // nothing in the row is ever stretched, whatever LOCK or "play at" say.
+    std::array<std::optional<double>, kNumDecks> deckSourceBpm;
+    // The tempo the row's buffers currently play at after stretching; 0 =
+    // untouched, exactly as recorded. Every layer is always at the same one.
+    std::array<double, kNumDecks> deckBufferBpm {};
+    std::array<juce::String, kNumDecks> rowMeter;   // a song's own time signature; "" = its signature group's (setRowMeter)
+
+    // Owner: a song's own click and guide tracks live beside the row, never
+    // on one of its eight decks. Mono at the file's own rate; the audio
+    // thread reads them through the live* pointers (see renderSongTrack),
+    // which only ever change while the row can't be heard. A replaced track
+    // is kept in retiredSongTracks until the transport stops.
+    struct SongTrack { juce::String filePath; std::vector<float> mono; double rate { 0.0 }; };
+    std::array<std::shared_ptr<SongTrack>, kNumDecks> songClickTrack, songGuideTrack;
+    std::array<std::atomic<SongTrack*>, kNumDecks> liveClickTrack, liveGuideTrack;
+    std::vector<std::shared_ptr<SongTrack>> retiredSongTracks;
+    std::array<bool, kNumDecks> useSongClick {}, useSongGuide {};   // set true per row in the constructor
+    std::atomic<int>    guideSongTracks { 0 };       // bit 0: click from the song's track, bit 1: guide from it
+    std::atomic<double> guideDeckFileRate { 0.0 };   // the guide deck's file rate, for the tracks' positions
+    int guideRowOverride { -1 };                     // PERFORM: the last triggered row gets the guide, setlist or not
+    std::unique_ptr<juce::FileChooser> rowFileChooser;
+    juce::OwnedArray<GuideSlotCell> guideCells;
+
     //==========================================================================
     //  Section playback -- PlaybackHost implementation + the per-tick
     //  scheduler. Everything a performer does on the PLAYBACK screen lands
@@ -11846,6 +14707,11 @@ private:
     //  change. Bars live up here; samples live in the engine.
     //==========================================================================
     static constexpr int kNavPlayback = 5;
+    // nav bar positions (kNavItems order): PERFORM, PLAYBACK, WEB, STORE, then the docks
+    static constexpr int kNavLibraryPos   = 4;
+    static constexpr int kNavMixerPos     = 5;
+    static constexpr int kNavDockGroupGap = 36;   // the space between the views and the docks
+    static constexpr int kNavBrowser  = 6;
 
     std::array<ezarr::Arrangement, kNumDecks> arrangements;
     std::vector<int> setlist;          // flat deck indices, in performance order
@@ -11859,6 +14725,93 @@ private:
     juce::Component playbackHolder;
     std::unique_ptr<ezplayback::PlaybackView> playbackView;
 
+    // ---- PERFORM LIVE channel strip on every deck and live track ----
+    // Built into the app rather than loaded as a plugin. Strip index == mixer
+    // channel index: 0-7 the decks, 8-11 LIVE 1-4. Created up front (cheap,
+    // silent while off) so switching one on is never an allocation on stage.
+    // Owner: "FX on every track, off by default."
+    static constexpr int kNumStrips = ezdeck::kNumLayers + ezdeck::kNumLiveTracks;
+    std::array<std::unique_ptr<amanorsac::perform::PerformProcessor>, kNumStrips> strips;
+    std::array<std::atomic<bool>, kNumStrips> stripOn {};
+    std::array<std::unique_ptr<juce::DocumentWindow>, kNumStrips> stripWindows;
+    juce::MidiBuffer stripMidi;   // always empty; the strip takes no MIDI
+
+    // ---- live tracks: instruments (PX-D) and inputs (PX-C) ----
+    ezinst::PluginLibrary                                     pluginLibrary;
+    std::array<ezinst::InstrumentSlot, ezdeck::kNumLiveTracks> instruments;
+    ezinst::HostPlayHead                                      hostPlayHead;
+    std::array<std::unique_ptr<ezinst::InstrumentEditorWindow>, ezdeck::kNumLiveTracks> instrumentWindows;
+    std::unique_ptr<juce::DocumentWindow>                     pluginListWindow;
+    std::unique_ptr<juce::ThreadWithProgressWindow>           pluginScan;
+
+    // Per live track: -1 no input, else the device input channel (see
+    // SettingsSnapshot); MIDI channel 0 = every channel. Written on the
+    // message thread, read per block / per MIDI message.
+    std::array<std::atomic<int>,  ezdeck::kNumLiveTracks> trackInput {};
+    std::array<std::atomic<bool>, ezdeck::kNumLiveTracks> trackStereo {};
+    std::array<std::atomic<int>,  ezdeck::kNumLiveTracks> trackMidiChannel {};
+    std::array<std::vector<float>, ezdeck::kNumLiveTracks> trackScratchL, trackScratchR;   // sized in prepareToPlay
+    std::vector<std::vector<float>> liveInScratch;     // one per open input channel, sized in prepareToPlay
+    std::atomic<int>                liveInputCount { 0 };
+    bool                            reconfiguringInputs { false };
+
+    // ---- Guide.h state ----
+    struct CueSource { std::vector<float> mono; double rate { 48000.0 }; };
+    std::vector<CueSource>            cueSources;      // as loaded
+    std::vector<std::vector<float>>   cueDeviceAudio;  // at the device rate
+    std::vector<ezguide::CueSample>   cueBank;         // what the player reads
+    std::map<std::string, int>        cueIds;
+    juce::StringArray                 cueMenuNames;    // "Song Form/Chorus-2"
+    ezguide::Click                    songClick;       // the native click (guideClick() is the per-song switch)
+    ezguide::CuePlayer                cuePlayer;       // audio thread
+    std::vector<float>                cueScratchL, cueScratchR;
+    std::unique_ptr<std::vector<ezguide::CueEvent>>              currentSchedule;
+    std::vector<std::unique_ptr<std::vector<ezguide::CueEvent>>> retiredSchedules;
+    std::atomic<const std::vector<ezguide::CueEvent>*>           activeSchedule { nullptr };
+    std::atomic<const std::vector<ezguide::CueEvent>*>           audioSeenSchedule { nullptr };
+    const std::vector<ezguide::CueEvent>*                        guideScheduleInUse { nullptr };   // audio thread
+    std::atomic<bool>   metronomeGate { false };   // Settings > Metronome: the PERFORM loop-mode click
+    std::atomic<int>    guideFlags { 0 };          // bit 0 click, bit 1 cues
+    std::atomic<int>    guideDeck { -1 };
+    std::atomic<int>    guideBeatsPerBar { 4 };
+    std::atomic<double> guideSamplesPerBar { 0.0 };
+    std::atomic<bool>   guideCountFast { true };
+    std::atomic<int>    pendingCuePreview { ezguide::kNoCue };
+    int64_t             lastCountInBeat { INT64_MIN };   // audio thread
+    std::atomic<float>  guideDebugPeak { 0.0f };          // loudest click sample this block (PERFORMLIVE_GUIDE_DEBUG)
+    int                 guideDebugTicks { 0 };
+
+    // Lazily-created browser (see the constructor): this container reports
+    // its first show so the WebView2 process is only started when wanted.
+    struct LazyHolder : public juce::Component
+    {
+        std::function<void()> onFirstShow;
+        void visibilityChanged() override
+        {
+            if (isVisible() && ! shown) { shown = true; if (onFirstShow) onFirstShow(); }
+        }
+        bool shown { false };
+    };
+    LazyHolder browserHolder;
+    std::unique_ptr<ezweb::BrowserTab> browserTab;
+
+    void createBrowserTab()
+    {
+        if (browserTab) return;
+        juce::Logger::writeToLog ("browser: creating tab");
+        browserTab = std::make_unique<ezweb::BrowserTab>();
+        juce::Logger::writeToLog ("browser: tab created");
+        browserTab->onImportFiles = [this] (juce::Array<juce::File> files)
+        {
+            if (libraryTab != nullptr) libraryTab->importFiles (files);
+        };
+        browserTab->onMessage = [this] (juce::String text) { showToast (text); };
+        browserTab->getRightsAccepted = [] { auto* p = getAppSettings(); return p != nullptr && p->getBoolValue ("urlImportRightsAccepted", false); };
+        browserTab->setRightsAccepted = [] { if (auto* p = getAppSettings()) { p->setValue ("urlImportRightsAccepted", true); p->saveIfNeeded(); } };
+        browserHolder.addAndMakeVisible (*browserTab);
+        browserTab->setBounds (browserHolder.getLocalBounds());
+        pushWebLevel();   // the mixer's WEB strip applies to this page too
+    }
 
     // ---- song <-> deck helpers ---------------------------------------------
 
@@ -11867,14 +14820,13 @@ private:
         return (setlistPos >= 0 && setlistPos < (int) setlist.size()) ? setlist[(size_t) setlistPos] : -1;
     }
 
-    /** The tempo this deck's stems were made at: override > tagged > master. */
+    /** The tempo this song plays at: "play at" override > the user-set
+        original > master. Never a detected value. */
     double deckBpm (int deck) const
     {
         if (deck < 0 || deck >= kNumDecks) return masterTempo.bpm;
         if (auto t = deckTempoOverride[(size_t) deck]; t.has_value() && *t > 0.0) return *t;
-        for (int l = 0; l < ezdeck::kNumLayers; ++l)
-            if (session.decks[(size_t) deck].layers[(size_t) l].loaded && taggedBpm[(size_t) deck][(size_t) l] > 0.0)
-                return taggedBpm[(size_t) deck][(size_t) l];
+        if (auto s = deckSourceBpm[(size_t) deck]; s.has_value() && *s > 0.0) return *s;
         return masterTempo.bpm;
     }
 
@@ -11960,6 +14912,7 @@ private:
         if (i < 0 || i >= (int) setlist.size()) return;
         const int deck = setlist[(size_t) i];
         setlistPos = i;
+        guideRowOverride = -1;   // the setlist song is the guide's song again
         lastSectionIdx = -1;
         queuedSectionIdx = -1;
         session.cancelSeek();
@@ -11971,6 +14924,7 @@ private:
         // Play starts it. Playing: switch now too -- "next song" on stage
         // means now, and the engine resets the new deck's playhead.
         session.switchNow (deck);
+        rebuildGuideSchedule();
         if (playbackView) playbackView->songChanged();
     }
 
@@ -12069,6 +15023,275 @@ private:
     void arrangementEdited() override
     {
         lastSectionIdx = -1;   // re-evaluate loopOnEntry/pauseAfter for the section we are in
+        rebuildGuideSchedule();
+    }
+
+    // ---- PlaybackHost: native click and cues (Guide.h) ---------------------------
+
+    bool guideClick() const override { const int d = currentSongDeck(); return d >= 0 && arrangements[(size_t) d].guideClick; }
+    bool guideCues() const override  { const int d = currentSongDeck(); return d >= 0 && arrangements[(size_t) d].guideCues; }
+    int  cueLeadBars() const override { const int d = currentSongDeck(); return d >= 0 ? arrangements[(size_t) d].cueLeadBars : 2; }
+    bool cueCounts() const override  { const int d = currentSongDeck(); return d < 0 || arrangements[(size_t) d].cueCounts; }
+    void setGuideClick (bool on) override  { const int d = currentSongDeck(); if (d >= 0) { arrangements[(size_t) d].guideClick = on; rebuildGuideSchedule(); } }
+    void setGuideCues (bool on) override   { const int d = currentSongDeck(); if (d >= 0) { arrangements[(size_t) d].guideCues = on; rebuildGuideSchedule(); } }
+    void setCueLeadBars (int b) override   { const int d = currentSongDeck(); if (d >= 0) { arrangements[(size_t) d].cueLeadBars = juce::jlimit (1, 8, b); rebuildGuideSchedule(); } }
+    void setCueCounts (bool on) override   { const int d = currentSongDeck(); if (d >= 0) { arrangements[(size_t) d].cueCounts = on; rebuildGuideSchedule(); } }
+    bool cueBankLoaded() const override    { return ! cueBank.empty(); }
+    juce::StringArray cueNames() const override { return cueMenuNames; }
+
+    void previewCue (const juce::String& stem) override
+    {
+        const int id = cueIdFor (stem.toStdString());
+        if (id != ezguide::kNoCue) pendingCuePreview.store (id, std::memory_order_relaxed);
+    }
+
+    /** PLAYBACK's Auto-section: listen (speech, else the cue recordings), then review. */
+    void listenForSections (int i, int layer) override
+    {
+        const int d = songDeck (i);
+        if (d >= 0) listenForSectionsOnDeck (d, layer);
+    }
+
+    bool songHasGuideTrack (int i) const override
+    {
+        const int d = songDeck (i);
+        return d >= 0 && songGuideTrack[(size_t) d] != nullptr;
+    }
+
+    int cueIdFor (const std::string& stem) const
+    {
+        auto it = cueIds.find (stem);
+        return it == cueIds.end() ? ezguide::kNoCue : it->second;
+    }
+
+    int countCueIdFor (int beat, bool fast) const
+    {
+        static const char* const words[] = { "1", "2", "3", "4", "5", "6", "7", "8" };
+        if (beat < 1 || beat > 8) return ezguide::kNoCue;
+        return cueIdFor (std::string (words[beat - 1]) + (fast ? "-fast" : "-slow"));
+    }
+
+    /** Loads every WAV under the cue folder once (mono, at its own rate).
+        Looked for beside the exe first, then in the working directory. */
+    void loadCueBank()
+    {
+        const juce::File exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory();
+        const juce::File candidates[] = {
+            exeDir.getChildFile ("cues"),
+            exeDir.getChildFile ("MotionWorshipGuideCues"),
+            juce::File::getCurrentWorkingDirectory().getChildFile ("cues"),
+            juce::File::getCurrentWorkingDirectory().getChildFile ("MotionWorshipGuideCues"),
+        };
+        juce::File folder;
+        for (const auto& c : candidates) if (c.isDirectory()) { folder = c; break; }
+        if (folder == juce::File()) { juce::Logger::writeToLog ("Cues: no cue folder found -- native cues unavailable"); return; }
+
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        for (const auto& group : { "Song Form", "Counts", "Instrumentation" })
+        {
+            auto dir = folder.getChildFile (group);
+            auto files = dir.findChildFiles (juce::File::findFiles, false, "*.wav");
+            files.sort();
+            for (const auto& f : files)
+            {
+                std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (f));
+                if (reader == nullptr || reader->lengthInSamples <= 0 || reader->lengthInSamples > 48000 * 10) continue;
+                juce::AudioBuffer<float> buf ((int) reader->numChannels, (int) reader->lengthInSamples);
+                reader->read (&buf, 0, buf.getNumSamples(), 0, true, true);
+                CueSource src;
+                src.rate = reader->sampleRate;
+                src.mono.resize ((size_t) buf.getNumSamples());
+                for (int i = 0; i < buf.getNumSamples(); ++i)
+                {
+                    float s = 0.0f;
+                    for (int ch = 0; ch < buf.getNumChannels(); ++ch) s += buf.getSample (ch, i);
+                    src.mono[(size_t) i] = s / (float) juce::jmax (1, buf.getNumChannels());
+                }
+                const auto stem = f.getFileNameWithoutExtension().toStdString();
+                cueIds[stem] = (int) cueSources.size();
+                cueSources.push_back (std::move (src));
+                if (juce::String (group) != "Counts") cueMenuNames.add (juce::String (group) + "/" + juce::String (stem));
+            }
+        }
+        juce::Logger::writeToLog ("Cues: " + juce::String ((int) cueSources.size()) + " recordings from " + folder.getFullPathName());
+    }
+
+    /** Resamples the bank to the device rate (linear -- speech, and the
+        rates are close) and rebuilds the pointer table the player reads. */
+    void prepareCueBank (double deviceRate)
+    {
+        cueDeviceAudio.assign (cueSources.size(), {});
+        cueBank.assign (cueSources.size(), {});
+        for (size_t i = 0; i < cueSources.size(); ++i)
+        {
+            const auto& src = cueSources[i];
+            const double ratio = src.rate > 0.0 ? src.rate / deviceRate : 1.0;
+            const int outLen = (int) std::floor ((double) src.mono.size() / ratio);
+            auto& out = cueDeviceAudio[i];
+            out.resize ((size_t) juce::jmax (0, outLen));
+            for (int o = 0; o < outLen; ++o)
+            {
+                const double p = (double) o * ratio;
+                const size_t a = (size_t) p;
+                const float t = (float) (p - (double) a);
+                const float s0 = src.mono[juce::jmin (a, src.mono.size() - 1)];
+                const float s1 = src.mono[juce::jmin (a + 1, src.mono.size() - 1)];
+                out[(size_t) o] = s0 + (s1 - s0) * t;
+            }
+            cueBank[i] = { out.data(), (int) out.size() };
+        }
+        cuePlayer.setBank (&cueBank);
+    }
+
+    /** Message thread. Publishes a fresh schedule for the current song; the
+        audio thread picks it up at its next block. Old schedules are kept
+        until the audio thread has confirmed it moved on, then freed. */
+    void rebuildGuideSchedule()
+    {
+        // PERFORM: the row last triggered from the grid gets the guide even
+        // when it isn't the setlist song (guideRowOverride); PLAYBACK's
+        // selectSong() clears that.
+        const int d = (guideRowOverride >= 0 && guideRowOverride < kNumDecks) ? guideRowOverride : currentSongDeck();
+        auto fresh = std::make_unique<std::vector<ezguide::CueEvent>>();
+        int flags = 0;
+        int songBits = 0;
+        double spb = 0.0;
+        int beats = 4;
+        if (d >= 0)
+        {
+            const auto& a = arrangements[(size_t) d];
+            spb   = deckSamplesPerBar (d);
+            beats = juce::jmax (1, session.deckTempo (d).beatsPerBar);
+            const bool songClickHere = useSongClick[(size_t) d] && songClickTrack[(size_t) d] != nullptr;
+            const bool songGuideHere = useSongGuide[(size_t) d] && songGuideTrack[(size_t) d] != nullptr;
+            if (songClickHere) songBits |= 1;
+            if (songGuideHere) songBits |= 2;
+            guideDeckFileRate.store (deckFileSampleRate[(size_t) d], std::memory_order_relaxed);
+            if (a.guideClick) flags |= 1;
+            if (a.guideCues && (songGuideHere || ! cueBank.empty()))
+            {
+                flags |= 2;
+                std::vector<ezguide::GuideSection> secs;
+                for (const auto& s : a.sections) secs.push_back ({ s.name, s.cue, s.startBar });
+                ezguide::ScheduleSettings st;
+                st.samplesPerBar = spb;
+                st.beatsPerBar   = beats;
+                st.leadBars      = a.cueLeadBars;
+                st.counts        = a.cueCounts;
+                st.fast          = deckBpm (d) >= 100.0;
+                *fresh = ezguide::buildSchedule (secs,
+                                                 st,
+                                                 [this] (const std::string& stem) { return cueIdFor (stem); },
+                                                 [this] (int beat, bool fast) { return countCueIdFor (beat, fast); });
+            }
+        }
+        guideSamplesPerBar.store (spb, std::memory_order_relaxed);
+        guideBeatsPerBar.store (beats, std::memory_order_relaxed);
+        guideSongTracks.store (songBits, std::memory_order_relaxed);
+        guideFlags.store (flags, std::memory_order_relaxed);
+        guideDeck.store (d, std::memory_order_relaxed);
+        guideCountFast.store (d >= 0 && deckBpm (d) >= 100.0, std::memory_order_relaxed);
+
+        retiredSchedules.push_back (std::move (currentSchedule));
+        currentSchedule = std::move (fresh);
+        activeSchedule.store (currentSchedule.get(), std::memory_order_release);
+        // free retired schedules once the audio thread is provably past them
+        if (audioSeenSchedule.load (std::memory_order_acquire) == currentSchedule.get()) retiredSchedules.clear();
+        if (retiredSchedules.size() > 64) retiredSchedules.erase (retiredSchedules.begin());   // never grows without bound
+    }
+
+    /** Audio thread. Fills metroScratch (click) and cueScratch (voice). */
+    void renderGuide (int numSamples, int64_t masterPosAtStart, double deckPosBefore)
+    {
+        for (int i = 0; i < numSamples; ++i)
+        {
+            metroScratchL[(size_t) i] = 0.0f; metroScratchR[(size_t) i] = 0.0f;
+            cueScratchL[(size_t) i] = 0.0f;   cueScratchR[(size_t) i] = 0.0f;
+        }
+
+        // a manual "Say now" from the menu plays whatever is happening
+        if (const int pv = pendingCuePreview.exchange (ezguide::kNoCue, std::memory_order_relaxed); pv != ezguide::kNoCue)
+            cuePlayer.trigger (pv);
+
+        const bool running = transportRunning.load();
+        const int  flags   = guideFlags.load (std::memory_order_relaxed);
+        const int  d       = guideDeck.load (std::memory_order_relaxed);
+        const bool songLive = running && d >= 0 && d < kNumDecks && session.activeDeck() == d;
+
+        if (const auto* s = activeSchedule.load (std::memory_order_acquire); s != guideScheduleInUse)
+        {
+            guideScheduleInUse = s;
+            cuePlayer.setSchedule (s);
+            cuePlayer.locate (deckPosBefore);
+            audioSeenSchedule.store (s, std::memory_order_release);
+        }
+
+        if (songLive)
+        {
+            const double spb   = guideSamplesPerBar.load (std::memory_order_relaxed);
+            const int    beats = juce::jmax (1, guideBeatsPerBar.load (std::memory_order_relaxed));
+            const int64_t countInLeft = session.countInSamplesLeft();
+
+            if (countInLeft > 0)
+            {
+                // Count-in: the master clock, counted backwards to the downbeat,
+                // so the last count-in bar ends exactly where the song starts.
+                const double beatLen = ezdeck::barLengthSamples (session.getTempo(), currentSampleRate) / (double) beats;
+                const double pos = -(double) countInLeft;
+                // a count-in is always clicked: that is what a count-in is for
+                songClick.render (metroScratchL.data(), metroScratchR.data(), numSamples, pos, beatLen, beats);
+                if (flags & 2)
+                {
+                    // speak "1, 2, 3, 4" on the beats of the final count-in bar
+                    for (int i = 0; i < numSamples; ++i)
+                    {
+                        const int64_t beat = (int64_t) std::floor ((pos + (double) i) / beatLen);
+                        if (beat != lastCountInBeat)
+                        {
+                            lastCountInBeat = beat;
+                            if (beat >= -beats && beat < 0)
+                                cuePlayer.trigger (countCueIdFor ((int) (beat + beats) + 1, guideCountFast.load (std::memory_order_relaxed)));
+                        }
+                    }
+                }
+                cuePlayer.locate (0.0);
+            }
+            else
+            {
+                lastCountInBeat = INT64_MIN;
+                const double posAfter = session.decks[(size_t) d].playheadPosition();
+                // the song's own click/guide tracks when it has them and they're chosen; else the built-in ones
+                const int songBits = guideSongTracks.load (std::memory_order_relaxed);
+                const double fileRate = guideDeckFileRate.load (std::memory_order_relaxed);
+                if (flags & 1)
+                {
+                    const SongTrack* ct = (songBits & 1) ? liveClickTrack[(size_t) d].load (std::memory_order_acquire) : nullptr;
+                    if (ct != nullptr) renderSongTrack (*ct, metroScratchL.data(), metroScratchR.data(), numSamples, deckPosBefore, fileRate);
+                    else if (spb > 0.0) songClick.render (metroScratchL.data(), metroScratchR.data(), numSamples, deckPosBefore, spb / (double) beats, beats);
+                }
+                if (flags & 2)
+                {
+                    const SongTrack* gt = (songBits & 2) ? liveGuideTrack[(size_t) d].load (std::memory_order_acquire) : nullptr;
+                    if (gt != nullptr) renderSongTrack (*gt, cueScratchL.data(), cueScratchR.data(), numSamples, deckPosBefore, fileRate);
+                    else cuePlayer.advance (deckPosBefore, posAfter);
+                }
+            }
+        }
+        else
+        {
+            lastCountInBeat = INT64_MIN;
+            // PERFORM's loop mode keeps the plain metronome on the Click strip.
+            if (running && metronomeGate.load (std::memory_order_relaxed))
+                metro.render (metroScratchL.data(), metroScratchR.data(), numSamples, masterPosAtStart, session.getTempo().bpm);
+            else if (! running)
+                songClick.reset();
+        }
+
+        cuePlayer.render (cueScratchL.data(), cueScratchR.data(), numSamples);
+        float pk = 0.0f;
+        for (int i = 0; i < numSamples; ++i) pk = juce::jmax (pk, std::fabs (metroScratchL[(size_t) i]));
+        guideDebugPeak.store (juce::jmax (pk, guideDebugPeak.load (std::memory_order_relaxed) * 0.9f), std::memory_order_relaxed);
     }
 
     // ---- PlaybackHost: state ---------------------------------------------------
@@ -12109,13 +15332,28 @@ private:
         return l.loaded ? &l.left : nullptr;
     }
 
+    bool layerIsLive (int i, int layer) const override
+    {
+        juce::ignoreUnused (i, layer);
+        return false;   // decks are stems only now; live sources are the mixer's LIVE tracks
+    }
+
     juce::String layerName (int i, int layer) const override
     {
         const int d = songDeck (i);
         if (d < 0 || layer < 0 || layer >= ezdeck::kNumLayers) return {};
         if (layerNameOverride[(size_t) d][(size_t) layer].isNotEmpty()) return layerNameOverride[(size_t) d][(size_t) layer];
         const auto& path = layerFilePaths[(size_t) d][(size_t) layer];
-        return path.isNotEmpty() ? displayFileName (juce::File (path).getFileNameWithoutExtension()) : "Stem " + juce::String (layer + 1);
+        if (path.isEmpty()) return "Stem " + juce::String (layer + 1);
+        // Stem packs name files "SONG 105BPM - Clap": every track in a song
+        // shares the part before the dash, so the lane header shows the part
+        // after it (and the icon is chosen from that). The full name stays
+        // visible inside the lane via layerFileName().
+        auto name = displayFileName (juce::File (path).getFileNameWithoutExtension());
+        const int dash = name.lastIndexOf (" - ");
+        if (dash > 0 && name.substring (dash + 3).trim().isNotEmpty())
+            name = name.substring (dash + 3).trim();
+        return name;
     }
 
     bool layerEnabled (int i, int layer) const override
@@ -12133,6 +15371,33 @@ private:
         l.enabled.store (! l.enabled.load (std::memory_order_relaxed), std::memory_order_relaxed);
     }
 
+    // Track names set from the PLAYBACK lane headers are the same per-slot
+    // names PERFORM's slot editor sets (layerNameOverride), so they show in
+    // both places and save with the project like every other slot name.
+    void setLayerName (int i, int layer, const juce::String& name) override
+    {
+        const int d = songDeck (i);
+        if (d < 0 || layer < 0 || layer >= ezdeck::kNumLayers) return;
+        layerNameOverride[(size_t) d][(size_t) layer] = name.trim().substring (0, 40);
+        refreshSlotLabels();
+        if (playbackView) playbackView->songChanged();
+    }
+
+    bool layerHasCustomName (int i, int layer) const override
+    {
+        const int d = songDeck (i);
+        return d >= 0 && layer >= 0 && layer < ezdeck::kNumLayers
+            && layerNameOverride[(size_t) d][(size_t) layer].isNotEmpty();
+    }
+
+    juce::String layerFileName (int i, int layer) const override
+    {
+        const int d = songDeck (i);
+        if (d < 0 || layer < 0 || layer >= ezdeck::kNumLayers) return {};
+        const auto& path = layerFilePaths[(size_t) d][(size_t) layer];
+        return path.isNotEmpty() ? displayFileName (juce::File (path).getFileNameWithoutExtension()) : juce::String();
+    }
+
     // ---- PlaybackHost: commands ------------------------------------------------
 
     void playStop() override
@@ -12146,6 +15411,7 @@ private:
             session.resetTransport();
             session.switchNow (d);
             lastSectionIdx = -1;
+            rebuildGuideSchedule();   // the click and cues follow THIS song from its first sample
             transportRunning = true;
             return;
         }
@@ -12164,11 +15430,11 @@ private:
         session.resetTransport();
         session.switchNow (d);
         lastSectionIdx = -1;
+        rebuildGuideSchedule();
 
         // The metronome IS the count-in. Unmute it for the duration even if
         // the performer normally runs without a click; restored afterwards.
-        countInMetroWasMuted = mixer.getChannelMute (ezdeck::MixerChannel::Metro);
-        mixer.setChannelMute (ezdeck::MixerChannel::Metro, false);
+        // the count-in is always clicked (renderGuide), so nothing to unmute now
         countInActive = true;
 
         session.startCountIn ((int64_t) bars * ezdeck::barLengthSamples (session.getTempo(), currentSampleRate));
@@ -12179,7 +15445,7 @@ private:
     {
         if (! countInActive) return;
         countInActive = false;
-        mixer.setChannelMute (ezdeck::MixerChannel::Metro, countInMetroWasMuted);
+        // (Click strip mute untouched -- see startCountIn)
     }
 
     void jumpToSection (int s) override
@@ -12592,15 +15858,25 @@ static bool runPersistenceSelfTest()
 
     ProjectSnapshot original;
     original.settings.metronomeEnabled = false;
+    original.settings.trackInput[0] = 0;  original.settings.trackStereo[0] = false;   // LIVE 1: In 1
+    original.settings.trackInput[2] = 2;  original.settings.trackStereo[2] = true;    // LIVE 3: In 3+4
+    original.settings.trackInstrumentId[1] = "VST3-Kontakt-1a2b3c4d-9e8f7a6b";
+    original.settings.trackInstrumentState[1] = juce::MemoryBlock ("hello", 5).toBase64Encoding();
+    original.settings.trackMidiChannel[1] = 3;
+    original.settings.stripOn[6] = true;    // DECK 7
+    original.settings.stripOn[9] = true;    // LIVE 2
+    original.settings.stripState[6] = juce::MemoryBlock ("<PERFORM_LIVE/>", 15).toBase64Encoding();
     original.settings.onePadAtATime    = false;
     original.settings.meterVisible     = true;
     original.settings.tempoLockEnabled = true;
+    original.settings.webGain = 0.35f;
+    original.settings.webMute = true;
     original.masterTempoBpm  = 133.5;
     original.viewedSignature = 3;
     original.masterGain      = 0.75f;
     for (int c = 0; c < ProjectSnapshot::kMixerChannels; ++c)
     {
-        original.mixerChannels[(size_t) c].gain = 0.08f * (float) (c + 1);
+        original.mixerChannels[(size_t) c].gain = 0.07f * (float) (c + 1);
         original.mixerChannels[(size_t) c].mute = (c % 2 == 0);
         original.mixerChannels[(size_t) c].solo = (c == 3);
         original.mixerChannels[(size_t) c].outputRoute = (c + 1) % MixerChannelSnapshot::kMaxOutputRoutes;   // every channel on its own pair, Metro on Out 23/24
@@ -12608,6 +15884,12 @@ static bool runPersistenceSelfTest()
     DeckSnapshot deck;
     deck.flatIndex = 12;
     deck.tempoOverrideBpm = 128.0;
+    deck.sourceBpm = 74.5;
+    deck.stemMode = false;
+    deck.clickFile = "C:/stems/song/Click.wav";
+    deck.guideFile = "C:/stems/song/Guide.wav";
+    deck.meter = "7/8";
+    deck.useSongClick = false;
     deck.rowName = "Intro";
     deck.rowColourSet = true;
     deck.rowColourArgb = 0xff7c5cff;
@@ -12626,10 +15908,11 @@ static bool runPersistenceSelfTest()
         s.name = "Intro";  s.startBar = 0;  s.colourArgb = 0xff00d9ff; deck.sections.push_back (s);
         s.name = "Chorus"; s.startBar = 8;  s.colourArgb = 0;          s.loopOnEntry = true; deck.sections.push_back (s);
         s = {};
-        s.name = "Tag";    s.startBar = 24; s.optional = true; s.pauseAfter = true; s.skip = true; deck.sections.push_back (s);
+        s.name = "Tag";    s.startBar = 24; s.optional = true; s.pauseAfter = true; s.skip = true; s.cue = "Last-Time"; deck.sections.push_back (s);
         deck.arrangementLengthBars = 32;
         deck.endBehaviour = 1;
         deck.countInBars = 2;
+        deck.guideClick = true; deck.guideCues = true; deck.cueLeadBars = 4; deck.cueCounts = false;
     }
     original.decks.push_back (deck);
     original.setlist = { 12, 3, 40 };
@@ -12648,6 +15931,45 @@ static bool runPersistenceSelfTest()
            restored.settings.onePadAtATime    == original.settings.onePadAtATime &&
            restored.settings.tempoLockEnabled == original.settings.tempoLockEnabled,
            "settings round-trip exactly");
+    check (juce::approximatelyEqual (restored.settings.webGain, 0.35f) && restored.settings.webMute == true,
+           "the mixer's WEB strip level and mute round-trip");
+    check (restored.settings.trackInput == original.settings.trackInput
+           && restored.settings.trackStereo == original.settings.trackStereo
+           && restored.settings.trackInput[3] == -1,
+           "live track inputs round-trip (LIVE 1 = In 1, LIVE 3 = In 3+4 stereo, others none)");
+    check (restored.settings.trackInstrumentId == original.settings.trackInstrumentId
+           && restored.settings.trackInstrumentState == original.settings.trackInstrumentState
+           && restored.settings.trackMidiChannel == original.settings.trackMidiChannel
+           && restored.settings.trackInstrumentId[0].isEmpty(),
+           "live track instrument id, state and MIDI channel round-trip (LIVE 2), others empty");
+    check (restored.settings.stripOn == original.settings.stripOn && restored.settings.stripState == original.settings.stripState
+           && ! restored.settings.stripOn[4],
+           "PERFORM LIVE channel strip on/off and state round-trip on decks and live tracks (DECK 7, LIVE 2 on)");
+
+    // A project from before the live tracks: a mic on column 7 (its strip on),
+    // an instrument on column 8, an 12-entry mixer. The mic and instrument move
+    // to LIVE 1/2 with the strip, the columns become plain stem columns, and
+    // the mixer's Pads/Fx/Click/Cues keep their own settings.
+    {
+        juce::var legacy;
+        juce::JSON::parse (R"({"version":1,"settings":{
+            "liveInputChannel":[-1,-1,-1,-1,-1,-1,3,-1],"liveInputStereo":[false,false,false,false,false,false,false,false],
+            "instrumentId":["","","","","","","","VST3-EZkeys-1"],"instrumentState":["","","","","","","","c3RhdGU="],
+            "stripOn":[false,false,false,false,false,false,true,false],"stripState":["","","","","","","PHAvPg==",""]},
+            "mixerChannels":[{"gain":1},{"gain":1},{"gain":1},{"gain":1},{"gain":1},{"gain":1},{"gain":1},{"gain":1},
+                             {"gain":0.25},{"gain":0.5},{"gain":0.75},{"gain":0.9}],
+            "decks":[]})", legacy);
+        ProjectSnapshot migrated;
+        const bool ok = fromVar (legacy, migrated);
+        check (ok && migrated.settings.trackInput[0] == 3 && migrated.settings.trackInstrumentId[1] == "VST3-EZkeys-1"
+               && migrated.settings.trackInstrumentState[1] == "c3RhdGU=",
+               "an older project's column mic and column instrument move onto LIVE 1 and LIVE 2");
+        check (migrated.settings.stripOn[8] && migrated.settings.stripState[8] == "PHAvPg==" && ! migrated.settings.stripOn[6],
+               "the mic column's channel strip moves with it, and the column's own strip is off");
+        check (juce::approximatelyEqual (migrated.mixerChannels[12].gain, 0.25f) && juce::approximatelyEqual (migrated.mixerChannels[15].gain, 0.9f)
+               && juce::approximatelyEqual (migrated.mixerChannels[8].gain, 1.0f),
+               "a 12-channel mixer's Pads/FX/Click/Cues settings land on their channels after the live tracks");
+    }
     check (juce::approximatelyEqual (restored.masterTempoBpm, original.masterTempoBpm), "masterTempoBpm round-trips exactly");
     check (restored.viewedSignature == original.viewedSignature, "viewedSignature round-trips exactly");
     check (juce::approximatelyEqual (restored.masterGain, original.masterGain), "masterGain round-trips exactly");
@@ -12659,12 +15981,18 @@ static bool runPersistenceSelfTest()
         auto& b = restored.mixerChannels[(size_t) c];
         if (! juce::approximatelyEqual (a.gain, b.gain) || a.mute != b.mute || a.solo != b.solo || a.outputRoute != b.outputRoute) mixerOk = false;
     }
-    check (mixerOk, "all 11 mixer channels' gain/mute/solo/outputRoute round-trip exactly (Decks 1-8, Pads, FX, Metro)");
+    check (mixerOk, "all 16 mixer channels' gain/mute/solo/outputRoute round-trip exactly (Decks 1-8, LIVE 1-4, Pads, FX, Click, Cues)");
     check (restored.mixerChannels[10].outputRoute == 11, "the highest route (Out 23/24) survives the save, not clamped down");
 
     check (restored.decks.size() == 1 && restored.decks[0].flatIndex == 12
            && juce::approximatelyEqual (restored.decks[0].tempoOverrideBpm, 128.0),
            "deck snapshot's flatIndex/tempoOverrideBpm round-trip exactly");
+    check (juce::approximatelyEqual (restored.decks[0].sourceBpm, 74.5) && restored.decks[0].stemMode == false,
+           "deck snapshot's original tempo and loop/stem mode round-trip");
+    check (restored.decks[0].clickFile == "C:/stems/song/Click.wav" && restored.decks[0].guideFile == "C:/stems/song/Guide.wav"
+           && restored.decks[0].useSongClick == false && restored.decks[0].useSongGuide == true,
+           "deck snapshot's song click/guide tracks and their built-in/song choice round-trip");
+    check (restored.decks[0].meter == "7/8", "a song's own time signature round-trips");
     // Phase 1.1 P1 "Row Management" fields.
     check (restored.decks.size() == 1 && restored.decks[0].sections.size() == 3
            && restored.decks[0].sections[0].name == "Intro" && restored.decks[0].sections[0].startBar == 0
@@ -12677,6 +16005,11 @@ static bool runPersistenceSelfTest()
            "arrangement length, end behaviour and count-in round-trip");
     check (restored.setlist == std::vector<int> { 12, 3, 40 } && restored.jumpMode == 2,
            "setlist order and jump mode round-trip");
+    check (restored.decks.size() == 1 && restored.decks[0].guideClick && restored.decks[0].guideCues
+           && restored.decks[0].cueLeadBars == 4 && ! restored.decks[0].cueCounts
+           && restored.decks[0].sections.size() == 3 && restored.decks[0].sections[2].cue == "Last-Time"
+           && restored.decks[0].sections[0].cue.isEmpty(),
+           "native click/cues settings and a section's chosen cue round-trip");
     {
         // A pre-section project has none of these fields: it must load as
         // "no sections, no setlist, default jump mode", never as garbage.
@@ -12792,8 +16125,9 @@ static bool runPersistenceSelfTest()
     }
 
     // A project saved before PX-B has 7 mixer channels (Tab1-4, Pads, Fx,
-    // Metro). Pads/Fx/Metro must land on their own strips (8/9/10), not on
-    // Decks 5-7 -- otherwise opening an old set silently swaps outputs.
+    // Metro). Pads/Fx/Metro must land on their own strips (12/13/14, after
+    // Decks 5-8 and LIVE 1-4), not on Decks 5-7 -- otherwise opening an old
+    // set silently swaps outputs.
     {
         const char* sevenChannelJson =
             "{\"version\":1,\"mixerChannels\":["
@@ -12810,11 +16144,11 @@ static bool runPersistenceSelfTest()
                "old Decks 1-4 keep their outputs");
         check (legacy.mixerChannels[4].outputRoute == 0 && legacy.mixerChannels[7].outputRoute == 0,
                "Decks 5-8 (new) start on Main instead of inheriting Pads/FX/Metro routes");
-        check (legacy.mixerChannels[8].outputRoute == 5 && juce::approximatelyEqual (legacy.mixerChannels[8].gain, 0.5f),
+        check (legacy.mixerChannels[12].outputRoute == 5 && juce::approximatelyEqual (legacy.mixerChannels[12].gain, 0.5f),
                "old Pads channel lands on the Pads strip");
-        check (legacy.mixerChannels[9].outputRoute == 2 && legacy.mixerChannels[9].mute,
+        check (legacy.mixerChannels[13].outputRoute == 2 && legacy.mixerChannels[13].mute,
                "old FX channel lands on the FX strip");
-        check (legacy.mixerChannels[10].outputRoute == MixerChannelSnapshot::kMaxOutputRoutes - 1,
+        check (legacy.mixerChannels[14].outputRoute == MixerChannelSnapshot::kMaxOutputRoutes - 1,
                "old Metro channel lands on the Metro strip, and an out-of-range route is clamped");
     }
 
@@ -12993,6 +16327,67 @@ static bool runLibrarySelfTest()
                "LibraryManager::resolve() finds an asset that only exists in the SECOND root");
 
         rootDir2.deleteRecursively();
+    }
+
+    // ---- Folders: saved with the library, old stem-set groups become folders, pictures stay inside the library ----
+    {
+        auto folderRoot = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("ezplay_selftest_folders");
+        folderRoot.deleteRecursively();
+        folderRoot.createDirectory();
+
+        LibraryEntry drums, bass, kick;
+        drums.assetId = juce::Uuid().toString(); drums.name = "Grace - Drums";
+        bass.assetId  = juce::Uuid().toString(); bass.name  = "Grace - Bass";
+        kick.assetId  = juce::Uuid().toString(); kick.name  = "Old Kick"; kick.collectionId = "legacy-group";
+
+        juce::StringArray pairNames, pairIds;
+        pairNames.add (drums.name); pairNames.add (bass.name);
+        pairIds.add (drums.assetId); pairIds.add (bass.assetId);
+
+        juce::String folderId;
+        {
+            Library lib (folderRoot);
+            lib.upsert (drums); lib.upsert (bass); lib.upsert (kick);
+            check (Library::suggestFolderName (pairNames) == "Grace",
+                   "suggestFolderName() uses the samples' shared leading words");
+            folderId = lib.createFolder ("Grace", pairIds).id;
+            lib.save();
+        }
+        {
+            Library lib (folderRoot);
+            lib.load();
+            auto folder = lib.findFolder (folderId);
+            check (folder.has_value() && folder->name == "Grace" && lib.folderSize (folderId) == 2,
+                   "a folder and its members survive save + load");
+            check (lib.findFolder ("legacy-group").has_value() && lib.folderSize ("legacy-group") == 1,
+                   "an older stem-set group (a collectionId with no folder record) loads as a folder");
+
+            juce::Image big (juce::Image::RGB, 900, 600, true);
+            { juce::Graphics g (big); g.fillAll (juce::Colours::orange); }
+            auto source = folderRoot.getSiblingFile ("ezplay_selftest_folder_picture.png");
+            source.deleteFile();
+            { juce::FileOutputStream out (source); juce::PNGImageFormat().writeImageToStream (big, out); }
+            juce::String error;
+            check (lib.setFolderImage (folderId, source, error)
+                     && lib.folderImageFile (folderId).isAChildOf (folderRoot.getChildFile ("Folders")),
+                   "setFolderImage() keeps its own copy of the picture inside the library's Folders directory");
+            const auto stored = juce::ImageFileFormat::loadFrom (lib.folderImageFile (folderId));
+            check (stored.isValid() && stored.getWidth() <= 512 && stored.getHeight() <= 512,
+                   "a large folder picture is scaled down to 512 px");
+            source.deleteFile();
+
+            auto tampered = *lib.findFolder (folderId);
+            tampered.imagePath = "../../outside.png";
+            lib.upsertFolder (tampered);
+            check (lib.folderImageFile (folderId) == juce::File(),
+                   "a folder picture path that leads outside the library is ignored");
+
+            lib.removeFolder (folderId);
+            check (! lib.findFolder (folderId).has_value() && lib.findById (drums.assetId).has_value()
+                     && lib.findById (drums.assetId)->collectionId.isEmpty(),
+                   "deleting a folder keeps its samples and takes them out of it");
+        }
+        folderRoot.deleteRecursively();
     }
 
     // ---- resolveAssetOrPath(): the shared helper every load boundary (Deck layers, Pads, FX) uses ----
@@ -13225,6 +16620,70 @@ static bool runImporterSelfTest()
     return allOk;
 }
 
+#if JUCE_WINDOWS
+ // The crash report names the exception and the module it happened in, which
+ // needs the Win32 types. Included here, after the app's own code, so its
+ // macros cannot reach anything above.
+ #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+ #endif
+ #ifndef NOMINMAX
+  #define NOMINMAX
+ #endif
+ #include <windows.h>
+#endif
+
+// ============================================================================
+//  Crash safety net. Owner: "we need a very strong app that won't fail." When
+//  it does fail anyway, the failure must be visible and reportable rather
+//  than a window that silently vanishes mid-service: the handler writes a
+//  report (version, time, stack) beside the log, and the next launch says so
+//  and where the file is.
+// ============================================================================
+static juce::File crashReportFolder()
+{
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory).getChildFile ("EzPlay");
+}
+
+static juce::File pendingCrashReportFile()
+{
+    return crashReportFolder().getChildFile ("PerformLive-crash.txt");
+}
+
+static void performliveCrashHandler (void* info)
+{
+    // Keep this minimal: the process is already broken. No allocations we
+    // can avoid, no logger, one file write.
+    const auto file = pendingCrashReportFile();
+    juce::String report;
+    report << "PerformLive closed unexpectedly\n"
+           << "Time:    " << juce::Time::getCurrentTime().toString (true, true) << "\n"
+           << "Version: " << JUCE_APPLICATION_VERSION_STRING << "\n"
+           << "OS:      " << juce::SystemStats::getOperatingSystemName() << "\n";
+   #if JUCE_WINDOWS
+    // Which exception, and which module it happened in -- a plugin's own
+    // DLL, more often than not.
+    if (auto* ep = static_cast<PEXCEPTION_POINTERS> (info); ep != nullptr && ep->ExceptionRecord != nullptr)
+    {
+        const auto* rec = ep->ExceptionRecord;
+        report << "Code:    0x" << juce::String::toHexString ((juce::int64) rec->ExceptionCode) << "\n";
+        HMODULE mod = nullptr;
+        if (GetModuleHandleExA (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCSTR) rec->ExceptionAddress, &mod) && mod != nullptr)
+        {
+            char path[1024] = {};
+            GetModuleFileNameA (mod, path, (DWORD) sizeof (path));
+            report << "Module:  " << path << "\n";
+        }
+        if (rec->ExceptionCode == 0xE06D7363)
+            report << "         (a C++ exception thrown by that module and caught by nobody)\n";
+    }
+   #endif
+    report << "\nStack:\n" << juce::SystemStats::getStackBacktrace() << "\n";
+    file.getParentDirectory().createDirectory();
+    file.replaceWithText (report);
+}
+
 class EzPlayApplication : public juce::JUCEApplication
 {
 public:
@@ -13240,7 +16699,15 @@ public:
     // file (fixed ad hoc via taskkill each time). Refusing a second instance
     // outright removes the whole failure class instead of relying on the
     // user to notice and kill stray processes by hand.
-    bool moreThanOneInstanceAllowed() override           { return false; }
+    // One instance only -- except the copies we launch ourselves: the
+    // plugin-scanner worker (InstrumentHost.h) and the command-line
+    // self-tests, which must run while the app is open.
+    bool moreThanOneInstanceAllowed() override
+    {
+        const auto params = getCommandLineParameters();
+        return params.contains (ezinst::kScannerProcessUID) || params.contains ("--selftest") || params.contains ("--list-audio-devices")
+            || params.contains ("--scan-plugins") || params.contains ("--test-instrument");
+    }
 
     // JUCE's own mechanism for this: when moreThanOneInstanceAllowed() is
     // false, a second launch attempt never runs its own initialise() at all
@@ -13259,6 +16726,108 @@ public:
 
     void initialise (const juce::String& commandLine) override
     {
+        // PX-D: launched by ourselves as the plugin-scanner worker? Then this
+        // process only probes plugin files and reports back -- no window, no
+        // audio, no project. A plugin that crashes here crashes only here.
+        {
+            auto scanner = std::make_unique<ezinst::ScannerSubprocess>();
+            if (scanner->initialiseFromCommandLine (commandLine, ezinst::kScannerProcessUID))
+            {
+                scannerSubprocess = std::move (scanner);
+                return;
+            }
+        }
+
+        // PX-D: "PerformLive.exe --test-instrument <name>" loads one scanned
+        // instrument in THIS process, prepares it and renders a few blocks
+        // with a note held, then quits 0. A crash here is a crash in that
+        // plugin only -- run one per process to find which plugins fail.
+        if (commandLine.contains ("--test-instrument"))
+        {
+            const auto wanted = commandLine.fromFirstOccurrenceOf ("--test-instrument", false, false).trim().unquoted().trim();
+            ezinst::PluginLibrary lib;
+            if (auto* settings = SessionComponent::getAppSettings()) lib.loadFrom (*settings);
+            std::optional<juce::PluginDescription> found;
+            for (const auto& d : lib.instruments())
+                if (wanted.isEmpty() || d.name.containsIgnoreCase (wanted)) { found = d; break; }
+            if (! found) { std::printf ("no instrument matching [%s] in the scanned list\n", wanted.toRawUTF8()); setApplicationReturnValue (2); quit(); return; }
+            std::printf ("loading %s (%s) from %s\n", found->name.toRawUTF8(), found->pluginFormatName.toRawUTF8(), found->fileOrIdentifier.toRawUTF8());
+            std::fflush (stdout);
+            juce::SystemStats::setApplicationCrashHandler (performliveCrashHandler);
+            try
+            {
+                juce::String error;
+                auto inst = lib.formatManager().createPluginInstance (*found, 48000.0, 512, error);
+                if (inst == nullptr) { std::printf ("FAILED to create: %s\n", error.toRawUTF8()); setApplicationReturnValue (3); quit(); return; }
+                std::printf ("created: %d in, %d out, buses in/out %d/%d, editor=%d\n", inst->getTotalNumInputChannels(), inst->getTotalNumOutputChannels(),
+                             inst->getBusCount (true), inst->getBusCount (false), (int) inst->hasEditor());
+                std::fflush (stdout);
+                ezinst::InstrumentSlot slot;
+                slot.prepare (48000.0, 512);
+                slot.install (std::move (inst), *found);
+                std::printf ("prepared\n"); std::fflush (stdout);
+                slot.addMidi (juce::MidiMessage::noteOn (1, 60, 0.8f));
+                std::vector<float> l (512), r (512);
+                float peak = 0.0f;
+                for (int b = 0; b < 40; ++b)
+                {
+                    slot.render (l.data(), r.data(), 512);
+                    for (float v : l) peak = juce::jmax (peak, std::fabs (v));
+                }
+                slot.addMidi (juce::MidiMessage::noteOff (1, 60));
+                slot.render (l.data(), r.data(), 512);
+                std::printf ("rendered 40 blocks, peak %.3f%s\n", peak, peak > 0.0f ? "" : " (silent -- a sampler with no patch loaded is expected to be silent)");
+                slot.clear(); slot.collectRetired();
+                std::printf ("OK %s\n", found->name.toRawUTF8());
+            }
+            catch (const std::exception& e) { std::printf ("THREW: %s\n", e.what()); setApplicationReturnValue (4); }
+            catch (...)                     { std::printf ("THREW (non-std)\n"); setApplicationReturnValue (4); }
+            std::fflush (stdout);
+            quit();
+            return;
+        }
+
+        // PX-D: "PerformLive.exe --scan-plugins" scans the standard VST3
+        // folders through the separate scanner process, prints what it found,
+        // saves the list for the app, and quits. Proves the subprocess path
+        // without a window, and seeds the Instrument menu on a new machine.
+        if (commandLine.contains ("--scan-plugins"))
+        {
+            struct CliScan final : public juce::Thread
+            {
+                CliScan() : juce::Thread ("plugin scan") {}
+                void run() override
+                {
+                    ezinst::PluginLibrary lib;
+                    const auto pedal = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("performlive-scan-pedal.txt");
+                    int files = 0;
+                    for (auto* format : lib.formatManager().getFormats())
+                    {
+                        juce::PluginDirectoryScanner scanner (lib.list(), *format, format->getDefaultLocationsToSearch(), true, pedal, true);
+                        juce::String name;
+                        while (! threadShouldExit())
+                        {
+                            const auto next = scanner.getNextPluginFileThatWillBeScanned();
+                            if (! scanner.scanNextFile (true, name)) break;
+                            ++files;
+                            std::printf ("  scanned %s\n", next.toRawUTF8());
+                            std::fflush (stdout);
+                        }
+                    }
+                    std::printf ("\n%d files scanned. Instruments:\n", files);
+                    for (const auto& d : lib.instruments())
+                        std::printf ("  [%s] %s -- %s\n", d.pluginFormatName.toRawUTF8(), d.name.toRawUTF8(), d.manufacturerName.toRawUTF8());
+                    std::printf ("%d instruments, %d plugins in total\n", lib.instruments().size(), lib.list().getNumTypes());
+                    std::fflush (stdout);
+                    if (auto* settings = SessionComponent::getAppSettings()) lib.saveTo (*settings);
+                    juce::MessageManager::callAsync ([] { juce::JUCEApplication::getInstance()->quit(); });
+                }
+            };
+            cliScan = std::make_unique<CliScan>();
+            cliScan->startThread();
+            return;
+        }
+
         if (commandLine.contains ("--selftest-persistence"))
         {
             std::printf ("Milestone 12 persistence self-test\n");
@@ -13343,6 +16912,7 @@ public:
         }
         juce::Logger::setCurrentLogger (fileLogger.get());
         juce::Logger::writeToLog ("PerformLive " + getApplicationVersion() + " starting up");
+        juce::SystemStats::setApplicationCrashHandler (performliveCrashHandler);
 
         // PerformLive font stack -- installed BEFORE the window exists so
         // the very first paint already uses Inter/JetBrains Mono. See
@@ -13365,9 +16935,29 @@ public:
         }
 
         mainWindow.reset (new MainWindow (performbeta::kLabel));
+
+        // A report from a previous run: say so once, keep the file under a
+        // dated name so it is not reported again, and offer to show it.
+        if (const auto pending = pendingCrashReportFile(); pending.existsAsFile())
+        {
+            const auto kept = crashReportFolder().getChildFile ("PerformLive-crash-"
+                                  + juce::Time::getCurrentTime().formatted ("%Y-%m-%d-%H%M%S") + ".txt");
+            pending.moveFileTo (kept);
+            juce::Logger::writeToLog ("Previous run crashed; report kept at " + kept.getFullPathName());
+            juce::MessageManager::callAsync ([kept]
+            {
+                juce::AlertWindow::showOkCancelBox (juce::MessageBoxIconType::WarningIcon,
+                    "PerformLive closed unexpectedly last time",
+                    "A report was saved so the cause can be fixed:\n" + kept.getFullPathName()
+                    + "\n\nPlease email it to amanorsac@gmail.com. Your project and library are untouched.",
+                    "Show the file", "OK", nullptr,
+                    juce::ModalCallbackFunction::create ([kept] (int r) { if (r == 1) kept.revealToUser(); }));
+            });
+        }
     }
     void shutdown() override
     {
+        if (cliScan != nullptr) cliScan->stopThread (5000);
         juce::Logger::writeToLog ("PerformLive shutting down cleanly");
         mainWindow = nullptr;
         expiredWindow = nullptr;
@@ -13376,13 +16966,25 @@ public:
         juce::Logger::setCurrentLogger (nullptr);
         fileLogger.reset();
     }
-    void systemRequestedQuit() override { quit(); }
+    void systemRequestedQuit() override
+    {
+        // the close button, Alt+F4 and Windows shutting down all come here
+        if (mainWindow != nullptr)
+            if (auto* session = dynamic_cast<SessionComponent*> (mainWindow->getContentComponent()))
+            {
+                session->requestQuit ([] { juce::JUCEApplication::getInstance()->quit(); });
+                return;
+            }
+        quit();
+    }
 
 private:
     std::unique_ptr<MainWindow> mainWindow;
     std::unique_ptr<creators::BetaEndedWindow> expiredWindow;   // shown instead of mainWindow once the beta has ended
     std::unique_ptr<PerformLookAndFeel> performLookAndFeel;   // app-wide font stack -- see its class comment
     std::unique_ptr<juce::FileLogger> fileLogger;
+    std::unique_ptr<ezinst::ScannerSubprocess> scannerSubprocess;   // PX-D: only in the scanner worker process
+    std::unique_ptr<juce::Thread> cliScan;                            // PX-D: --scan-plugins
 };
 
 START_JUCE_APPLICATION (EzPlayApplication)

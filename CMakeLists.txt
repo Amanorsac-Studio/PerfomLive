@@ -2,6 +2,15 @@ cmake_minimum_required(VERSION 3.22)
 
 project(EzPlay VERSION 0.4.0)
 
+# Must be set BEFORE JUCE is added: FindWebView2 runs while JUCE's own targets
+# are being created, not when ours is. Windows only (the WEB tab's browser).
+#   curl -L -o wv2.nupkg https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2
+#   unzip wv2.nupkg -d "C:/Amanorsac Studio/sdks/webview2/Microsoft.Web.WebView2.<version>"
+# (the studio's shared SDK folder, beside ASIOSDK, per the File & Data Conventions)
+if (WIN32)
+    set(JUCE_WEBVIEW2_PACKAGE_LOCATION "C:/Amanorsac Studio/sdks/webview2" CACHE PATH "Folder containing the Microsoft.Web.WebView2.* NuGet package")
+endif()
+
 # ---- JUCE --------------------------------------------------------------------
 # A clone of the public repo (and CI) gets JUCE 9.0.0 as the JUCE/ submodule.
 # The studio's Windows machine builds against its shared copy at C:/JUCE.
@@ -26,9 +35,8 @@ if (IOS)
     # plus "open in place" makes the app's Documents folder -- where projects
     # and the library live (ProductPaths.h) -- visible in the Files app.
     #
-    # The microphone text is required by App Store validation because JUCE's
-    # audio code links the input APIs. PerformLive opens no inputs, so iPadOS
-    # never shows it in practice.
+    # The microphone text: LIVE 1-4 tracks play a mic or instrument through
+    # the app, so iPadOS asks the first time one is switched on.
     #
     # ITSAppUsesNonExemptEncryption=false: the app uses no encryption, which
     # also stops TestFlight holding every build for an export-compliance answer.
@@ -43,29 +51,33 @@ if (IOS)
         FILE_SHARING_ENABLED TRUE
         BACKGROUND_AUDIO_ENABLED TRUE
         MICROPHONE_PERMISSION_ENABLED TRUE
-        MICROPHONE_PERMISSION_TEXT "PerformLive only plays audio. iPadOS asks this for apps that can use audio interfaces with inputs."
+        MICROPHONE_PERMISSION_TEXT "PerformLive plays your microphone or instrument through its LIVE tracks when you switch one on."
         PLIST_TO_MERGE "<plist><dict><key>LSSupportsOpeningDocumentsInPlace</key><true/><key>ITSAppUsesNonExemptEncryption</key><false/></dict></plist>")
 elseif (APPLE)
-    # Hardened runtime is required for notarisation. No audio-input entitlement:
-    # the app opens outputs only (setAudioChannels (0, 2) in Main.cpp).
+    # Hardened runtime is required for notarisation. LIVE 1-4 tracks open audio
+    # inputs, so the hardened runtime needs the audio-input entitlement and
+    # macOS needs the microphone text, or it silently hands the app silence.
     list(APPEND PERFORMLIVE_PLATFORM_ARGS
         ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/logo_icon_1024.png"
         BUILD_VERSION "${PERFORMLIVE_BUILD_NUMBER}"
         HARDENED_RUNTIME_ENABLED TRUE
+        HARDENED_RUNTIME_OPTIONS com.apple.security.device.audio-input
+        MICROPHONE_PERMISSION_ENABLED TRUE
+        MICROPHONE_PERMISSION_TEXT "PerformLive plays your microphone or instrument through its LIVE tracks when you switch one on."
         PLIST_TO_MERGE "<plist><dict><key>LSApplicationCategoryType</key><string>public.app-category.music</string><key>ITSAppUsesNonExemptEncryption</key><false/></dict></plist>")
 else()
     list(APPEND PERFORMLIVE_PLATFORM_ARGS
-        ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/logo_icon.png")
+        ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/logo_icon.png"
+        NEEDS_WEBVIEW2 TRUE)
 endif()
 
 # Standalone app target. The TARGET stays EzPlay (internal names keep the
 # working title) -- PRODUCT_NAME is the user-facing identity, so the built app
 # is PerformLive(.exe/.app) with the PerformLive "P" emblem as its icon.
 #
-# No WebView2: the in-app browser was removed for the public beta, which makes
-# no network requests at all (Build Standard B46). COMPANY_NAME and BUNDLE_ID
-# put the manufacturer into the app's metadata (B29). The bundle id is the one
-# registered with Apple for the Mac and iPad apps.
+# The beta ships everything, WEB included (owner, 15 Sep 2026: "no strip
+# down"). COMPANY_NAME and BUNDLE_ID put the manufacturer into the app's
+# metadata (B29). The bundle id is the one registered with Apple.
 juce_add_gui_app(EzPlay
     PRODUCT_NAME "PerformLive"
     COMPANY_NAME "Amanorsac Studio"
@@ -76,7 +88,13 @@ juce_add_gui_app(EzPlay
 target_sources(EzPlay PRIVATE
     Main.cpp
     Library.cpp
-    ProjectFile.cpp)
+    ProjectFile.cpp
+    # hearing the words on a guide track (Windows speech recognition; a stub elsewhere)
+    SpeechCues_win.cpp
+    # PERFORM LIVE, the Amanorsac channel strip -- compiled in, never loaded
+    # as a plugin, so it always ships with the app (see ChannelStrip/SOURCE.txt)
+    ChannelStrip/PerformProcessor.cpp
+    ChannelStrip/PerformEditor.cpp)
 
 # EzDSP.h lives in this folder, so the app can #include it
 target_include_directories(EzPlay PRIVATE
@@ -141,10 +159,30 @@ endif()
 
 # JUCE compile settings
 target_compile_definitions(EzPlay PRIVATE
-    JUCE_WEB_BROWSER=0
+    JUCE_WEB_BROWSER=1
+    # VST2 needs Steinberg's withdrawn SDK and stays off everywhere.
+    JUCE_PLUGINHOST_VST=0
     JUCE_USE_CURL=0
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:EzPlay,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:EzPlay,JUCE_VERSION>")
+
+# PX-D: VST3 instruments on a column (InstrumentHost.h). The VST3 SDK headers
+# ship inside JUCE 9. iPadOS cannot load VST3 plug-ins, so it builds without
+# the host and the instrument picker has nothing to list there.
+if (IOS)
+    target_compile_definitions(EzPlay PRIVATE JUCE_PLUGINHOST_VST3=0)
+else()
+    target_compile_definitions(EzPlay PRIVATE
+        JUCE_PLUGINHOST_VST3=1
+        JUCE_VST3_HOST_CROSS_PLATFORM_UID=1)
+endif()
+
+# The in-app browser (WEB) is Edge WebView2 on Windows -- a real Chromium, so
+# YouTube works -- linked statically, so nothing ships beside the exe. Mac and
+# iPad use the system WebKit and need nothing extra.
+if (WIN32)
+    target_compile_definitions(EzPlay PRIVATE JUCE_USE_WIN_WEBVIEW2_WITH_STATIC_LINKING=1)
+endif()
 
 # Security hardening (owner: "make the app and its code safe"): Control
 # Flow Guard on top of MSVC's defaults (/GS stack cookies, /DYNAMICBASE
@@ -173,7 +211,13 @@ target_link_libraries(EzPlay PRIVATE
     juce::juce_cryptography
     juce::juce_dsp
     juce::juce_gui_extra
+    juce::juce_audio_processors
     PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+
+# The header wordmark is compiled into the exe, so it shows however the app is
+# launched or installed (it used to be read from a logo.png beside the exe).
+juce_add_binary_data(PerformLiveArt SOURCES logo.png)
+target_link_libraries(EzPlay PRIVATE PerformLiveArt)

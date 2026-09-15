@@ -5,7 +5,7 @@ A stage instrument for running stems, loops, pads and a click live, by
 
 This repository builds **PERFORMLIVE BETA (Testing)** for Mac and iPad. The
 beta was released on 13 September 2026 and can be used until 12 October 2026.
-It opens empty: no sounds are included, and it makes no network connections.
+It opens empty: no sounds are included. It goes online only when you use the WEB tab's browser, or open a link on the STORE page.
 
 ## Builds
 

@@ -52,11 +52,29 @@ inline juce::Image loadImage (const char* filename)
     animate. */
 inline const juce::Image& dialFace() { static juce::Image i = loadImage ("dial-face.png"); return i; }
 
+/** The Perform Live Creators WhatsApp QR code, zoomed in to the code itself.
+    Owner: "zoom in the qr code". creators-qr.jpg is WhatsApp's full phone
+    screen (green ground, card, caption) with the code a small square in the
+    middle; this keeps that square and a thin white quiet zone so it still
+    scans. The crop is proportional, so a re-export at another resolution of
+    the same screen still lands on the code. */
+inline const juce::Image& creatorsQr()
+{
+    static juce::Image i = []
+    {
+        auto full = loadImage ("creators-qr.jpg");
+        if (! full.isValid()) return full;
+        const int w = full.getWidth(), h = full.getHeight();
+        const int side = juce::roundToInt (w * 0.49);
+        const juce::Rectangle<int> code (juce::roundToInt (w * 0.4985) - side / 2, juce::roundToInt (h * 0.5) - side / 2, side, side);
+        if (! full.getBounds().contains (code)) return full;   // not the expected screen: show it whole
+        return full.getClippedImage (code).createCopy();
+    }();
+    return i;
+}
+
 /** The Amanorsac Studio lockup, on black -- the only background the Master
     Standard allows it on. STORE page and end-of-beta notice. */
 inline const juce::Image& amanorsacLogo() { static juce::Image i = loadImage ("amanorsac-logo.jpg"); return i; }
-
-/** QR code for the Perform Live Creators WhatsApp group (STORE page). */
-inline const juce::Image& creatorsQr() { static juce::Image i = loadImage ("creators-qr.jpg"); return i; }
 
 } // namespace performart

@@ -30,6 +30,10 @@ INCLUDE=(
   ActionRegistry.h Arrangement.h Beta.h CreatorsTab.h DeckCard.h Deck.h EzDSP.h
   Importer.h KeyBindingMap.h Metronome.h MidiActionRouter.h Mixer.h OneShotVoice.h
   PlaybackView.h ProductPaths.h Session.h SignatureManager.h UiArt.h WarpIntegration.h
+  BrowserTab.h DownloadManager.h CueDetect.h CueReview.h Guide.h InstrumentHost.h
+  SectionNameField.h SpeechCues.h SpeechCues_win.cpp StemImport.h StoreShowcase.h TouchSupport.h
+  ChannelStrip/PerformProcessor.cpp ChannelStrip/PerformProcessor.h
+  ChannelStrip/PerformEditor.cpp ChannelStrip/PerformEditor.h ChannelStrip/SOURCE.txt
   # engine test suites run by CI
   decktest.cpp switchtest.cpp stemlentest.cpp stemplaytest.cpp stemlocktest.cpp
   outroutetest.cpp sectiontest.cpp arrangetest.cpp
