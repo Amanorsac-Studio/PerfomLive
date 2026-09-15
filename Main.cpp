@@ -14688,7 +14688,9 @@ private:
     // thread reads them through the live* pointers (see renderSongTrack),
     // which only ever change while the row can't be heard. A replaced track
     // is kept in retiredSongTracks until the transport stops.
+public:   // declared public above (the forward declaration); Clang refuses a change of access
     struct SongTrack { juce::String filePath; std::vector<float> mono; double rate { 0.0 }; };
+private:
     std::array<std::shared_ptr<SongTrack>, kNumDecks> songClickTrack, songGuideTrack;
     std::array<std::atomic<SongTrack*>, kNumDecks> liveClickTrack, liveGuideTrack;
     std::vector<std::shared_ptr<SongTrack>> retiredSongTracks;

@@ -262,7 +262,11 @@ jobs:
         run: |
           set -o pipefail
           cmake --build build --config Release --target EzPlay 2>&1 | tee build.log | grep -E "error:|warning: unused|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/EzPlay_artefacts/Release/PerformLive.app || { grep -B2 -A8 "error:" build.log | head -150; exit 1; }
+          # The bundle folder exists even when linking failed, so check the
+          # executable itself -- otherwise a compile error only shows up later
+          # as "code object is not signed at all".
+          test -f build/EzPlay_artefacts/Release/PerformLive.app/Contents/MacOS/PerformLive \
+            || { grep -B2 -A8 "error:" build.log | head -150; exit 1; }
 
       - name: Read version
         id: version
