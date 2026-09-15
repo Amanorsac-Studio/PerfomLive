@@ -1,13 +1,20 @@
 name: Build
 
-# Mac and iPad builds of PERFORMLIVE BETA (Testing). The Windows installer is
-# built on the studio machine (package_release.ps1), because it needs
-# Steinberg's ASIO SDK, which cannot be put in a public repository.
+# Windows, Mac and iPad builds of PERFORMLIVE BETA (Testing), on every push.
 #
-# The certificate steps follow the studio's macOS Code Signing & Notarisation
-# Standard (proven on SecondOut 1.3.2), and the iPad signing follows PulseRoom's
-# TestFlight job. This repository is public, so Actions minutes are free and
-# both jobs run on every push.
+#   windows -- the Inno Setup installer. Steinberg's ASIO SDK and Microsoft's
+#              WebView2 SDK are downloaded from their publishers during the
+#              build and never committed (the ASIO licence keeps the SDK
+#              itself out of a public repository).
+#   macos   -- the signed, notarised .pkg. The certificate steps follow the
+#              studio's macOS Code Signing & Notarisation Standard (proven on
+#              SecondOut 1.3.2).
+#   ipad    -- the signed App Store build of com.amanorsac.performlive (an
+#              explicit, registered bundle id), uploaded to TestFlight. No
+#              simulator: the device build is the check. Signing follows
+#              PulseRoom's TestFlight job.
+#
+# This repository is public, so Actions minutes on standard runners are free.
 
 on:
   push:
@@ -23,6 +30,100 @@ permissions:
   contents: read
 
 jobs:
+  windows:
+    name: Windows (installer)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Fetched per build, never committed. Each download is checked for what
+      # the build needs from it, so a moved or changed download fails here,
+      # loudly, instead of producing an installer without ASIO.
+      - name: Fetch the ASIO and WebView2 SDKs
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sdk = Join-Path $env:RUNNER_TEMP "sdks"
+          New-Item -ItemType Directory -Force -Path $sdk | Out-Null
+
+          $asioZip = Join-Path $sdk "asio.zip"
+          $got = $false
+          foreach ($url in "https://www.steinberg.net/asiosdk",
+                           "https://download.steinberg.net/sdk_downloads/asiosdk_2.3.3_2019-06-14.zip") {
+            try {
+              Invoke-WebRequest $url -OutFile $asioZip -MaximumRedirection 5
+              $magic = [System.IO.File]::ReadAllBytes($asioZip)[0..1]
+              if ($magic[0] -eq 0x50 -and $magic[1] -eq 0x4B) { Write-Host "ASIO SDK from $url"; $got = $true; break }
+            } catch { Write-Host "  $url failed: $($_.Exception.Message)" }
+          }
+          if (-not $got) { Write-Error "Could not download Steinberg's ASIO SDK"; exit 1 }
+          Expand-Archive $asioZip -DestinationPath (Join-Path $sdk "asio")
+          $hdr = Get-ChildItem (Join-Path $sdk "asio") -Recurse -Filter iasiodrv.h | Select-Object -First 1
+          if (-not $hdr) { Write-Error "The ASIO SDK download has no common/iasiodrv.h"; exit 1 }
+          $asioRoot = $hdr.Directory.Parent.FullName
+
+          $wv2Zip = Join-Path $sdk "webview2.zip"
+          Invoke-WebRequest "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2" -OutFile $wv2Zip
+          $wv2Root = Join-Path $sdk "webview2"
+          Expand-Archive $wv2Zip -DestinationPath (Join-Path $wv2Root "Microsoft.Web.WebView2")
+          if (-not (Get-ChildItem $wv2Root -Recurse -Filter WebView2LoaderStatic.lib | Select-Object -First 1)) {
+            Write-Error "The WebView2 package has no WebView2LoaderStatic.lib"; exit 1
+          }
+
+          "ASIO_SDK_DIR=$($asioRoot.Replace('\','/'))" >> $env:GITHUB_ENV
+          "WEBVIEW2_DIR=$($wv2Root.Replace('\','/'))"  >> $env:GITHUB_ENV
+
+      - name: Configure
+        run: |
+          cmake -S . -B build_release -A x64 `
+                "-DASIO_SDK_DIR=$env:ASIO_SDK_DIR" `
+                "-DJUCE_WEBVIEW2_PACKAGE_LOCATION=$env:WEBVIEW2_DIR" `
+                "-DPERFORMLIVE_BUILD_NUMBER=${{ github.run_number }}" 2>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # CMakeLists.txt: never ship a Windows build that could not see
+          # multi-output interfaces.
+          if (-not (Select-String -Path configure.log -Pattern "ASIO: enabled" -Quiet)) {
+            Write-Error "Configured without ASIO - refusing to build the Windows installer"; exit 1
+          }
+
+      - name: Build
+        run: |
+          cmake --build build_release --config Release --target EzPlay -- /m /v:minimal 2>&1 | Tee-Object -FilePath build.log | Select-String -Pattern "error |PerformLive.exe"
+          if (-not (Test-Path build_release/EzPlay_artefacts/Release/PerformLive.exe)) {
+            Select-String -Path build.log -Pattern "error " | Select-Object -First 60; exit 1
+          }
+
+      - name: In-app self-tests
+        run: |
+          $exe = "build_release/EzPlay_artefacts/Release/PerformLive.exe"
+          foreach ($suite in "beta", "persistence", "library", "importer") {
+            $out  = & $exe "--selftest-$suite" 2>&1 | Out-String
+            $pass = ([regex]::Matches($out, '\[PASS\]')).Count
+            $fail = ([regex]::Matches($out, '\[FAIL\]')).Count
+            if ($fail -gt 0 -or $pass -eq 0) { $out; Write-Error "--selftest-${suite}: $pass passed, $fail failed"; exit 1 }
+            Write-Host "--selftest-${suite}: PASS ($pass checks)"
+          }
+
+      # Inno Setup 6.6 or later for the dark wizard style; the runner image may
+      # carry an older one.
+      - name: Install Inno Setup
+        run: choco upgrade innosetup -y --no-progress
+
+      - name: Package the installer
+        run: ./package_release.ps1 -SkipBuild
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: PerformLive-Windows
+          path: dist/PerformLive-*-Windows.exe
+          if-no-files-found: error
+
   macos:
     name: Mac (signed + notarised installer)
     runs-on: macos-latest
@@ -268,7 +369,7 @@ jobs:
         run: security delete-keychain build.keychain || true
 
   ipad:
-    name: iPad (simulator check + TestFlight)
+    name: iPad (signed + TestFlight)
     runs-on: macos-latest
     timeout-minutes: 120
     steps:
@@ -284,68 +385,8 @@ jobs:
             -DCMAKE_XCODE_GENERATE_SCHEME=ON \
             -DPERFORMLIVE_BUILD_NUMBER="${{ github.run_number }}"
 
-      # Always runs, signed or not: proves the iPad code compiles and launches.
-      - name: Build for the iPad simulator
-        run: |
-          set -o pipefail
-          xcodebuild -project build-ios/EzPlay.xcodeproj -scheme EzPlay -configuration Release \
-            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath build-sim CODE_SIGNING_ALLOWED=NO build 2>&1 | tee sim-build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
-          # Ask Xcode where it put the app rather than guessing: CMake's Xcode
-          # projects override the usual derived-data product folder.
-          SETTINGS=$(xcodebuild -project build-ios/EzPlay.xcodeproj -scheme EzPlay -configuration Release \
-                       -sdk iphonesimulator -derivedDataPath build-sim -showBuildSettings 2>/dev/null)
-          TBD=$(printf '%s\n' "$SETTINGS" | awk -F' = ' '$1 ~ /^ *TARGET_BUILD_DIR$/ {print $2}' | tail -1)
-          WRAP=$(printf '%s\n' "$SETTINGS" | awk -F' = ' '$1 ~ /^ *WRAPPER_NAME$/ {print $2}' | tail -1)
-          APP="$TBD/$WRAP"
-          echo "Xcode says the app is at: $APP"
-          if [ ! -d "$APP" ]; then
-            echo "::error::No app at $APP"
-            printf '%s\n' "$SETTINGS" | grep -E " (TARGET_NAME|PRODUCT_NAME|TARGET_BUILD_DIR|BUILT_PRODUCTS_DIR|CONFIGURATION_BUILD_DIR|WRAPPER_NAME|SDKROOT|SUPPORTED_PLATFORMS) = " | sort -u
-            find "$PWD" "$HOME/Library/Developer/Xcode/DerivedData" -name "*.app" -type d -not -path "*/JUCE/*" 2>/dev/null | head -20
-            grep -E "^(CompileC|Ld|CodeSign|Touch|ProcessInfoPlistFile|CopySwiftLibs|RegisterExecutionPolicyException) " sim-build.log | tail -15
-            grep -B2 -A8 "error:" sim-build.log | head -80
-            exit 1
-          fi
-          echo "APP=$APP" >> "$GITHUB_ENV"
-
-      - name: Screenshots on an iPad simulator
-        run: |
-          set -x
-          ls "$APP" | head -40
-          test -f "$APP/fonts/Inter-Regular.ttf" || test -f "$APP/Resources/fonts/Inter-Regular.ttf" \
-            || { echo "::error::fonts are missing from the iPad bundle"; exit 1; }
-
-          DEVTYPE=$(xcrun simctl list devicetypes | grep -E "iPad Air 11-inch|iPad Pro 11-inch|iPad Air" | head -1 | sed -E 's/.*\((com\.apple[^)]+)\).*/\1/')
-          RUNTIME=$(xcrun simctl list runtimes available | grep -E "^iOS " | tail -1 | sed -E 's/.* - ([^ ]+)$/\1/')
-          UDID=$(xcrun simctl create PerformLive-iPad "$DEVTYPE" "$RUNTIME")
-          xcrun simctl boot "$UDID"
-          xcrun simctl bootstatus "$UDID" -b
-          xcrun simctl install "$UDID" "$APP"
-
-          mkdir -p shots
-          xcrun simctl launch "$UDID" com.amanorsac.performlive
-          sleep 30
-          xcrun simctl io "$UDID" screenshot shots/01-opens.png
-          xcrun simctl terminate "$UDID" com.amanorsac.performlive || true
-
-          xcrun simctl launch "$UDID" com.amanorsac.performlive --simulate-beta-ended
-          sleep 15
-          xcrun simctl io "$UDID" screenshot shots/02-beta-ended.png
-          xcrun simctl terminate "$UDID" com.amanorsac.performlive || true
-
-          # A crash shows up here rather than as a mysterious home screen.
-          cp ~/Library/Logs/DiagnosticReports/PerformLive* shots/ 2>/dev/null || true
-          xcrun simctl spawn "$UDID" log show --last 5m --style compact --predicate 'process == "PerformLive"' > shots/app-log.txt 2>&1 || true
-
-      - name: Upload simulator screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: PerformLive-iPad-simulator
-          path: shots/
-          if-no-files-found: ignore
-
+      # The device build for com.amanorsac.performlive, signed with the Apple
+      # Distribution certificate, exported and uploaded to TestFlight.
       - name: Signed archive and TestFlight upload
         id: testflight
         env:

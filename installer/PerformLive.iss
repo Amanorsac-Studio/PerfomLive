@@ -72,7 +72,7 @@ LicenseLabel3=Please read the following licence. You must accept it before conti
 LicenseAccepted=I &accept the licence agreement
 LicenseNotAccepted=I &do not accept the licence agreement
 WelcomeLabel1=Welcome to {#AppLabel}
-WelcomeLabel2=This installs {#AppName} {#AppVersion} from {#Publisher}: a stage instrument for running stems, loops, pads and a click live.%n%nThis is a free test build. There is no licence key and no account, and it never connects to the internet. You can use it until {#LastDay}.%n%nNo sounds are included. The app opens empty.
+WelcomeLabel2=This installs {#AppName} {#AppVersion} from {#Publisher}: a stage instrument for running stems, loops, pads and a click live.%n%nThis is a free test build. There is no licence key and no account. It goes online only when you use the WEB tab or open a link on the STORE page. You can use it until {#LastDay}.%n%nNo sounds are included. The app opens empty.
 
 [Types]
 Name: "full"; Description: "{#AppName}"; Flags: iscustom

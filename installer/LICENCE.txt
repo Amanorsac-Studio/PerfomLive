@@ -18,8 +18,8 @@ About this beta
     anything important.
   - It stops opening on a fixed date. The installer's last page and the
     STORE page inside the app both show that date.
-  - There is no licence key and no account. PerformLive itself never
-    connects to the internet.
+  - There is no licence key and no account. PerformLive goes online only
+    when you use the WEB tab's browser or open a link on the STORE page.
   - No sounds are included. The app opens empty.
 
 By continuing, you accept the licence agreement published at the

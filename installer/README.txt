@@ -26,8 +26,8 @@ YOUR PROJECTS AND SETTINGS
 Uninstalling does not delete these.
 
 NO ACTIVATION
-There is no key and no account. PerformLive itself never connects
-to the internet.
+There is no key and no account. PerformLive goes online only when
+you use the WEB tab's browser or open a link on the STORE page.
 
 NO SOUNDS INCLUDED
 The app opens empty. Bring your own stems, loops and pads.
