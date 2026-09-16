@@ -244,6 +244,7 @@ jobs:
         run: |
           COMMON=(-S . -B build -G Xcode
                   -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+                  -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
                   -DPERFORMLIVE_BUILD_NUMBER="${{ github.run_number }}")
           if [ "${{ steps.gate.outputs.sign }}" = "true" ]; then
             # Xcode signs at build time and applies JUCE's hardened-runtime
@@ -275,6 +276,13 @@ jobs:
       - name: In-app self-tests and bundled files
         run: |
           APP=build/EzPlay_artefacts/Release/PerformLive.app
+          # Without an explicit minimum, Xcode targets its own SDK's macOS and
+          # the app refuses to open on anything older.
+          BIN="$APP/Contents/MacOS/PerformLive"
+          echo "Architectures: $(lipo -archs "$BIN")"
+          MINOS=$(vtool -show-build "$BIN" | awk '$1 == "minos" {print $2}' | sort -u | tr '\n' ' ')
+          echo "Minimum macOS: $MINOS"
+          [ "$(echo $MINOS)" = "11.0" ] || { echo "::error::minimum macOS is '$MINOS', expected 11.0"; exit 1; }
           for f in fonts/Inter-Regular.ttf fonts/SpaceGrotesk-Bold.ttf art/creators-qr.jpg art/amanorsac-logo.jpg art/dial-face.png logo.png; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f is missing from Contents/Resources"; exit 1; }
           done
