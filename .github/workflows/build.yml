@@ -281,9 +281,15 @@ jobs:
           # older Macs" -- 10.13 High Sierra, the lowest current Xcode builds for.
           BIN="$APP/Contents/MacOS/PerformLive"
           echo "Architectures: $(lipo -archs "$BIN")"
-          MINOS=$(vtool -show-build "$BIN" | awk '$1 == "minos" {print $2}' | sort -u | tr '\n' ' ')
-          echo "Minimum macOS: $MINOS"
-          [ "$(echo $MINOS)" = "10.13" ] || { echo "::error::minimum macOS is '$MINOS', expected 10.13"; exit 1; }
+          # Per slice: Intel carries the real floor (a target below 10.14 is
+          # written as LC_VERSION_MIN_MACOSX "version", not LC_BUILD_VERSION
+          # "minos"); Apple Silicon can never be below 11.0, the first macOS
+          # that ran on it.
+          minos_of () { vtool -arch "$1" -show-build "$BIN" | awk '$1 == "minos" || $1 == "version" {print $2; exit}'; }
+          INTEL=$(minos_of x86_64); ARM=$(minos_of arm64)
+          echo "Minimum macOS: Intel $INTEL, Apple Silicon $ARM"
+          [ "$INTEL" = "10.13" ] || { echo "::error::Intel minimum macOS is '$INTEL', expected 10.13"; exit 1; }
+          [ "$ARM" = "11.0" ]    || { echo "::error::Apple Silicon minimum macOS is '$ARM', expected 11.0"; exit 1; }
           for f in fonts/Inter-Regular.ttf fonts/SpaceGrotesk-Bold.ttf art/creators-qr.jpg art/amanorsac-logo.jpg art/dial-face.png logo.png; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f is missing from Contents/Resources"; exit 1; }
           done
