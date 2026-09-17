@@ -46,13 +46,17 @@ struct Section
     std::string cue;
 };
 
-enum class EndBehaviour { stop, cueNext, autoAdvance };
+// What happens when a song ends. Appended only: projects store the number.
+// Owner: "let's have options for what happens when one song ends -- next,
+// cue next, fade in, etc."
+enum class EndBehaviour { stop, cueNext, autoAdvance, advanceWithCountIn, fadeIntoNext, repeat };
 
 struct Arrangement
 {
     std::vector<Section> sections;     // kept sorted by startBar, unique startBar
     int          lengthBars { 0 };     // the song's length; sections beyond it are clamped on use
     EndBehaviour atEnd { EndBehaviour::autoAdvance };
+    int          endFadeSeconds { 2 };   // fadeIntoNext: how long the next song takes to come up (1, 2 or 4)
     int          countInBars { 0 };    // 0 = none, else 1/2/4
 
     // Native guide tracks (Guide.h). Off by default: a stem pack that ships

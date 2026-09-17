@@ -31,12 +31,13 @@ INCLUDE=(
   Importer.h KeyBindingMap.h Metronome.h MidiActionRouter.h Mixer.h OneShotVoice.h
   PlaybackView.h ProductPaths.h Session.h SignatureManager.h UiArt.h WarpIntegration.h
   BrowserTab.h DownloadManager.h CueDetect.h CueReview.h Guide.h InstrumentHost.h
-  SectionNameField.h SpeechCues.h SpeechCues_win.cpp StemImport.h StoreShowcase.h TouchSupport.h
+  SectionNameField.h SpeechCues.h SpeechCues_win.cpp StemImport.h StoreShowcase.h TouchSupport.h PluginManager.h
+  TempoDetect.h LoopTempo.h ClickEngine.h MetronomeSettings.h Stretch.h
   ChannelStrip/PerformProcessor.cpp ChannelStrip/PerformProcessor.h
   ChannelStrip/PerformEditor.cpp ChannelStrip/PerformEditor.h ChannelStrip/SOURCE.txt
   # engine test suites run by CI
   decktest.cpp switchtest.cpp stemlentest.cpp stemplaytest.cpp stemlocktest.cpp
-  outroutetest.cpp sectiontest.cpp arrangetest.cpp
+  outroutetest.cpp sectiontest.cpp arrangetest.cpp tempotest.cpp clicktest.cpp stretchtest.cpp tempochangetest.cpp
   # bundled, read-only assets
   fonts art logo.png logo_icon.png logo_icon_1024.png
   # Windows packaging (built locally; needs the ASIO SDK)

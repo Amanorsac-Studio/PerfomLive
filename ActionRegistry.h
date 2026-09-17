@@ -38,6 +38,10 @@ enum class ActionId : int
     NextSection = SceneBase + 8, PrevSection, NextSong, PrevSong,
     JumpNow, CancelJump, LoopSection, CountInPlay, TogglePlaybackView,
 
+    // Live tempo: 1 BPM up or down, at the next bar while playing. Appended
+    // for the same reason as the section actions above.
+    TempoUp, TempoDown,
+
     kCount
 };
 

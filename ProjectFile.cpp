@@ -146,6 +146,7 @@ static juce::var deckToVar (const DeckSnapshot& d)
         o->setProperty ("sections", sections);
         o->setProperty ("arrangementLengthBars", d.arrangementLengthBars);
         o->setProperty ("endBehaviour", d.endBehaviour);
+        o->setProperty ("endFadeSeconds", d.endFadeSeconds);
         o->setProperty ("countInBars", d.countInBars);
         o->setProperty ("guideClick", d.guideClick);
         o->setProperty ("guideCues", d.guideCues);
@@ -212,7 +213,8 @@ static DeckSnapshot deckFromVar (const juce::var& v)
             }
         }
         d.arrangementLengthBars = juce::jlimit (0, 100000, (int) o->getProperty ("arrangementLengthBars"));
-        d.endBehaviour          = juce::jlimit (0, 2, o->hasProperty ("endBehaviour") ? (int) o->getProperty ("endBehaviour") : 2);
+        d.endBehaviour          = juce::jlimit (0, 5, o->hasProperty ("endBehaviour") ? (int) o->getProperty ("endBehaviour") : 2);
+        d.endFadeSeconds        = o->hasProperty ("endFadeSeconds") ? juce::jlimit (1, 4, (int) o->getProperty ("endFadeSeconds")) : 2;
         d.countInBars           = juce::jlimit (0, 8, (int) o->getProperty ("countInBars"));
         d.guideClick            = (bool) o->getProperty ("guideClick");
         d.guideCues             = (bool) o->getProperty ("guideCues");
@@ -289,9 +291,9 @@ static MixerChannelSnapshot mixerChannelFromVar (const juce::var& v)
         c.gain = clampGain (o->getProperty ("gain"), c.gain);
         c.mute = (bool) o->getProperty ("mute");
         c.solo = (bool) o->getProperty ("solo");
-        // 0 = Main, N = hardware pair N. Mixer.h re-clamps against the live
-        // device every block; this keeps the stored value honest as well.
-        c.outputRoute = juce::jlimit (0, MixerChannelSnapshot::kMaxOutputRoutes - 1, (int) o->getProperty ("outputRoute"));
+        // Main, a stereo pair or a mono output. Mixer.h re-clamps against the
+        // live device every block; this keeps the stored value honest as well.
+        c.outputRoute = MixerChannelSnapshot::sanitiseRoute ((int) o->getProperty ("outputRoute"));
     }
     return c;
 }
@@ -379,6 +381,7 @@ static juce::var settingsToVar (const SettingsSnapshot& s)
     o->setProperty ("stripState", stripStateArr);
     o->setProperty ("webGain", (double) s.webGain);
     o->setProperty ("webMute", s.webMute);
+    o->setProperty ("webRoute", s.webRoute);
     return juce::var (o);
 }
 
@@ -471,6 +474,7 @@ static SettingsSnapshot settingsFromVar (const juce::var& v)
         for (auto& x : s.instrumentState) x = {};
         if (o->hasProperty ("webGain")) s.webGain = clampGain (o->getProperty ("webGain"), 1.0f);
         s.webMute = (bool) o->getProperty ("webMute");
+        s.webRoute = MixerChannelSnapshot::sanitiseRoute ((int) o->getProperty ("webRoute"));
     }
     return s;
 }

@@ -84,6 +84,20 @@ public:
     virtual void   setJumpMode (int) = 0;
     virtual int    countInBars() const = 0;
     virtual void   setCountInBars (int) = 0;
+    /** What happens when the song ends, as the "At the end" menu's item id
+        (1 stop, 2 cue next, 3 play next, 4 next with count-in, 5-7 fade into
+        next over 1/2/4 s, 8 repeat). */
+    /** Undo / redo, shared with PERFORM. */
+    virtual void   undo() {}
+    virtual void   redo() {}
+    virtual bool   canUndo() const { return false; }
+    virtual bool   canRedo() const { return false; }
+    virtual int    endChoice() const { return 3; }
+    virtual void   setEndChoice (int id) { juce::ignoreUnused (id); }
+    /** + / -: the tempo moves by delta BPM, at the next bar while playing. */
+    virtual void   nudgeTempo (double delta) { juce::ignoreUnused (delta); }
+    /** The tempo a change is heading for, 0 when none is on its way. */
+    virtual double pendingTempoBpm() const { return 0.0; }
 
     // ---- waveform data for the lanes ----
     virtual const std::vector<float>* layerSamples (int songIndex, int layer) const = 0;
@@ -1247,6 +1261,14 @@ public:
         mk (clickButton,       "Click",                   [this] { host.setGuideClick (! host.guideClick()); songChanged(); });
         clickButton.setTooltip ("Native click for this song, on the CLICK mixer strip (route it to the drummer's ears)");
         mk (cuesButton,        "Cues",                    [this] { cuesMenu(); });
+        mk (undoButton,        "\xe2\x86\xb6",            [this] { host.undo(); songChanged(); });
+        undoButton.setTooltip ("Undo (Ctrl+Z)");
+        mk (redoButton,        "\xe2\x86\xb7",            [this] { host.redo(); songChanged(); });
+        redoButton.setTooltip ("Redo (Ctrl+Y)");
+        mk (tempoDownButton,   "\xe2\x88\x92 BPM",        [this] { host.nudgeTempo (-1.0); });
+        tempoDownButton.setTooltip ("Tempo down 1 BPM, at the next bar while playing (key: -)");
+        mk (tempoUpButton,     "+ BPM",                   [this] { host.nudgeTempo (1.0); });
+        tempoUpButton.setTooltip ("Tempo up 1 BPM, at the next bar while playing (key: =)");
         cuesButton.setTooltip ("Spoken cues for this song, on the CUES mixer strip: the section name a couple of bars early, then a count");
 
         jumpModeBox.addItem ("Jump: next bar", 1);
@@ -1262,6 +1284,20 @@ public:
         countInBox.onChange = [this] { host.setCountInBars (countInBox.getSelectedId() - 1); };
         addAndMakeVisible (countInBox);
 
+        // Owner: "options for what happens when one song ends -- next, cue next, fade in..."
+        endBox.addSectionHeading ("When this song ends");
+        endBox.addItem ("Stop", 1);
+        endBox.addItem ("Cue the next song (wait)", 2);
+        endBox.addItem ("Play the next song", 3);
+        endBox.addItem ("Play the next song with a count-in", 4);
+        endBox.addItem ("Fade into the next song (1 s)", 5);
+        endBox.addItem ("Fade into the next song (2 s)", 6);
+        endBox.addItem ("Fade into the next song (4 s)", 7);
+        endBox.addItem ("Repeat this song", 8);
+        endBox.setTooltip ("What happens when this song reaches its end");
+        endBox.onChange = [this] { host.setEndChoice (endBox.getSelectedId()); host.arrangementEdited(); };
+        addAndMakeVisible (endBox);
+
         startTimerHz (30);
     }
 
@@ -1274,6 +1310,7 @@ public:
         setlist.refresh();
         jumpModeBox.setSelectedId (host.jumpMode() + 1, juce::dontSendNotification);
         countInBox.setSelectedId (host.countInBars() + 1, juce::dontSendNotification);
+        endBox.setSelectedId (host.endChoice(), juce::dontSendNotification);
         const bool haveSong = host.currentArrangement() != nullptr;
         clickButton.setEnabled (haveSong);
         cuesButton.setEnabled (haveSong && host.cueBankLoaded());
@@ -1583,7 +1620,10 @@ public:
         const int tempoSplit = tempoRow.getWidth() * 3 / 5;
         g.setColour (tokens::dim);
         g.setFont (juce::Font (juce::FontOptions (mono, d * 0.062f, juce::Font::plain)));
-        g.drawText (juce::String (host.tempoBpm(), 1) + " BPM",
+        const double heading = host.pendingTempoBpm();
+        g.drawText (juce::String (host.tempoBpm(), 1)
+                        + (heading > 0.0 ? juce::String (juce::CharPointer_UTF8 (" \xe2\x86\x92 ")) + juce::String (heading, 1) : juce::String())
+                        + " BPM",
                     tempoRow.withTrimmedRight (tempoRow.getWidth() - tempoSplit + 3),
                     juce::Justification::centredRight, false);
         g.drawText (juce::String (beatsPerBar) + "/4",
@@ -1649,11 +1689,16 @@ public:
 
         // edit row
         auto e = edit;
+        undoButton.setBounds (e.removeFromLeft (32)); e.removeFromLeft (2);
+        redoButton.setBounds (e.removeFromLeft (32)); e.removeFromLeft (10);
         addSectionButton.setBounds (e.removeFromLeft (110)); e.removeFromLeft (8);
         autoSectionButton.setBounds (e.removeFromLeft (110)); e.removeFromLeft (16);
         clickButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (6);
-        cuesButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (8);
+        cuesButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (16);
+        tempoDownButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (4);
+        tempoUpButton.setBounds (e.removeFromLeft (70)); e.removeFromLeft (8);
         countInBox.setBounds (e.removeFromRight (120)); e.removeFromRight (8);
+        endBox.setBounds (e.removeFromRight (200)); e.removeFromRight (8);
         jumpModeBox.setBounds (e.removeFromRight (180));
     }
 
@@ -1661,6 +1706,8 @@ private:
     void timerCallback() override
     {
         const bool playing = host.isPlaying();
+        undoButton.setEnabled (host.canUndo());
+        redoButton.setEnabled (host.canRedo());
         playButton.setButtonText (juce::String (juce::CharPointer_UTF8 (playing ? "\xe2\x96\xa0 Stop" : "\xe2\x96\xb6 Play")));
         playButton.setColour (juce::TextButton::buttonColourId, playing ? tokens::danger.withAlpha (0.85f) : tokens::play.withAlpha (0.85f));
         loopButton.setColour (juce::TextButton::buttonColourId, host.isLoopingSection() ? tokens::queued.withAlpha (0.85f) : tokens::card);
@@ -2002,8 +2049,9 @@ private:
     SetlistPanel setlist;
     juce::Rectangle<int> headerArea, dotsArea;
     juce::TextButton prevSongButton, prevSectionButton, playButton, countInButton, nextSectionButton, nextSongButton,
-                     loopButton, jumpNowButton, cancelButton, autoSectionButton, addSectionButton, clickButton, cuesButton;
-    juce::ComboBox jumpModeBox, countInBox;
+                     loopButton, jumpNowButton, cancelButton, autoSectionButton, addSectionButton, clickButton, cuesButton,
+                     tempoDownButton, tempoUpButton, undoButton, redoButton;
+    juce::ComboBox jumpModeBox, countInBox, endBox;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PlaybackView)
 };

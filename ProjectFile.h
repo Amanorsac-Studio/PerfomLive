@@ -116,7 +116,8 @@ struct DeckSnapshot
     };
     std::vector<SectionSnapshot> sections;
     int  arrangementLengthBars { 0 };
-    int  endBehaviour { 2 };        // 0 stop, 1 cue next, 2 auto-advance (ezarr::EndBehaviour)
+    int  endBehaviour { 2 };        // 0 stop, 1 cue next, 2 auto-advance, 3 next with count-in, 4 fade into next, 5 repeat (ezarr::EndBehaviour)
+    int  endFadeSeconds { 2 };      // for 4: 1, 2 or 4 seconds
     int  countInBars { 0 };
 
     // Native guide tracks (Guide.h). Additive; absent reads as off.
@@ -151,12 +152,24 @@ struct MixerChannelSnapshot
     float gain { 1.0f };
     bool  mute { false };
     bool  solo { false };
-    // Which hardware output pair this channel plays through: 0 = Main (Out
-    // 1/2, through Master); N = hardware pair N, straight to those jacks. Up
-    // to kMaxOutputRoutes pairs, so on a 24-output interface every one of the
-    // 11 channels can have its own pair. Additive field, no version bump.
-    static constexpr int kMaxOutputRoutes = 12;
+    // Where this channel plays (Mixer.h's route codes, ezdeck::outputTargetFor):
+    // 0 = Main (Out 1/2, through Master); 1..kMaxOutputRoutes-1 = hardware
+    // stereo pair N, straight to those jacks; kMonoRouteBase + c = hardware
+    // output c+1 alone (mono). Additive field, no version bump.
+    static constexpr int kMaxOutputRoutes    = 32;    // == ezdeck::kMaxStereoRoutes
+    static constexpr int kMonoRouteBase      = 100;   // == ezdeck::kMonoRouteBase
+    static constexpr int kMaxOutputChannels  = 64;    // == ezdeck::kMaxOutputChannels
     int outputRoute { 0 };
+
+    /** A stored route made safe: a valid code is kept; a pair past the end is
+        the last pair (as before mono existed); anything else is Main. */
+    static int sanitiseRoute (int code)
+    {
+        if (code >= 0 && code < kMaxOutputRoutes) return code;
+        if (code >= kMonoRouteBase && code < kMonoRouteBase + kMaxOutputChannels) return code;
+        if (code >= kMaxOutputRoutes && code < kMonoRouteBase) return kMaxOutputRoutes - 1;
+        return 0;
+    }
 };
 
 struct SceneSnapshot
@@ -221,9 +234,12 @@ struct SettingsSnapshot
     std::array<bool, kStrips>         stripOn {};
     std::array<juce::String, kStrips> stripState;
 
-    // The mixer's WEB strip: the browser page's level (0..1) and mute. Additive.
+    // The mixer's WEB strip: the browser page's level (0..1) and mute, which
+    // also set the LIBRARY preview's level; webRoute is where that preview
+    // plays (a MixerChannelSnapshot route code). Additive.
     float webGain { 1.0f };
     bool  webMute { false };
+    int   webRoute { 0 };
 };
 
 struct ProjectSnapshot

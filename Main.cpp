@@ -5,10 +5,15 @@
 #include "Guide.h"
 #include "TouchSupport.h"   // press-and-hold = right-click, for iPad and touchscreens
 #include "InstrumentHost.h"
+#include "PluginManager.h"   // the scan window and Settings > Plugins
 #include "CueDetect.h"
 #include "CreatorsTab.h"
 #include "ChannelStrip/PerformEditor.h"   // PERFORM LIVE, compiled in
 #include "EzDSP.h"
+#include "TempoDetect.h"   // eztempo::detect -- the tempo of a loop or a song
+#include "LoopTempo.h"     // the tempo field (Detect / halve / double / Tap) and the add-a-loop window
+#include "MetronomeSettings.h"   // the one click (ClickEngine.h) and Settings > Metronome
+#include "Stretch.h"              // tempo changes without pitch changes (WSOLA)
 #include "Importer.h"
 #include "KeyBindingMap.h"
 #include "Library.h"
@@ -1525,14 +1530,21 @@ public:
             // Main + 11 direct pairs (up to Out 23/24): enough for every one
             // of the 11 channels to have its own stereo out on a 24-output
             // interface. Same count as ProjectFile's kMaxOutputRoutes.
-            outputRouteBox.addItem ("Main", 1);   // "Main (Out 1/2)" truncated to "Main ..." at strip width
-            for (int i = 1; i < ezproject::MixerChannelSnapshot::kMaxOutputRoutes; ++i)
-                outputRouteBox.addItem ("Out " + juce::String (2 * i + 1) + "/" + juce::String (2 * i + 2), i + 1);
-            outputRouteBox.setSelectedItemIndex (0, juce::dontSendNotification);
+            // Owner: "the channel output should reflect the outputs on the sound
+            // card, mono or stereo." Main only until the device reports its
+            // outputs (setOutputChoices, called on every device change).
+            setOutputChoices ({});
             outputRouteBox.setColour (juce::ComboBox::backgroundColourId, juce::Colour (0xff151527));   // kCard
             outputRouteBox.setColour (juce::ComboBox::textColourId, juce::Colour (0xffa3a6cc));          // kTextDim
             outputRouteBox.setLookAndFeel (&tactileButtonLookAndFeel());
-            outputRouteBox.onChange = [this] { if (onOutputRouteChanged != nullptr) onOutputRouteChanged (outputRouteBox.getSelectedItemIndex()); };
+            outputRouteBox.onChange = [this]
+            {
+                const int id = outputRouteBox.getSelectedId();   // item id == route code + 1
+                if (id <= 0) return;
+                outputRouteCode = id - 1;
+                outputRouteBox.setTooltip (routeLabel (outputRouteCode));
+                if (onOutputRouteChanged != nullptr) onOutputRouteChanged (outputRouteCode);
+            };
             addAndMakeVisible (outputRouteBox);
         }
     }
@@ -1549,7 +1561,7 @@ public:
     std::function<void (float)> onGainChanged;
     std::function<void (bool)>  onMuteChanged;
     std::function<void (bool)>  onSoloChanged;
-    std::function<void (int)>   onOutputRouteChanged;   // index into this strip's own kOutputRoutes
+    std::function<void (int)>   onOutputRouteChanged;   // a route code (ezdeck::outputTargetFor): Main, a pair, or one output
     std::function<void()>       onFxToggle;             // the FX pill (DECK 5-8's PERFORM LIVE strip) was tapped
 
     // Owner: "on the mixer I want to see the channel strip, a sign showing FX
@@ -1562,8 +1574,8 @@ public:
         repaint();
     }
 
-    // The WEB strip has no solo and no output routing: it sets a web page's
-    // level, it doesn't carry audio through the mixer.
+    // The WEB strip has no solo: it sets a web page's level and carries the
+    // LIBRARY preview, not a mixer channel.
     void setSoloAvailable (bool s) { soloButton.setVisible (s); }
     void setRoutable (bool r)      { routable = r; if (! r) outputRouteBox.setVisible (false); }
 
@@ -1596,9 +1608,76 @@ public:
     void mouseDrag (const juce::MouseEvent& e) override { touchHold.drag (e); }
     void mouseUp (const juce::MouseEvent&) override    { touchHold.end(); }
 
-    void setOutputRouteIndex (int index) { outputRouteBox.setSelectedItemIndex (juce::jlimit (0, ezproject::MixerChannelSnapshot::kMaxOutputRoutes - 1, index), juce::dontSendNotification); }
-    int  getOutputRouteIndex() const     { return outputRouteBox.getSelectedItemIndex(); }
-    juce::String outputRouteLabel (int index) const { return outputRouteBox.getItemText (index); }
+    /** Where this strip plays: a route code (ezdeck::outputTargetFor). */
+    void setOutputRoute (int code)
+    {
+        outputRouteCode = ezproject::MixerChannelSnapshot::sanitiseRoute (code);
+        setOutputChoices (outputNames);   // re-listed, so a route this device lacks still shows as chosen
+    }
+    int getOutputRoute() const { return outputRouteCode; }
+
+    /** A route as the back of the interface reads. */
+    static juce::String routeLabel (int code)
+    {
+        if (ezdeck::isMonoOutputRoute (code))
+            return "Out " + juce::String (code - ezdeck::kMonoRouteBase + 1) + " (mono)";
+        const int pair = ezdeck::outputTargetFor (code).pair;
+        if (pair == 0) return "Main (Out 1/2)";
+        return "Out " + juce::String (2 * pair + 1) + "/" + juce::String (2 * pair + 2);
+    }
+
+    /** Lists the connected device's own outputs: Main, every stereo pair, then
+        every output alone (mono). The driver's names ("Line 5", "Phones L")
+        are shown where they say more than the number. A saved route the
+        device doesn't have stays selected, marked as not on this device. */
+    void setOutputChoices (const juce::StringArray& names)
+    {
+        outputNames = names;
+        const int n = juce::jmin (names.size(), ezdeck::kMaxOutputChannels);
+        auto named = [&names] (int c) -> juce::String
+        {
+            const auto s = names[c].trim();
+            const auto letters = s.removeCharacters ("0123456789 ").toLowerCase();
+            const bool justTheNumber = (letters == "out" || letters == "output")
+                                       && s.retainCharacters ("0123456789") == juce::String (c + 1);
+            return (s.isEmpty() || justTheNumber) ? juce::String() : s;
+        };
+
+        outputRouteBox.clear (juce::dontSendNotification);
+        outputRouteBox.addItem (routeLabel (0), 1);
+        bool listed = (outputRouteCode == 0);
+
+        if (n >= 4) outputRouteBox.addSectionHeading ("Stereo");
+        for (int p = 1; 2 * p + 1 < n && p < ezdeck::kMaxStereoRoutes; ++p)
+        {
+            auto text = routeLabel (p);
+            const auto a = named (2 * p), b = named (2 * p + 1);
+            if (a.isNotEmpty() || b.isNotEmpty())
+                text << "  -  " << (a.isNotEmpty() ? a : "Out " + juce::String (2 * p + 1))
+                     << " + " << (b.isNotEmpty() ? b : "Out " + juce::String (2 * p + 2));
+            outputRouteBox.addItem (text, p + 1);
+            listed = listed || outputRouteCode == p;
+        }
+
+        if (n >= 1) outputRouteBox.addSectionHeading ("Mono");
+        for (int c = 0; c < n; ++c)
+        {
+            const int code = ezdeck::kMonoRouteBase + c;
+            auto text = routeLabel (code);
+            if (const auto a = named (c); a.isNotEmpty()) text << "  -  " << a;
+            outputRouteBox.addItem (text, code + 1);
+            listed = listed || outputRouteCode == code;
+        }
+
+        if (! listed)
+        {
+            outputRouteBox.addSeparator();
+            outputRouteBox.addItem (routeLabel (outputRouteCode) + "  -  not on this device", outputRouteCode + 1);
+        }
+        outputRouteBox.setSelectedId (outputRouteCode + 1, juce::dontSendNotification);
+        outputRouteBox.setTooltip (routeLabel (outputRouteCode)
+                                   + (listed ? juce::String() : juce::String ("  (not on this device -- playing through Main)")));
+    }
 
     // Harmless no-op on the Master strip (showMuteSolo == false there, so
     // outputRouteBox was never added as a visible child at all -- setVisible
@@ -1845,6 +1924,8 @@ private:
     juce::Slider       gainSlider;
     juce::TextButton   muteButton, soloButton;
     juce::ComboBox     outputRouteBox;   // Phase 1.1 P3 "Output routing"
+    int                outputRouteCode { 0 };   // what outputRouteBox shows (a route code)
+    juce::StringArray  outputNames;             // the device's outputs, as last listed
 };
 
 //==============================================================================
@@ -3454,6 +3535,8 @@ inline juce::String actionDisplayName (ezaction::ActionId id)
         case ActionId::LoopSection:      return "Loop Section";
         case ActionId::CountInPlay:      return "Play with Count-In";
         case ActionId::TogglePlaybackView: return "Playback View";
+        case ActionId::TempoUp:          return "Tempo Up";
+        case ActionId::TempoDown:        return "Tempo Down";
         default: break;
     }
     const int i = (int) id;
@@ -3665,12 +3748,17 @@ public:
                            juce::AudioDeviceManager& deviceManager,
                            ezaction::KeyBindingMap& keyBindings, std::function<void()> onKeyBindingsChanged,
                            ezaction::MidiActionRouter& midiRouter, const juce::StringArray& openMidiDeviceNames,
-                           std::function<void (float)> masterGainSetter)
+                           std::function<void (float)> masterGainSetter,
+                           juce::Component* pluginsTab = nullptr, int initialTab = 0,
+                           juce::Component* metronomeTab = nullptr)
         : tabs (juce::TabbedButtonBar::TabsAtTop)
     {
         auto* general = new SettingsGeneralTab (metronomeEnabled, tempoLockEnabled, onePadAtATime);
         generalTab = general;
         tabs.addTab ("General", juce::Colour (0xff202030), general, true);
+        // Owner: "we should have different metronome settings."
+        if (metronomeTab != nullptr)
+            tabs.addTab ("Metronome", juce::Colour (0xff202030), metronomeTab, true);
 
         // Owner: "the app doesn't see my UMC driver... it should see different
         // sound card drivers like other DAWs and the outputs the device has."
@@ -3692,6 +3780,9 @@ public:
 
         tabs.addTab ("Shortcuts", juce::Colour (0xff202030), new ShortcutsTab (keyBindings, std::move (onKeyBindingsChanged)), true);
         tabs.addTab ("MIDI", juce::Colour (0xff202030), new MidiTab (midiRouter, openMidiDeviceNames, std::move (masterGainSetter)), true);
+        // Owner: "we should have a plugin manager window in settings."
+        if (pluginsTab != nullptr)
+            tabs.addTab ("Plugins", juce::Colour (0xff202030), pluginsTab, true);
 
         // Owner: "same as the settings window [feels foreign]" -- the tab
         // strip's empty area right of the last tab painted in the stock
@@ -3702,7 +3793,8 @@ public:
         tabs.getTabbedButtonBar().setColour (juce::TabbedButtonBar::frontTextColourId,    juce::Colour (0xfff2f0ff));   // == kTextBright
 
         addAndMakeVisible (tabs);
-        setSize (480, 420);
+        setSize (660, 520);   // room for the Plugins tab's two lists
+        tabs.setCurrentTabIndex (juce::jlimit (0, tabs.getNumTabs() - 1, initialTab), false);
     }
 
     SettingsGeneralTab& general() { return *generalTab; }
@@ -7199,7 +7291,7 @@ private:
         {
             g.setFont (juce::Font (juce::FontOptions (8.0f)));
             g.setColour (has && lit ? juce::Colours::black.withAlpha (0.7f) : dim);
-            g.drawText (! has ? "none" : (song ? "song" : "built-in"), text, juce::Justification::centred, false);
+            g.drawText (! has ? "none" : (! lit ? "muted" : (song ? "song" : "built-in")), text, juce::Justification::centred, false);
         }
     }
 
@@ -7291,6 +7383,7 @@ public:
         loadCueBank();   // Guide.h: the spoken cue recordings, once
         for (auto& c : trackInput) c.store (-1, std::memory_order_relaxed);
         if (auto* settings = getAppSettings()) pluginLibrary.loadFrom (*settings);
+        if (auto* settings = getAppSettings()) ezclick::loadSettings (*settings, clickParams, countInParams);
         for (auto& s : instruments) s.setPlayHead (&hostPlayHead);
         for (int i = 0; i < kNumStrips; ++i)
         {
@@ -7446,6 +7539,15 @@ public:
                     // Owner: several files at once are a set of stems -- the
                     // import window reads their names and places them
                     if (audio.size() > 1) { openStemImport (flat, audio, {}); return; }
+                    // Owner: "if I drag in just one loop the workflow becomes very
+                    // difficult." One file on an otherwise empty row is a loop:
+                    // ask its tempo (detected), how it plays, and at what tempo.
+                    if (! rowHasOtherLayers (flat, l))
+                    {
+                        askAboutLoop (flat, l, juce::File (firstAudio), {}, 0.0);
+                        offerLibraryImport (paths);
+                        return;
+                    }
                     clearLayer (flat, l);
                     loadLayer (flat, l, juce::File (firstAudio));
                     refreshSlotLabels();
@@ -7622,6 +7724,35 @@ public:
         // clutter, not function. The scene buttons absorb its width.)
 
         refreshSlotLabels();
+
+        // Owner: "press a plus button and the tempo goes up in the next bar."
+        for (auto* b : { &tempoDownButton, &tempoUpButton })
+        {
+            b->setColour (juce::TextButton::buttonColourId, juce::Colour (performlive::kCard));
+            b->setLookAndFeel (&tactileButtonLookAndFeel());
+            performView.addAndMakeVisible (b);
+        }
+        tempoDownButton.setButtonText (juce::String (juce::CharPointer_UTF8 ("\xe2\x88\x92")));
+        tempoDownButton.setTooltip ("Tempo down 1 BPM -- at the next bar while playing (key: -)");
+        tempoDownButton.onClick = [this] { actionRegistry.invoke (ezaction::ActionId::TempoDown); };
+        tempoUpButton.setButtonText ("+");
+        tempoUpButton.setTooltip ("Tempo up 1 BPM -- at the next bar while playing (key: =)");
+        tempoUpButton.onClick = [this] { actionRegistry.invoke (ezaction::ActionId::TempoUp); };
+
+        // Undo / redo: two small symbols (owner: "don't make it big").
+        for (auto* b : { &undoButtonPerform, &redoButtonPerform })
+        {
+            b->setColour (juce::TextButton::buttonColourId, juce::Colour (performlive::kCard));
+            b->setLookAndFeel (&tactileButtonLookAndFeel());
+            b->setEnabled (false);
+            performView.addAndMakeVisible (b);
+        }
+        undoButtonPerform.setButtonText (juce::String (juce::CharPointer_UTF8 ("\xe2\x86\xb6")));
+        undoButtonPerform.setTooltip ("Undo (Ctrl+Z)");
+        undoButtonPerform.onClick = [this] { undo(); };
+        redoButtonPerform.setButtonText (juce::String (juce::CharPointer_UTF8 ("\xe2\x86\xb7")));
+        redoButtonPerform.setTooltip ("Redo (Ctrl+Y)");
+        redoButtonPerform.onClick = [this] { redo(); };
 
         tapButton.setButtonText ("TAP");
         tapButton.addListener (this);
@@ -7897,25 +8028,14 @@ public:
             // below maps this selector's own existing vocabulary (Main /
             // Output 1-4 / Custom Bus) onto the Mixer's real output pairs,
             // and mixer.setChannelOutputPair() makes the routing live.
-            strip->onOutputRouteChanged = [this, channel, strip] (int routeIndex)
+            // Main, a stereo pair or one output alone (mono); any number of
+            // channels may share an output. A route the device doesn't have is
+            // remembered and plays through Main until that device is back.
+            strip->onOutputRouteChanged = [this, channel] (int code)
             {
-                channelOutputRoute[(size_t) channel] = routeIndex;
-                mixer.setChannelOutputPair (channel, routeIndexToOutputPair (routeIndex));
-                if (routeIndex != 0)
-                {
-                    const juce::String label = strip->outputRouteLabel (routeIndex);
-                    // The engine clamps a pair the device doesn't have back
-                    // to Main every block, so the choice is remembered (and
-                    // comes alive when a bigger interface is plugged in) but
-                    // is silent right now. Say so, rather than let someone
-                    // wonder why Out 5/6 on a 4-output box makes no sound.
-                    if (routeIndexToOutputPair (routeIndex) >= pairCount())
-                        showToast (kChannelNames[(int) channel] + ": \"" + label + "\" isn't on this audio device (it has "
-                                   + juce::String (pairCount()) + " pair" + (pairCount() == 1 ? "" : "s")
-                                   + ") -- playing through Main until it is");
-                    else
-                        showToast (kChannelNames[(int) channel] + ": routed to \"" + label + "\" -- direct to hardware, bypasses Master");
-                }
+                channelOutputRoute[(size_t) channel] = code;
+                mixer.setChannelOutputRoute (channel, code);
+                announceRoute (kChannelNames[(int) channel], code);
             };
             mixerStripHolder.addAndMakeVisible (strip);
             mixerStrips.add (strip);
@@ -7931,20 +8051,30 @@ public:
         }
         {
             // Owner: "the browser and YouTube should have a dedicated mixer
-            // channel." WebView2 plays through Windows, not through this
-            // mixer, so the strip sets the page's own players' level and
-            // mute (BrowserTab::setMediaLevel) -- no meter, no solo, no
-            // routing, because no audio passes through here.
-            auto* strip = new MixerChannelStrip ("Web", juce::Colour (performlive::kTextDim), false, true, juce::Colour (0xffff7a45));
+            // channel" and "the web mixer channel should work for both the web
+            // and the library". Fader and mute set the web page's own players
+            // (BrowserTab::setMediaLevel) and the LIBRARY preview; the output
+            // is where the LIBRARY preview plays. The browser (WebView2) plays
+            // through the system's sound device, not through this mixer, so its
+            // device is picked in Windows' per-app sound settings -- the strip's
+            // menu opens them.
+            auto* strip = new MixerChannelStrip ("Web/Lib", juce::Colour (performlive::kTextDim), false, true, juce::Colour (0xffff7a45));
             strip->setMeterVisible (false);
             strip->setSoloAvailable (false);
-            strip->setRoutable (false);
             strip->onGainChanged = [this] (float g) { webGain = g; pushWebLevel(); };
             strip->onMuteChanged = [this] (bool m) { webMute = m; pushWebLevel(); };
+            strip->onOutputRouteChanged = [this] (int code)
+            {
+                webRoute = code;
+                libraryPreview.route.store (code, std::memory_order_relaxed);
+                announceRoute ("Library preview", code);
+            };
+            strip->onStripMenu = [this] { showWebStripMenu(); };
             mixerStripHolder.addAndMakeVisible (strip);
             webStrip.reset (strip);
         }
         refreshMixerSoloVisuals();
+        refreshOutputChoices();
 
         // Milestone 8: pads. Exclusive by default (PRD §8). Real audio is
         // loaded only for whichever of pad1.wav..pad12.wav actually exist on
@@ -8089,6 +8219,7 @@ public:
                 startLibraryPreview (std::move (left), std::move (right),
                                      fileSampleRate > 0.0 && currentSampleRate > 0.0
                                        ? fileSampleRate / currentSampleRate : 1.0);
+                previewIsFromLibrary = true;   // closing LIBRARY stops it
             },
             [this] { stopLibraryPreview(); },
             [this] { return isLibraryPreviewActive(); });
@@ -8257,6 +8388,13 @@ public:
         addChildComponent (playbackHolder);
         playbackView = std::make_unique<ezplayback::PlaybackView> (*this);
         playbackHolder.addAndMakeVisible (*playbackView);
+
+        // WEB: the in-app browser, created the first time WEB is shown (WebView2
+        // starts processes of its own, so nobody who never opens WEB pays for
+        // it). These lines went missing in the beta merge, which left WEB
+        // showing an empty page.
+        addChildComponent (browserHolder);
+        browserHolder.onFirstShow = [this] { createBrowserTab(); };
 
         refreshActiveView();   // establishes the initial PERFORM-visible/others-hidden state
 
@@ -8580,7 +8718,7 @@ public:
                            slot.hasInstrument() && slot.currentDescription().createIdentifierString() == list[i].createIdentifierString());
         m.addSeparator();
         m.addItem (8003, "Scan for plugins...");
-        m.addItem (8004, "Plugin list...");
+        m.addItem (8004, "Plugin manager...");
         into.addSubMenu ("Instrument (VST3)", m);
     }
 
@@ -8590,7 +8728,7 @@ public:
         if (result == 8001) { openInstrumentEditor (t); return true; }
         if (result == 8002) { instruments[(size_t) t].allNotesOff(); return true; }
         if (result == 8003) { startPluginScan(); return true; }
-        if (result == 8004) { showPluginScanner(); return true; }
+        if (result == 8004) { showSettingsPanel (kSettingsPluginsTab); return true; }
         if (result >= 8100 && result < 8600)
         {
             const auto list = pluginLibrary.instruments();
@@ -8671,92 +8809,45 @@ public:
                                                                  [this, t] { instrumentWindows[(size_t) t] = nullptr; });
     }
 
-    /** Scans the standard VST3 folders straight away, with a progress window
-        and a Cancel button -- no folder dialog. Each file is probed in the
-        separate scanner process (InstrumentHost.h). */
-    void startPluginScan()
+    /** Scans the standard plugin folders in a window that shows what is being
+        checked and for how long, with Skip this plugin and Stop scan
+        (PluginManager.h). Each file is probed in the separate scanner process
+        (InstrumentHost.h); one that doesn't answer in time is skipped on its
+        own, and everything skipped is listed in Settings > Plugins. */
+    void startPluginScan (bool rescanEverything = false)
     {
-        if (pluginScan != nullptr) return;
+        if (pluginScanWindow != nullptr) { pluginScanWindow->toFront (true); return; }
+        if (rescanEverything) pluginLibrary.forgetEverything();
 
-        class Scan final : public juce::ThreadWithProgressWindow
+        // JUCE's dead-man's pedal: a plugin being checked when the app itself
+        // went down is set aside on the next scan.
+        const auto pedal = productpaths::machineState().getChildFile ("plugin-scan-in-progress.txt");
+        pedal.getParentDirectory().createDirectory();
+
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        pluginScanWindow = std::make_unique<ezplugins::ScanWindow> (pluginLibrary, pedal, [safe] (bool stopped, int files)
         {
-        public:
-            explicit Scan (SessionComponent& o)
-                : juce::ThreadWithProgressWindow ("Scanning for instruments...", true, true, 10000, "Cancel"), owner (o) {}
-
-            void run() override
-            {
-                const auto pedal = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                                       .getChildFile ("EzPlay").getChildFile ("plugin-scan-dead-mans-pedal.txt");
-                pedal.getParentDirectory().createDirectory();
-                for (auto* format : owner.pluginLibrary.formatManager().getFormats())
-                {
-                    juce::PluginDirectoryScanner scanner (owner.pluginLibrary.list(), *format,
-                                                          format->getDefaultLocationsToSearch(), true, pedal, true);
-                    juce::String name;
-                    for (;;)
-                    {
-                        if (threadShouldExit()) return;
-                        setStatusMessage ("Testing " + scanner.getNextPluginFileThatWillBeScanned().fromLastOccurrenceOf ("\\", false, false));
-                        if (! scanner.scanNextFile (true, name)) break;
-                        setProgress (scanner.getProgress());
-                    }
-                }
-            }
-
-            void threadComplete (bool cancelled) override
-            {
-                const int effects = owner.pluginLibrary.keepInstrumentsOnly();
-                if (effects > 0) juce::Logger::writeToLog ("Plugin scan: ignored " + juce::String (effects) + " effect plugins (instruments only)");
-                if (auto* settings = owner.getAppSettings()) owner.pluginLibrary.saveTo (*settings);
-                const int n = owner.pluginLibrary.instruments().size();
-                owner.showToast (juce::String (cancelled ? "Scan stopped. " : "Scan finished. ") + juce::String (n)
-                                 + (n == 1 ? " instrument available" : " instruments available") + " -- MIXER, a LIVE strip's source button");
-                juce::MessageManager::callAsync ([o = &owner] { o->pluginScan = nullptr; });
-            }
-
-        private:
-            SessionComponent& owner;
-        };
-
-        pluginScan = std::make_unique<Scan> (*this);
-        pluginScan->launchThread();
+            if (safe != nullptr) safe->pluginScanFinished (stopped, files);
+        });
     }
 
-    /** JUCE's plugin list with its scan button; the scan itself runs in a
-        separate process (InstrumentHost.h), so a bad plugin cannot take the
-        app down. The list is saved to the app settings when the window closes. */
-    void showPluginScanner()
+    void pluginScanFinished (bool stopped, int files)
     {
-        if (pluginListWindow != nullptr) { pluginListWindow->toFront (true); return; }
+        if (auto* settings = getAppSettings()) pluginLibrary.saveTo (*settings);
+        const int n = pluginLibrary.instruments().size();
+        const int aside = pluginLibrary.setAsideFiles().size();
+        juce::Logger::writeToLog ("Plugin scan " + juce::String (stopped ? "stopped" : "finished") + ": "
+                                  + juce::String (files) + " files checked, " + juce::String (n) + " instruments, "
+                                  + juce::String (aside) + " set aside, " + juce::String (pluginLibrary.effectCount())
+                                  + " effects ignored (instruments only)");
+        showToast (juce::String (stopped ? "Scan stopped. " : "Scan finished. ") + juce::String (n)
+                   + (n == 1 ? " instrument available" : " instruments available")
+                   + (aside > 0 ? juce::String (", ") + juce::String (aside) + " skipped (Settings > Plugins)" : juce::String())
+                   + " -- MIXER, a LIVE strip's source button");
 
-        class ListWindow final : public juce::DocumentWindow
-        {
-        public:
-            ListWindow (SessionComponent& o, juce::PluginListComponent* content)
-                : juce::DocumentWindow ("Plugins", juce::Colour (0xff0c0c17), juce::DocumentWindow::closeButton), owner (o)
-            {
-                setUsingNativeTitleBar (true);
-                setContentOwned (content, true);
-                setResizable (true, false);
-                centreWithSize (720, 480);
-                setVisible (true);
-            }
-            void closeButtonPressed() override
-            {
-                if (auto* settings = owner.getAppSettings()) owner.pluginLibrary.saveTo (*settings);
-                owner.pluginListWindow = nullptr;   // deletes this
-            }
-        private:
-            SessionComponent& owner;
-        };
-
-        const auto pedal = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                               .getChildFile ("EzPlay").getChildFile ("plugin-scan-dead-mans-pedal.txt");
-        pedal.getParentDirectory().createDirectory();
-        auto* content = new juce::PluginListComponent (pluginLibrary.formatManager(), pluginLibrary.list(), pedal, getAppSettings(), true);
-        content->setSize (720, 480);
-        pluginListWindow = std::make_unique<ListWindow> (*this, content);
+        // The scan window called this: it is deleted once this call has returned.
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        juce::MessageManager::callAsync ([safe] { if (safe != nullptr) safe->pluginScanWindow = nullptr; });
     }
 
     // ---- PERFORM LIVE channel strip ----------------------------------------------
@@ -8802,7 +8893,15 @@ public:
     {
         if (i < 0 || i >= kNumStrips || result < 7001 || result >= 7400) return false;
         if (result == 7001) { setStripOn (i, ! stripOn[(size_t) i].load (std::memory_order_relaxed)); return true; }
-        if (result == 7002) { if (! stripOn[(size_t) i].load (std::memory_order_relaxed)) setStripOn (i, true); openStripEditor (i); return true; }
+        if (result == 7002)
+        {
+            if (! stripOn[(size_t) i].load (std::memory_order_relaxed)) setStripOn (i, true);
+            // After the menu has gone: a window created while a popup menu is
+            // closing could lose its first full paint and open blank.
+            juce::Component::SafePointer<SessionComponent> safe (this);
+            juce::MessageManager::callAsync ([safe, i] { if (safe != nullptr) safe->openStripEditor (i); });
+            return true;
+        }
         if (result >= 7100)
         {
             strips[(size_t) i]->loadFactory (result - 7100);
@@ -8826,8 +8925,17 @@ public:
     {
         if (i < 0 || i >= kNumStrips) return;
         auto& win = stripWindows[(size_t) i];
-        if (win != nullptr) { win->toFront (true); return; }
+        if (win != nullptr)
+        {
+            // a minimised or hidden window is brought back, not just raised
+            if (win->isMinimised()) win->setMinimised (false);
+            win->setVisible (true);
+            win->toFront (true);
+            if (auto* c = win->getContentComponent()) c->repaint();
+            return;
+        }
 
+        // Owner: "sometimes the channel strip opens just a blank page."
         class StripWindow final : public juce::DocumentWindow
         {
         public:
@@ -8835,18 +8943,42 @@ public:
                 : juce::DocumentWindow (title, juce::Colour (0xff0c0c17), juce::DocumentWindow::closeButton), onClose (std::move (onClosed))
             {
                 setUsingNativeTitleBar (true);
-                if (auto* ed = p.createEditorIfNeeded()) setContentOwned (ed, true);
-                setResizable (true, false);
+                if (auto* ed = p.createEditorIfNeeded())
+                {
+                    setContentOwned (ed, true);
+                    // The editor's own size limits and aspect ratio: a freely
+                    // dragged window left the surface only partly filled.
+                    setResizable (ed->isResizable(), false);
+                    if (auto* limits = ed->getConstrainer()) setConstrainer (limits);
+                }
                 centreWithSize (getWidth(), getHeight());
                 setVisible (true);
+
+                // After showing, the editor only repaints its meters, so a lost
+                // first paint would stay blank: paint the whole surface now and
+                // once more when the window has settled.
+                if (auto* content = getContentComponent())
+                {
+                    content->repaint();
+                    juce::Component::SafePointer<juce::Component> safe (content);
+                    juce::Timer::callAfterDelay (150, [safe] { if (safe != nullptr) safe->repaint(); });
+                }
             }
-            void closeButtonPressed() override { if (onClose) onClose(); }
+
+            // The owner deletes this window, so that happens after this call has
+            // returned -- never while the window is still running its own code.
+            void closeButtonPressed() override
+            {
+                setVisible (false);
+                if (onClose) juce::MessageManager::callAsync (onClose);
+            }
         private:
             std::function<void()> onClose;
         };
 
         win = std::make_unique<StripWindow> (*strips[(size_t) i], "PERFORM LIVE  --  " + stripLabel (i),
-                                             [this, i] { stripWindows[(size_t) i] = nullptr; });
+                                             [safe = juce::Component::SafePointer<SessionComponent> (this), i]
+                                             { if (safe != nullptr) safe->stripWindows[(size_t) i] = nullptr; });
     }
 
     /** Returns true if result was one of addTrackInputMenu's items. */
@@ -8895,7 +9027,74 @@ public:
             requestAllOutputChannels();
             requestLiveInputChannels();
             saveAudioDeviceState();
+            refreshOutputChoices();
         }
+    }
+
+    /** The WEB/Library strip's own menu (right-click or hold). */
+    void showWebStripMenu()
+    {
+        juce::PopupMenu m;
+        m.addSectionHeader ("Web / Library");
+       #if JUCE_WINDOWS
+        m.addItem (1, "Browser sound output (Windows settings)...");
+       #endif
+        m.addItem (2, "What this strip does");
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options(), [safe] (int r)
+        {
+            if (safe == nullptr) return;
+            // Windows keeps a per-app output device: PerformLive's browser can
+            // be sent to any output there.
+            if (r == 1) juce::Process::openDocument ("ms-settings:apps-volume", {});
+            if (r == 2) safe->showToast ("Web/Lib: the fader and mute set web pages and the LIBRARY preview; the output picks where the "
+                                         "LIBRARY preview plays. Web pages play through the system's sound device.");
+        });
+    }
+
+    /** How many device outputs are open right now. */
+    int outputCount() const
+    {
+        if (auto* device = deviceManager.getCurrentAudioDevice())
+            return device->getActiveOutputChannels().countNumberOfSetBits();
+        return 0;
+    }
+
+    /** Can this route be heard on the current device? */
+    bool routeAvailable (int code) const
+    {
+        const int n = outputCount();
+        if (ezdeck::isMonoOutputRoute (code)) return code - ezdeck::kMonoRouteBase < n;
+        const int pair = ezdeck::outputTargetFor (code).pair;
+        return pair == 0 || 2 * pair + 1 < n;
+    }
+
+    void announceRoute (const juce::String& who, int code)
+    {
+        if (code == 0) return;
+        const auto label = MixerChannelStrip::routeLabel (code);
+        if (! routeAvailable (code))
+            showToast (who + ": \"" + label + "\" isn't on this audio device (it has " + juce::String (outputCount())
+                       + " outputs) -- playing through Main until it is");
+        else if (ezdeck::outputTargetFor (code).pair == 0)
+            showToast (who + ": " + label + " -- through Master");
+        else
+            showToast (who + ": " + label + " -- direct to hardware, bypasses Master");
+    }
+
+    /** Every output menu lists what the connected device actually has. */
+    void refreshOutputChoices()
+    {
+        juce::StringArray names;
+        if (auto* device = deviceManager.getCurrentAudioDevice())
+        {
+            const auto all    = device->getOutputChannelNames();
+            const auto active = device->getActiveOutputChannels();
+            // the engine's buffer holds the OPEN outputs in order (Out 1, 2, ...)
+            for (int c = 0; c < all.size() && active[c]; ++c) names.add (all[c]);
+        }
+        for (auto* s : mixerStrips) s->setOutputChoices (names);
+        if (webStrip != nullptr) webStrip->setOutputChoices (names);
     }
 
     /** Remembers the current driver/device/rate/buffer for the next launch. */
@@ -8917,38 +9116,13 @@ public:
     // the constructor guarantees at least a stereo pair is open). Read
     // fresh from the device each call rather than cached, since the owner
     // can change audio devices at any time via the Settings > Audio tab.
+    // An odd last output (Out 5 of a 5-output box) gets a pair of its own,
+    // whose missing second side goes nowhere, so a mono route can reach it.
     int pairCount() const
     {
-        if (auto* device = deviceManager.getCurrentAudioDevice())
-            return juce::jmax (1, device->getActiveOutputChannels().countNumberOfSetBits() / 2);
-        return 1;
+        return juce::jmax (1, (outputCount() + 1) / 2);
     }
 
-    // SPEC_OUTPUT_ROUTING.md: maps MixerChannelStrip's own existing route
-    // vocabulary (kOutputRoutes: "Main", "Output 1".."Output 4", "Custom
-    // Bus" -- indices 0-5) onto a real output pair. "Main" is pair 0 by
-    // definition; "Output N" is pair N (so "Output 1" reaches Out 3/4, the
-    // device's SECOND pair, matching this app's existing "Main already
-    // covers Out 1/2" framing). "Custom Bus" (index 5) has no engine-level
-    // bus concept in this mixer (SPEC_OUTPUT_ROUTING.md's own option (a),
-    // "probably later" for that fuller model) -- falls back to pair 0,
-    // same honest-gap treatment Phase 1.1 P3's own toast already used for
-    // "not real yet," not silently pretended to work.
-    //
-    // A pair beyond what pairCount() reports right now (e.g. a saved
-    // "Output 3" on a now-stereo device) is NOT re-clamped here -- it's
-    // passed straight to Mixer::setChannelOutputPair(), which stores
-    // whatever's given, and Mixer::mixDown() re-clamps against the
-    // CURRENT pairCount() every single block. That's deliberate: if the
-    // owner reconnects the real interface later, the stored routing
-    // becomes live again automatically, with no need to re-select it.
-    // Selector index N == output pair N, one to one. Index 0 is Main
-    // (hardware Out 1/2, through Master); 1..11 are Out 3/4 .. Out 23/24,
-    // direct to hardware. Anything else clamps to Main.
-    static int routeIndexToOutputPair (int routeIndex)
-    {
-        return (routeIndex >= 1 && routeIndex < ezproject::MixerChannelSnapshot::kMaxOutputRoutes) ? routeIndex : 0;
-    }
 
     // Phase 1.1 P1: is it safe to mutate this deck's audio-thread-visible
     // state (Deck::mode, a layer's buffers/region/trim, seeking, etc.) right
@@ -9076,6 +9250,8 @@ public:
         actionRegistry.setAction (ActionId::CancelJump,   [this] { cancelJump(); });
         actionRegistry.setAction (ActionId::LoopSection,  [this] { toggleLoopSection(); });
         actionRegistry.setAction (ActionId::CountInPlay,  [this] { playWithCountIn(); });
+        actionRegistry.setAction (ActionId::TempoUp,      [this] { nudgeTempo (1.0); });
+        actionRegistry.setAction (ActionId::TempoDown,    [this] { nudgeTempo (-1.0); });
         actionRegistry.setAction (ActionId::TogglePlaybackView, [this]
         {
             activeNavIndex = (activeNavIndex == kNavPlayback) ? 0 : kNavPlayback;
@@ -9141,6 +9317,17 @@ public:
         {
             userTriggeredSave();
             return true;
+        }
+
+        // Undo / redo: Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z (Cmd on a Mac)
+        {
+            const auto cmd = juce::ModifierKeys::commandModifier;
+            const auto shiftCmd = cmd | juce::ModifierKeys::shiftModifier;
+            if (key == juce::KeyPress ('z', shiftCmd, 0) || key == juce::KeyPress ('Z', shiftCmd, 0)
+                 || key == juce::KeyPress ('y', cmd, 0) || key == juce::KeyPress ('Y', cmd, 0))
+            { redo(); return true; }
+            if (key == juce::KeyPress ('z', cmd, 0) || key == juce::KeyPress ('Z', cmd, 0))
+            { undo(); return true; }
         }
 
         // Owner: popular shortcuts to open the views and the docks (Ctrl on
@@ -9369,11 +9556,23 @@ public:
     // never a second, parallel implementation just because this dialog is a
     // different entry point (ENGINEERING_PRINCIPLES.md's "one path for a
     // state change").
-    void showSettingsPanel()
+    void showSettingsPanel (int initialTab = 0)
     {
+        if (settingsDialog != nullptr) delete settingsDialog.getComponent();   // reopened on the tab asked for
+
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        auto* plugins = new ezplugins::ManagerTab (pluginLibrary, {
+            [safe] (bool everything) { if (safe != nullptr) safe->startPluginScan (everything); },
+            [safe] { return safe != nullptr && safe->pluginScanWindow != nullptr; },
+            [safe] { if (safe != nullptr) if (auto* s = getAppSettings()) safe->pluginLibrary.saveTo (*s); } });
+
         auto* content = new SettingsPanelContent (metronomeEnabled, tempoLockEnabled, padBank.exclusive, deviceManager,
                                                    keyBindings, [] {}, *midiRouter, openMidiDeviceNames,
-                                                   [this] (float g) { mixer.setMasterGain (g); });
+                                                   [this] (float g) { mixer.setMasterGain (g); },
+                                                   plugins, initialTab,
+                                                   new ezclick::MetronomeTab (clickParams, countInParams,
+                                                       [safe] { if (safe != nullptr) if (auto* s = getAppSettings()) ezclick::saveSettings (*s, safe->clickParams, safe->countInParams); },
+                                                       [safe] { if (safe != nullptr) safe->previewClickSound(); }));
         content->general().onMetronomeChanged = [this] (bool enabled)
         {
             metronomeEnabled = enabled;
@@ -9393,7 +9592,7 @@ public:
         options.escapeKeyTriggersCloseButton = true;
         options.useNativeTitleBar = true;
         options.resizable = false;
-        options.launchAsync();
+        settingsDialog = options.launchAsync();
     }
 
     // UI_SPEC_MIXER.md §3.1/§3.3: recomputes, for every real channel, whether
@@ -9881,6 +10080,7 @@ public:
         snap.settings.tempoLockEnabled = tempoLockEnabled;
         snap.settings.webGain          = webGain;
         snap.settings.webMute          = webMute;
+        snap.settings.webRoute         = webRoute;
 
         snap.masterTempoBpm  = masterTempo.bpm;
         snap.viewedSignature = viewedSignature;
@@ -9931,6 +10131,7 @@ public:
                 }
                 ds.arrangementLengthBars = a.lengthBars;
                 ds.endBehaviour = (int) a.atEnd;
+                ds.endFadeSeconds = a.endFadeSeconds;
                 ds.countInBars = a.countInBars;
                 ds.guideClick  = a.guideClick;
                 ds.guideCues   = a.guideCues;
@@ -10033,7 +10234,9 @@ public:
         metronomeEnabled = snap.settings.metronomeEnabled;
         webGain = snap.settings.webGain;
         webMute = snap.settings.webMute;
-        if (webStrip != nullptr) { webStrip->setGainValue (webGain); webStrip->setMuteState (webMute); }
+        webRoute = snap.settings.webRoute;
+        libraryPreview.route.store (webRoute, std::memory_order_relaxed);
+        if (webStrip != nullptr) { webStrip->setGainValue (webGain); webStrip->setMuteState (webMute); webStrip->setOutputRoute (webRoute); }
         pushWebLevel();
         for (int t = 0; t < ezdeck::kNumLiveTracks; ++t)
         {
@@ -10080,12 +10283,12 @@ public:
             mixer.setChannelMute (channel, ch.mute);
             mixer.setChannelSolo (channel, ch.solo);
             channelOutputRoute[(size_t) c] = ch.outputRoute;
-            if (c < mixerStrips.size()) mixerStrips[c]->setOutputRouteIndex (ch.outputRoute);
+            if (c < mixerStrips.size()) mixerStrips[c]->setOutputRoute (ch.outputRoute);
             // SPEC_OUTPUT_ROUTING.md: restores the LIVE routing too, not
             // just the stored index/UI display -- a project reloaded with
             // Metro routed to Output 1 should still reach Output 1 without
             // the owner having to re-pick it from the dropdown.
-            mixer.setChannelOutputPair (channel, routeIndexToOutputPair (ch.outputRoute));
+            mixer.setChannelOutputRoute (channel, ch.outputRoute);
         }
         // a saved mute on a live track would leave the mic silent with its
         // channel strip's meter still moving -- see ensureChannelAudible()
@@ -10159,7 +10362,8 @@ public:
                 }
                 a.sortSections();
                 a.lengthBars  = ds.arrangementLengthBars;
-                a.atEnd       = (ezarr::EndBehaviour) juce::jlimit (0, 2, ds.endBehaviour);
+                a.atEnd       = (ezarr::EndBehaviour) juce::jlimit (0, 5, ds.endBehaviour);
+                a.endFadeSeconds = juce::jlimit (1, 4, ds.endFadeSeconds);
                 a.countInBars = ds.countInBars;
                 a.guideClick  = ds.guideClick;
                 a.guideCues   = ds.guideCues;
@@ -10240,6 +10444,287 @@ public:
 
         refreshSlotLabels();
         rebuildGuideSchedule();   // the loaded setlist song's click and cues, before Play is ever pressed
+        resetUndoHistory();       // a project just opened: nothing before it to undo
+    }
+
+    //== undo / redo for PERFORM and PLAYBACK =====================================
+    // Owner: "let's have undo and redo for the PERFORM and PLAYBACK windows...
+    // don't make it big, just symbols."
+    //
+    // Rather than every edit remembering to register itself, the app watches
+    // its own editable state a few times a second: when it changed (and no
+    // mouse button is held -- a drag is one edit), the state before the change
+    // goes on the undo list. Undo puts back only what differs, reloading audio
+    // only for layers whose file changed, and never touches the audio of a row
+    // that is playing.
+
+    struct UndoLayer
+    {
+        bool loaded { false }, enabled { true }, trimmed { false }, colourSet { false };
+        juce::String path, assetId, name;
+        float gain { 1.0f };
+        int regionStart { 0 }, regionLength { 0 }, fadeIn { 0 }, fadeOut { 0 }, linkedPad { -1 };
+        juce::uint32 colour { 0 };
+    };
+
+    struct UndoRow
+    {
+        int mode { 0 }, endBehavior { 0 };
+        double sourceBpm { 0.0 }, playAtBpm { 0.0 };
+        juce::String meter, name, notes, tags, clickPath, guidePath;
+        bool colourSet { false }, useClick { true }, useGuide { true };
+        juce::uint32 colour { 0 };
+        ezarr::Arrangement arrangement;
+        std::array<UndoLayer, ezdeck::kNumLayers> layers;
+    };
+
+    struct UndoState
+    {
+        std::array<UndoRow, kNumDecks> rows;
+        std::vector<int> setlist;
+        int jumpMode { 1 };
+        juce::String key;   // everything above as text: equal keys = the same state
+    };
+
+    std::vector<UndoState> undoStack, redoStack;
+    UndoState undoCurrent;
+    bool undoHaveBaseline { false };
+    int  undoTick { 0 };
+    static constexpr size_t kMaxUndo = 50;
+
+    UndoState captureUndoState() const
+    {
+        UndoState s;
+        juce::String k;
+        k.preallocateBytes (16000);
+        for (int d = 0; d < kNumDecks; ++d)
+        {
+            auto& r = s.rows[(size_t) d];
+            const auto& deck = session.decks[(size_t) d];
+            r.mode = (int) deck.mode;
+            r.endBehavior = (int) deck.stemEndBehavior;
+            r.sourceBpm = deckSourceBpm[(size_t) d].value_or (0.0);
+            r.playAtBpm = deckTempoOverride[(size_t) d].value_or (0.0);
+            r.meter = rowMeter[(size_t) d];
+            r.name = rowName[(size_t) d];
+            r.notes = rowNotes[(size_t) d];
+            r.tags = rowTags[(size_t) d];
+            r.colourSet = rowColourSet[(size_t) d];
+            r.colour = rowColourArgb[(size_t) d];
+            r.clickPath = songClickTrack[(size_t) d] != nullptr ? songClickTrack[(size_t) d]->filePath : juce::String();
+            r.guidePath = songGuideTrack[(size_t) d] != nullptr ? songGuideTrack[(size_t) d]->filePath : juce::String();
+            r.useClick = useSongClick[(size_t) d];
+            r.useGuide = useSongGuide[(size_t) d];
+            r.arrangement = arrangements[(size_t) d];
+
+            k << d << '|' << r.mode << r.endBehavior << '|' << r.sourceBpm << '|' << r.playAtBpm << '|' << r.meter << '|' << r.name
+              << '|' << r.notes << '|' << r.tags << '|' << (int) r.colourSet << (juce::int64) r.colour << '|' << r.clickPath << '|' << r.guidePath
+              << (int) r.useClick << (int) r.useGuide;
+            const auto& a = r.arrangement;
+            k << '[' << (int) a.atEnd << a.endFadeSeconds << a.countInBars << (int) a.guideClick << (int) a.guideCues << a.cueLeadBars << (int) a.cueCounts;
+            for (const auto& sec : a.sections)
+                k << '{' << juce::String (sec.name) << ',' << sec.startBar << ',' << (juce::int64) sec.colourArgb << (int) sec.skip << (int) sec.optional
+                  << (int) sec.loopOnEntry << (int) sec.pauseAfter << juce::String (sec.cue) << '}';
+            k << ']';
+
+            for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            {
+                auto& u = r.layers[(size_t) l];
+                const auto& layer = deck.layers[(size_t) l];
+                u.loaded = layer.loaded;
+                u.path = layer.loaded ? layerFilePaths[(size_t) d][(size_t) l] : juce::String();
+                u.assetId = layerAssetIds[(size_t) d][(size_t) l];
+                u.enabled = layer.enabled;
+                u.gain = layer.gain;
+                u.regionStart = layer.regionStart;
+                u.regionLength = layer.regionLength;
+                u.fadeIn = layer.fadeInSamples;
+                u.fadeOut = layer.fadeOutSamples;
+                u.trimmed = layer.trimmed;
+                u.name = layerNameOverride[(size_t) d][(size_t) l];
+                u.colourSet = layerColourSet[(size_t) d][(size_t) l];
+                u.colour = layerColourArgb[(size_t) d][(size_t) l];
+                u.linkedPad = layerLinkedPad[(size_t) d][(size_t) l];
+                if (! u.loaded && u.name.isEmpty() && ! u.colourSet && u.linkedPad < 0) continue;
+                // a loop's region follows its tempo on its own; only a region the
+                // person trimmed is an edit
+                k << '<' << l << (int) u.loaded << u.path << '|' << (int) u.enabled << (double) u.gain << ',';
+                if (u.trimmed) k << u.regionStart << ',' << u.regionLength << ',';
+                k << u.fadeIn << ',' << u.fadeOut << (int) u.trimmed << u.name << '|' << (int) u.colourSet << (juce::int64) u.colour << ',' << u.linkedPad << '>';
+            }
+            k << '\n';
+        }
+        s.setlist = setlist;
+        s.jumpMode = jumpModeValue;
+        k << "setlist";
+        for (int i : s.setlist) k << ',' << i;
+        k << '|' << s.jumpMode;
+        s.key = k;
+        return s;
+    }
+
+    /** A fresh start (a project opened, a new project): nothing to undo. */
+    void resetUndoHistory()
+    {
+        undoStack.clear();
+        redoStack.clear();
+        undoHaveBaseline = false;
+    }
+
+    /** UI timer: an edit happened since the last look? Remember what was before. */
+    void watchForEdits()
+    {
+        if (juce::ModifierKeys::currentModifiers.isAnyMouseButtonDown()) return;   // mid-drag: one edit when it ends
+        auto now = captureUndoState();
+        if (! undoHaveBaseline) { undoCurrent = std::move (now); undoHaveBaseline = true; return; }
+        if (now.key == undoCurrent.key) return;
+        undoStack.push_back (std::move (undoCurrent));
+        if (undoStack.size() > kMaxUndo) undoStack.erase (undoStack.begin());
+        redoStack.clear();
+        undoCurrent = std::move (now);
+        refreshUndoButtons();
+    }
+
+    bool canUndo() const override { return ! undoStack.empty(); }
+    bool canRedo() const override { return ! redoStack.empty(); }
+
+    void undo() override
+    {
+        watchForEdits();   // an edit made just now is part of the history first
+        if (undoStack.empty()) { showToast ("Nothing to undo"); return; }
+        auto target = std::move (undoStack.back());
+        undoStack.pop_back();
+        redoStack.push_back (captureUndoState());
+        restoreUndoState (target);
+        undoCurrent = captureUndoState();
+        refreshUndoButtons();
+    }
+
+    void redo() override
+    {
+        watchForEdits();
+        if (redoStack.empty()) { showToast ("Nothing to redo"); return; }
+        auto target = std::move (redoStack.back());
+        redoStack.pop_back();
+        undoStack.push_back (captureUndoState());
+        restoreUndoState (target);
+        undoCurrent = captureUndoState();
+        refreshUndoButtons();
+    }
+
+    void refreshUndoButtons()
+    {
+        undoButtonPerform.setEnabled (canUndo());
+        redoButtonPerform.setEnabled (canRedo());
+        if (playbackView) playbackView->repaint();
+    }
+
+    void restoreUndoState (const UndoState& s)
+    {
+        bool blocked = false;
+        for (int d = 0; d < kNumDecks; ++d)
+        {
+            const auto& r = s.rows[(size_t) d];
+            auto& deck = session.decks[(size_t) d];
+            const bool canChange = canMutateDeckState (d);
+
+            bool filesDiffer = false;
+            for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            {
+                const auto& u = r.layers[(size_t) l];
+                const bool loaded = deck.layers[(size_t) l].loaded;
+                if (u.loaded != loaded || (loaded && u.path != layerFilePaths[(size_t) d][(size_t) l])) filesDiffer = true;
+            }
+            const auto nowClick = songClickTrack[(size_t) d] != nullptr ? songClickTrack[(size_t) d]->filePath : juce::String();
+            const auto nowGuide = songGuideTrack[(size_t) d] != nullptr ? songGuideTrack[(size_t) d]->filePath : juce::String();
+            const bool tracksDiffer = nowClick != r.clickPath || nowGuide != r.guidePath;
+            if ((filesDiffer || tracksDiffer || (int) deck.mode != r.mode) && ! canChange) blocked = true;
+
+            // the row's tempo and mode first: loading a layer reads both
+            const bool tempoChanged = deckSourceBpm[(size_t) d].value_or (0.0) != r.sourceBpm
+                                   || deckTempoOverride[(size_t) d].value_or (0.0) != r.playAtBpm;
+            if (r.sourceBpm > 0.0) deckSourceBpm[(size_t) d] = r.sourceBpm; else deckSourceBpm[(size_t) d].reset();
+            if (r.playAtBpm > 0.0) deckTempoOverride[(size_t) d] = r.playAtBpm; else deckTempoOverride[(size_t) d].reset();
+            if (rowMeter[(size_t) d] != r.meter) setRowMeter (d, r.meter, true);
+            if (canChange)
+            {
+                deck.mode = (ezdeck::DeckMode) r.mode;
+                deck.stemEndBehavior = (ezdeck::StemEndBehavior) r.endBehavior;
+            }
+
+            for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            {
+                const auto& u = r.layers[(size_t) l];
+                auto& layer = deck.layers[(size_t) l];
+                if (canChange && (u.loaded != layer.loaded || (u.loaded && u.path != layerFilePaths[(size_t) d][(size_t) l])))
+                {
+                    clearLayer (d, l);
+                    if (u.loaded && u.path.isNotEmpty() && ! ezlibrary::isRemotePath (u.path))
+                    {
+                        loadLayer (d, l, juce::File (u.path));
+                        layerAssetIds[(size_t) d][(size_t) l] = u.assetId;
+                    }
+                }
+                if (layer.loaded)
+                {
+                    layer.enabled = u.enabled;
+                    layer.gain = u.gain;
+                    if (canChange)
+                    {
+                        layer.regionStart = u.regionStart;
+                        layer.regionLength = u.regionLength;
+                        layer.fadeInSamples = u.fadeIn;
+                        layer.fadeOutSamples = u.fadeOut;
+                        layer.trimmed = u.trimmed;
+                    }
+                }
+                layerNameOverride[(size_t) d][(size_t) l] = u.name;
+                layerColourSet[(size_t) d][(size_t) l] = u.colourSet;
+                layerColourArgb[(size_t) d][(size_t) l] = u.colour;
+                layerLinkedPad[(size_t) d][(size_t) l] = u.linkedPad;
+            }
+
+            if (canChange && tracksDiffer)
+                for (bool isGuide : { false, true })
+                {
+                    const auto& want = isGuide ? r.guidePath : r.clickPath;
+                    const auto& have = isGuide ? nowGuide : nowClick;
+                    if (want == have) continue;
+                    if (want.isEmpty()) clearSongTrack (d, isGuide, true);
+                    else if (! ezlibrary::isRemotePath (want)) loadSongTrack (d, isGuide, juce::File (want), true);
+                }
+            useSongClick[(size_t) d] = r.useClick;
+            useSongGuide[(size_t) d] = r.useGuide;
+
+            rowName[(size_t) d] = r.name;
+            rowNotes[(size_t) d] = r.notes;
+            rowTags[(size_t) d] = r.tags;
+            rowColourSet[(size_t) d] = r.colourSet;
+            rowColourArgb[(size_t) d] = r.colour;
+
+            const int keepLength = arrangements[(size_t) d].lengthBars;
+            arrangements[(size_t) d] = r.arrangement;
+            arrangements[(size_t) d].lengthBars = keepLength;
+
+            if (tempoChanged || filesDiffer)
+            {
+                applyDeckSourceTempo (d);
+                reWarpDeckToEffectiveTempo (d);
+            }
+        }
+
+        setlist = s.setlist;
+        if (setlistPos >= (int) setlist.size()) setlistPos = setlist.empty() ? -1 : (int) setlist.size() - 1;
+        jumpModeValue = s.jumpMode;
+        lastSectionIdx = -1;
+
+        refreshSlotLabels();
+        refreshDeckPanelChrome();
+        refreshColumnHeaders();
+        rebuildGuideSchedule();
+        if (playbackView) playbackView->songChanged();
+        repaint();
+        if (blocked) showToast ("Undone -- except audio changes on a row that is playing (stop it and undo again)");
     }
 
     void loadProjectFile()
@@ -10375,8 +10860,8 @@ public:
             mixer.setChannelMute (channel, false);
             mixer.setChannelSolo (channel, false);
             channelOutputRoute[(size_t) c] = 0;
-            mixer.setChannelOutputPair (channel, 0);
-            if (c < mixerStrips.size()) mixerStrips[c]->setOutputRouteIndex (0);
+            mixer.setChannelOutputRoute (channel, 0);
+            if (c < mixerStrips.size()) mixerStrips[c]->setOutputRoute (0);
         }
         mixer.setMasterGain (1.0f);
         refreshMixerSoloVisuals();
@@ -10413,6 +10898,7 @@ public:
     void newProject()
     {
         resetSessionToBlank();
+        resetUndoHistory();
         auto folder = currentProjectFile.getParentDirectory();
         currentProjectFile = folder.getNonexistentChildFile ("Untitled Project", ".perform", false);
         refreshProjectMenu();
@@ -11016,6 +11502,7 @@ public:
         performScroll.setVisible   (activeNavIndex == 0);
         storeView.setVisible       (activeNavIndex == 4);
         playbackHolder.setVisible  (activeNavIndex == kNavPlayback);
+        browserHolder.setVisible   (activeNavIndex == kNavBrowser);
         // Phase 1.1 P2/P3: LIBRARY and MIXER are docked panels now,
         // independent of activeNavIndex -- see DockHeaderBar's own comment
         // and the LIBRARY/MIXER nav buttons' own onClick above. Either can
@@ -11024,6 +11511,13 @@ public:
         // one of the two is open at once (one shared dock slot).
         libraryView.setVisible (libraryDockOpen);
         if (libraryDockOpen) libraryView.toFront (false);
+        // Owner: "when I close the library, auto stop any audio playing from there."
+        if (! libraryDockOpen && previewIsFromLibrary && isLibraryPreviewActive())
+        {
+            stopLibraryPreview();
+            previewIsFromLibrary = false;
+            if (libraryTab != nullptr) libraryTab->repaint();
+        }
         mixerView.setVisible (mixerDockOpen);
         if (mixerDockOpen) mixerView.toFront (false);
         editorView.setVisible (editorDockOpen);
@@ -11034,6 +11528,7 @@ public:
             juce::Component* shown = activeNavIndex == 0 ? static_cast<juce::Component*> (&performScroll)
                                     : activeNavIndex == 4 ? static_cast<juce::Component*> (&storeView)
                                     : activeNavIndex == kNavPlayback ? static_cast<juce::Component*> (&playbackHolder)
+                                    : activeNavIndex == kNavBrowser  ? static_cast<juce::Component*> (&browserHolder)
                                                            : nullptr;
             if (shown != nullptr)
             {
@@ -11055,7 +11550,8 @@ public:
         shutdownAudio();
         // PX-D: editors before instances, instances after the audio is stopped
         for (auto& w : instrumentWindows) w = nullptr;
-        pluginListWindow = nullptr;
+        pluginScanWindow = nullptr;   // stops a running scan before the plugin library goes
+        if (settingsDialog != nullptr) delete settingsDialog.getComponent();   // its Plugins tab uses the library
         for (auto& s : instruments) { s.clear(); s.collectRetired(); }
         for (auto& w : stripWindows) w = nullptr;   // editors before their processors
     }
@@ -11365,6 +11861,15 @@ public:
     {
         auto file = ezlibrary::resolveAssetOrPath (libraryManager, assetId, juce::String());
         if (! file.existsAsFile()) { showToast ("Could not resolve that Library item"); return; }
+
+        // a LIBRARY loop onto an empty row: the same questions, with the tempo
+        // LIBRARY already worked out offered first
+        if (! rowHasOtherLayers (flat, l))
+        {
+            const auto entry = libraryManager.findById (assetId);
+            askAboutLoop (flat, l, file, assetId, entry.has_value() ? entry->detectedBpm : 0.0);
+            return;
+        }
 
         clearLayer (flat, l);
         loadLayer (flat, l, file);
@@ -12020,6 +12525,110 @@ public:
     // existing "Clear deck tempo" convention) while mutation isn't safe,
     // and the handler re-checks again at click time (the menu is
     // asynchronous, so state could change between showing it and the click).
+    // ---- a single loop on a row ----------------------------------------------
+
+    bool rowHasOtherLayers (int flat, int exceptLayer) const
+    {
+        const auto& deck = session.decks[(size_t) flat];
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            if (l != exceptLayer && deck.layers[(size_t) l].loaded) return true;
+        return false;
+    }
+
+    /** The file whose beat best tells the row's tempo: drums or percussion if
+        the row has them, else its first loaded layer. */
+    juce::File rowTempoSourceFile (int flat) const
+    {
+        juce::File first;
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+        {
+            if (! session.decks[(size_t) flat].layers[(size_t) l].loaded) continue;
+            const juce::File f (layerFilePaths[(size_t) flat][(size_t) l]);
+            if (! f.existsAsFile()) continue;
+            const auto name = f.getFileNameWithoutExtension().toLowerCase();
+            if (name.contains ("drum") || name.contains ("perc") || name.contains ("loop") || name.contains ("beat")) return f;
+            if (first == juce::File()) first = f;
+        }
+        return first;
+    }
+
+    /** Asks what a single loop is (LoopTempo.h) and then puts it on the row. */
+    void askAboutLoop (int flat, int l, const juce::File& file, const juce::String& assetId, double libraryBpm)
+    {
+        double hint = 0.0;
+        juce::String source;
+        if (const double named = ezcue::tempoFromName (file.getFullPathName().toStdString()); named > 0.0) { hint = named; source = "the file name"; }
+        else if (libraryBpm > 0.0) { hint = libraryBpm; source = "the LIBRARY"; }
+        if (hint <= 0.0)
+            if (std::unique_ptr<juce::AudioFormatReader> reader { formatManager.createReaderFor (file) })
+                if (const double tagged = embeddedTempoFrom (*reader); tagged > 0.0) { hint = tagged; source = "the file's tag"; }
+
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        ezloop::showLoopDialog (file, deckLabel (flat), hint, source, masterTempo.bpm,
+            [safe, flat, l, file, assetId] (ezloop::LoopDialog::Choice c)
+            {
+                if (safe != nullptr) safe->addLoopToRow (flat, l, file, c, assetId);
+            });
+    }
+
+    void addLoopToRow (int flat, int l, const juce::File& file, const ezloop::LoopDialog::Choice& c, const juce::String& assetId)
+    {
+        if (! canMutateDeckState (flat)) { showToast (deckLabel (flat) + ": stop this row first to load into it"); return; }
+
+        auto& deck = session.decks[(size_t) flat];
+        deck.mode = c.repeats ? ezdeck::DeckMode::loop : ezdeck::DeckMode::stem;
+        deckBufferBpm[(size_t) flat] = 0.0;   // freshly loaded: as recorded
+        if (c.bpm > 0.0) deckSourceBpm[(size_t) flat] = juce::jlimit (20.0, 400.0, c.bpm);
+        else deckSourceBpm[(size_t) flat].reset();
+        if (c.playAtSongTempo && c.bpm > 0.0) deckTempoOverride[(size_t) flat] = masterTempo.bpm;
+        else deckTempoOverride[(size_t) flat].reset();
+
+        clearLayer (flat, l);
+        loadLayer (flat, l, file);   // loop mode cuts the loop to whole bars of the tempo set above
+        if (assetId.isNotEmpty()) layerAssetIds[(size_t) flat][(size_t) l] = assetId;
+        applyDeckSourceTempo (flat);
+        reWarpDeckToEffectiveTempo (flat);
+        refreshSlotLabels();
+        refreshDeckPanelChrome();
+
+        juce::String msg = deckLabel (flat) + ": " + file.getFileName() + (c.repeats ? " loops" : " plays once");
+        if (c.bpm > 0.0) msg += ", " + juce::String (c.bpm, 1) + " BPM";
+        if (deckTempoOverride[(size_t) flat].has_value()) msg += ", playing at " + juce::String (*deckTempoOverride[(size_t) flat], 1);
+        showToast (msg);
+        repaint();
+    }
+
+    /** Row menu > Detect tempo: listens to the row and sets its original tempo. */
+    void detectRowTempo (int deckIdx)
+    {
+        const auto file = rowTempoSourceFile (deckIdx);
+        if (! file.existsAsFile()) { showToast (deckLabel (deckIdx) + ": load audio into this row first"); return; }
+        showToast (deckLabel (deckIdx) + ": listening to " + file.getFileName() + "...");
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        ezloop::detectFileTempo (file, [safe, deckIdx] (eztempo::Result r)
+        {
+            if (safe == nullptr) return;
+            if (r.bpm <= 0.0) { safe->showToast (safe->deckLabel (deckIdx) + ": no steady beat heard -- set the tempo in Tempo & time signature"); return; }
+            safe->setRowOriginalTempo (deckIdx, r.bpm);
+            safe->showToast (safe->deckLabel (deckIdx) + ": " + (r.confidence >= 0.35 ? "heard " : "probably ") + juce::String (r.bpm, 1)
+                             + " BPM -- Tempo & time signature to halve, double or tap it");
+        });
+    }
+
+    /** Sets a row's original tempo; buffers still at the old original are only relabelled. */
+    void setRowOriginalTempo (int deckIdx, double bpm)
+    {
+        const double v = juce::jlimit (1.0, 999.0, bpm);
+        if (deckBufferBpm[(size_t) deckIdx] > 0.0
+             && deckSourceBpm[(size_t) deckIdx].has_value()
+             && std::abs (deckBufferBpm[(size_t) deckIdx] - *deckSourceBpm[(size_t) deckIdx]) < 0.01)
+            deckBufferBpm[(size_t) deckIdx] = v;
+        deckSourceBpm[(size_t) deckIdx] = v;
+        applyDeckSourceTempo (deckIdx);
+        reWarpDeckToEffectiveTempo (deckIdx);
+        repaint();
+    }
+
     void showDeckTempoMenu (int deckIdx)
     {
         auto& deck = session.decks[(size_t) deckIdx];
@@ -12046,6 +12655,7 @@ public:
                             ? "Tempo & time signature... (" + rowMeterName (deckIdx) + ", original " + juce::String (*deckSourceBpm[(size_t) deckIdx], 1) + " BPM)"
                             : "Tempo & time signature... (" + rowMeterName (deckIdx) + ", original not set)");
         menu.addItem (2, "Play as recorded (clear play-at tempo)", deckTempoOverride[(size_t) deckIdx].has_value());
+        menu.addItem (14, "Detect tempo", rowTempoSourceFile (deckIdx).existsAsFile());
         menu.addSeparator();
         menu.addItem (12, "Load stems into this row...", canChangeMode);
         menu.addItem (13, "Click & guide tracks...");
@@ -12078,6 +12688,7 @@ public:
             switch (result)
             {
                 case 1: promptSetDeckTempo (deckIdx); return;
+                case 14: detectRowTempo (deckIdx); return;
                 case 2:
                     deckTempoOverride[(size_t) deckIdx].reset();
                     applyDeckSourceTempo (deckIdx);
@@ -12206,13 +12817,17 @@ public:
     void promptSetDeckTempo (int deckIdx)
     {
         auto* aw = new juce::AlertWindow (deckLabel (deckIdx) + ": Tempo & time signature",
-                                           "Original is the tempo the stems were recorded at - the app never guesses it. "
-                                           "Play at stretches every stem together; leave it empty to play as recorded. "
-                                           "Time signature is how many beats make a bar in this song.",
+                                           "Original is the tempo the audio was recorded at: type it, Detect it from the row's "
+                                           "audio, or Tap along. Play at stretches every stem together; leave it empty to play "
+                                           "as recorded. Time signature is how many beats make a bar in this song.",
                                            juce::MessageBoxIconType::NoIcon);
         const auto& original = deckSourceBpm[(size_t) deckIdx];
         const auto& playAt   = deckTempoOverride[(size_t) deckIdx];
-        aw->addTextEditor ("original", original.has_value() ? juce::String (*original, 1) : juce::String(), "Original tempo (BPM)");
+        aw->addTextBlock ("Original tempo (BPM)");
+        auto* originalField = new ezloop::TempoField();   // deleted in the callback, after the window
+        originalField->setFile (rowTempoSourceFile (deckIdx));
+        if (original.has_value()) originalField->setBpm (*original);
+        aw->addCustomComponent (originalField);
         aw->addTextEditor ("playAt", playAt.has_value() ? juce::String (*playAt, 1) : juce::String(), "Play at (BPM) - optional");
         {
             juce::StringArray meters;
@@ -12227,13 +12842,15 @@ public:
         aw->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
 
         aw->enterModalState (true, juce::ModalCallbackFunction::create (
-            [this, aw, deckIdx] (int result)
+            [this, aw, deckIdx, originalField] (int result)
             {
-                const juce::String originalText = aw->getTextEditorContents ("original").trim();
+                const double originalBpm        = originalField->getBpm();
+                const juce::String originalText = originalBpm > 0.0 ? juce::String (originalBpm, 2) : juce::String();
                 const juce::String playAtText   = aw->getTextEditorContents ("playAt").trim();
                 const int meterIndex            = aw->getComboBoxComponent ("meter")->getSelectedItemIndex();
                 const juce::String chosenMeter  = meterIndex <= 0 ? juce::String() : aw->getComboBoxComponent ("meter")->getText();
                 delete aw;
+                delete originalField;
                 if (result == 1 && chosenMeter != rowMeter[(size_t) deckIdx]) setRowMeter (deckIdx, chosenMeter);
                 if (result == 2) { readTempoFromRowClick (deckIdx); promptSetDeckTempo (deckIdx); return; }
                 if (result != 1) return;
@@ -12358,70 +12975,429 @@ public:
         if (! target.has_value()) target = *original;   // "play as recorded"
 
         const double from = deckBufferBpm[(size_t) deckIdx] > 0.0 ? deckBufferBpm[(size_t) deckIdx] : *original;
-        if (std::abs (*target - from) < 0.01) return;   // already there -- don't re-process the audio for nothing
+        if (std::abs (*target - from) < 0.01 && ! tempoRenderBusy (deckIdx)) return;   // already there
+        startTempoRender (deckIdx, *target, false);
+    }
 
-        auto& deck = session.decks[(size_t) deckIdx];
-        const bool needsSwapPrimitive = session.isDeckAudible (deckIdx);
-        const bool isTrueActiveDeck   = (session.activeDeck() == deckIdx);
-        const bool stemMode = deck.mode == ezdeck::DeckMode::stem;
-        bool anyStaged = false, allApplied = true;
+    //== live tempo: + / -, and every re-stretch ==================================
+    // Owner: "I want to change the tempo on the fly: while a loop or stems are
+    // playing I press a plus button and the tempo goes up in the next bar."
+    //
+    // Every re-stretch (this, Tempo & time signature, TAP, LOCK) now:
+    //   - starts from the files on disk, never from audio that was already
+    //     stretched (which lost quality with every change);
+    //   - runs on a worker thread, so the app never freezes;
+    //   - uses Stretch.h for stems (no gaps, the whole song, every stem locked
+    //     to one plan) and the beat slicer for loops;
+    //   - lands, when the row is playing, on the next bar with the song
+    //     carrying on from the same place (Session::scheduleTempoChange); the
+    //     song's own click and guide change with it, in the same audio block.
 
+    struct TempoRender
+    {
+        int    deck { -1 };
+        int    generation { 0 };
+        double toBpm { 0.0 };
+        double scale { 1.0 };          // new buffer length / the length now playing (set when staged)
+        bool   stemMode { true };
+        bool   setsPlayAt { false };   // + / -: the row's play-at tempo becomes toBpm when it lands
+        std::array<juce::String, ezdeck::kNumLayers> files;
+        std::array<std::vector<float>, ezdeck::kNumLayers> left, right;
+        std::array<int, ezdeck::kNumLayers> region {};
+        std::array<bool, ezdeck::kNumLayers> done {};
+        std::shared_ptr<SongTrack> click, guide;
+    };
+
+    std::array<int, kNumDecks>    tempoGeneration {};   // bumped by every request; an older result is dropped
+    std::array<double, kNumDecks> requestedTempo {};    // what the row is heading for (0 = nothing in flight)
+    std::array<std::shared_ptr<std::atomic<int>>, kNumDecks> tempoGenerationShared;   // the worker's view of tempoGeneration
+    std::shared_ptr<TempoRender>  waitingTempoRender;   // ready while another change still waits for its bar
+    std::shared_ptr<TempoRender>  stagedTempoRender;    // staged for the audio thread
+    std::atomic<int>        stagedTempoDeck { -1 };
+    std::atomic<SongTrack*> stagedClickTrack { nullptr }, stagedGuideTrack { nullptr };
+    std::atomic<double>     stagedGuideSpb { 0.0 };
+    std::atomic<uint32_t>   audioSeenTempoChanges { 0 };   // written by the audio thread
+    uint32_t                uiSeenTempoChanges { 0 };
+
+    bool tempoRenderBusy (int d) const { return requestedTempo[(size_t) d] > 0.0; }
+
+    /** The row + and - act on: the one playing, else the cued song, else PERFORM's active row. */
+    int tempoTargetDeck() const
+    {
+        if (transportRunning.load()) return session.activeDeck();
+        if (const int s = currentSongDeck(); s >= 0) return s;
+        return session.activeDeck();
+    }
+
+    /** PLAYBACK's tempo readout: where a change is heading. */
+    double pendingTempoBpm() const override
+    {
+        const int d = tempoTargetDeck();
+        return d >= 0 && d < kNumDecks ? requestedTempo[(size_t) d] : 0.0;
+    }
+
+    /** + / -: the tempo moves by `delta` BPM -- at the next bar when playing. */
+    void nudgeTempo (double delta) override
+    {
+        const int d = tempoTargetDeck();
+        if (d < 0 || d >= kNumDecks) return;
+
+        bool anyLoaded = false;
+        for (const auto& layer : session.decks[(size_t) d].layers) anyLoaded = anyLoaded || layer.loaded;
+        if (! anyLoaded || ! deckSourceBpm[(size_t) d].has_value())
+        {
+            // nothing to stretch: the master tempo moves (the metronome follows it)
+            masterTempo.bpm = juce::jlimit (30.0, 300.0, std::round ((masterTempo.bpm + delta) * 10.0) / 10.0);
+            session.setTempo (masterTempo);
+            showToast ("Tempo " + juce::String (masterTempo.bpm, 1) + " BPM"
+                       + (anyLoaded ? juce::String (" -- set this row's original tempo (row menu > Detect tempo) so its audio follows")
+                                    : juce::String()));
+            repaint();
+            return;
+        }
+
+        const double current = requestedTempo[(size_t) d] > 0.0 ? requestedTempo[(size_t) d]
+                             : deckTempoOverride[(size_t) d].has_value() ? *deckTempoOverride[(size_t) d]
+                             : deckBufferBpm[(size_t) d] > 0.0 ? deckBufferBpm[(size_t) d]
+                             : *deckSourceBpm[(size_t) d];
+        const double target = juce::jlimit (30.0, 300.0, std::round ((current + delta) * 10.0) / 10.0);
+        if (std::abs (target - current) < 0.01) return;
+
+        startTempoRender (d, target, true);
+        showToast (deckLabel (d) + ": tempo " + juce::String (target, 1) + " BPM"
+                   + (transportRunning.load() && session.activeDeck() == d ? juce::String (" at the next bar") : juce::String()));
+        repaint();
+    }
+
+    void startTempoRender (int d, double toBpm, bool setsPlayAt)
+    {
+        const double original = deckSourceBpm[(size_t) d].value_or (0.0);
+        if (original <= 0.0 || toBpm <= 0.0) return;
+
+        auto job = std::make_shared<TempoRender>();
+        job->deck = d;
+        job->generation = ++tempoGeneration[(size_t) d];
+        job->toBpm = toBpm;
+        job->setsPlayAt = setsPlayAt;
+        job->stemMode = session.decks[(size_t) d].mode == ezdeck::DeckMode::stem;
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            if (session.decks[(size_t) d].layers[(size_t) l].loaded) job->files[(size_t) l] = layerFilePaths[(size_t) d][(size_t) l];
+        const juce::String clickPath = songClickTrack[(size_t) d] != nullptr ? songClickTrack[(size_t) d]->filePath : juce::String();
+        const juce::String guidePath = songGuideTrack[(size_t) d] != nullptr ? songGuideTrack[(size_t) d]->filePath : juce::String();
+
+        auto& shared = tempoGenerationShared[(size_t) d];
+        if (shared == nullptr) shared = std::make_shared<std::atomic<int>> (0);
+        shared->store (job->generation);
+        requestedTempo[(size_t) d] = toBpm;
+
+        juce::Component::SafePointer<SessionComponent> safe (this);
+        juce::Thread::launch ([job, original, clickPath, guidePath, shared, safe]
+        {
+            renderTempoJob (*job, original, clickPath, guidePath, *shared);
+            juce::MessageManager::callAsync ([safe, job] { if (safe != nullptr) safe->tempoRenderReady (job); });
+        });
+    }
+
+    /** Worker thread: the row's files, stretched from their recorded tempo to job.toBpm. */
+    static void renderTempoJob (TempoRender& job, double original, const juce::String& clickPath,
+                                const juce::String& guidePath, const std::atomic<int>& latest)
+    {
+        auto stale = [&] { return latest.load() != job.generation; };
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        const double scale = original / job.toBpm;
+
+        std::array<std::vector<float>, ezdeck::kNumLayers> inL, inR;
+        double rate = 0.0;
+        size_t longest = 0;
         for (int l = 0; l < ezdeck::kNumLayers; ++l)
         {
-            auto& layer = deck.layers[(size_t) l];
-            if (! layer.loaded) continue;
+            if (job.files[(size_t) l].isEmpty()) continue;
+            const juce::File file (job.files[(size_t) l]);
+            if (ezlibrary::isRemotePath (file.getFullPathName())) continue;
+            std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (file));
+            if (reader == nullptr) continue;
+            juce::String reason;
+            if (! eximport::readerGeometryIsSane (*reader, reason)) continue;
+            const int len = (int) reader->lengthInSamples;
+            if (len <= 0) continue;
+            const bool stereo = reader->numChannels > 1;
+            inL[(size_t) l].resize ((size_t) len);
+            if (stereo) inR[(size_t) l].resize ((size_t) len);
+            float* chans[2] { inL[(size_t) l].data(), stereo ? inR[(size_t) l].data() : nullptr };
+            juce::AudioBuffer<float> dest (chans, stereo ? 2 : 1, len);
+            reader->read (&dest, 0, len, 0, true, stereo);
+            if (rate <= 0.0) rate = reader->sampleRate;
+            longest = std::max (longest, (size_t) len);
+            if (stale()) return;
+        }
+        if (rate <= 0.0) return;
 
-            auto warped = ezdsp::reWarpLayer (layer.left, layer.right,
-                                               deckFileSampleRate[(size_t) deckIdx],
-                                               from, *target);
-            if (warped.left.empty()) { allApplied = false; continue; }   // defensive -- reWarpLayer's own no-op-on-bad-input guard
+        auto decode = [&fm] (const juce::String& path, std::vector<float>& mono, double& trackRate)
+        {
+            if (path.isEmpty()) return false;
+            std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (juce::File (path)));
+            if (reader == nullptr) return false;
+            juce::String reason;
+            if (! eximport::readerGeometryIsSane (*reader, reason)) return false;
+            const int len = (int) reader->lengthInSamples;
+            if (len <= 0) return false;
+            mono.assign ((size_t) len, 0.0f);
+            float* chans[1] { mono.data() };
+            juce::AudioBuffer<float> dest (chans, 1, len);
+            reader->read (&dest, 0, len, 0, true, false);
+            trackRate = reader->sampleRate;
+            return true;
+        };
+        auto makeTrack = [] (const juce::String& path, std::vector<float> mono, double trackRate)
+        {
+            auto t = std::make_shared<SongTrack>();
+            t->filePath = path;
+            t->rate = trackRate;
+            t->mono = std::move (mono);
+            return t;
+        };
 
-            // a stem plays its whole length; only loop mode wants the fitted region
-            const int region = stemMode ? 0 : warped.regionLength;
-
-            if (needsSwapPrimitive)
+        if (job.stemMode)
+        {
+            // one plan for the whole song, from a mix of every stem, so they stay locked
+            std::vector<float> mix (longest, 0.0f);
+            for (int l = 0; l < ezdeck::kNumLayers; ++l)
             {
-                // If a previously-staged swap for this layer hasn't been
-                // applied yet, stagePendingSwap() returns false and this
-                // request is dropped rather than overwriting an in-flight
-                // buffer (M4-T1's concurrent-request policy) -- the next
-                // triggering event will simply try again.
-                if (layer.stagePendingSwap (std::move (warped.left), std::move (warped.right), region))
-                {
-                    taggedBpm[(size_t) deckIdx][(size_t) l] = *target;
-                    anyStaged = true;
-                }
-                else allApplied = false;
+                for (size_t i = 0; i < inL[(size_t) l].size(); ++i) mix[i] += inL[(size_t) l][i];
+                for (size_t i = 0; i < inR[(size_t) l].size(); ++i) mix[i] += inR[(size_t) l][i];
             }
-            else
+            const auto plan = ezstretch::plan (mix.data(), (int64_t) longest, rate, scale);
+            mix = {};
+            for (int l = 0; l < ezdeck::kNumLayers; ++l)
             {
-                layer.left         = std::move (warped.left);
-                layer.right        = std::move (warped.right);
-                layer.regionLength = region;
-                taggedBpm[(size_t) deckIdx][(size_t) l] = *target;
+                if (inL[(size_t) l].empty()) continue;
+                if (stale()) return;
+                const auto n = (int64_t) inL[(size_t) l].size();
+                const auto len = (size_t) std::llround ((double) n * scale);
+                job.left[(size_t) l] = ezstretch::apply (plan, inL[(size_t) l].data(), n);
+                job.left[(size_t) l].resize (len);
+                inL[(size_t) l] = {};
+                if (! inR[(size_t) l].empty())
+                {
+                    job.right[(size_t) l] = ezstretch::apply (plan, inR[(size_t) l].data(), n);
+                    job.right[(size_t) l].resize (len);
+                    inR[(size_t) l] = {};
+                }
+                job.region[(size_t) l] = 0;
+                job.done[(size_t) l] = true;
+            }
+            for (bool isGuide : { false, true })
+            {
+                std::vector<float> mono;
+                double trackRate = 0.0;
+                const auto& path = isGuide ? guidePath : clickPath;
+                if (! decode (path, mono, trackRate) || stale()) continue;
+                const auto n = (int64_t) mono.size();
+                const auto own = (trackRate == rate && (size_t) n <= longest) ? plan
+                                                                               : ezstretch::plan (mono.data(), n, trackRate, scale);
+                auto out = ezstretch::apply (own, mono.data(), n);
+                out.resize ((size_t) std::llround ((double) n * scale));
+                (isGuide ? job.guide : job.click) = makeTrack (path, std::move (out), trackRate);
+            }
+        }
+        else
+        {
+            // a loop: the beat slicer, then fitted to whole bars
+            for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            {
+                if (inL[(size_t) l].empty()) continue;
+                if (stale()) return;
+                auto warped = ezdsp::reWarpLayer (inL[(size_t) l], inR[(size_t) l], rate, original, job.toBpm);
+                if (warped.left.empty()) continue;
+                job.left[(size_t) l]   = std::move (warped.left);
+                job.right[(size_t) l]  = std::move (warped.right);
+                job.region[(size_t) l] = warped.regionLength;
+                job.done[(size_t) l]   = true;
+            }
+            for (bool isGuide : { false, true })
+            {
+                std::vector<float> mono;
+                double trackRate = 0.0;
+                const auto& path = isGuide ? guidePath : clickPath;
+                if (! decode (path, mono, trackRate) || stale()) continue;
+                auto warped = ezdsp::reWarpLayer (mono, {}, trackRate, original, job.toBpm);
+                if (! warped.left.empty())
+                    (isGuide ? job.guide : job.click) = makeTrack (path, std::move (warped.left), trackRate);
+            }
+        }
+    }
+
+    /** Message thread: a finished render. Dropped if a newer one was asked
+        for or the row's audio changed meanwhile. */
+    void tempoRenderReady (std::shared_ptr<TempoRender> job)
+    {
+        const int d = job->deck;
+        if (d < 0 || d >= kNumDecks || job->generation != tempoGeneration[(size_t) d]) return;
+        auto& deck = session.decks[(size_t) d];
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+        {
+            const bool loaded = deck.layers[(size_t) l].loaded;
+            const bool same = loaded && layerFilePaths[(size_t) d][(size_t) l] == job->files[(size_t) l];
+            if ((job->done[(size_t) l] || loaded) && ! same && ! job->files[(size_t) l].isEmpty())
+            {
+                requestedTempo[(size_t) d] = 0.0;   // the row changed under it: a later request will redo it
+                return;
             }
         }
 
-        // the song's own click and guide stretch with the stems, so they stay on the beat
-        if (allApplied && ! needsSwapPrimitive)
-            for (bool isGuide : { false, true })
-            {
-                auto& slot = isGuide ? songGuideTrack[(size_t) deckIdx] : songClickTrack[(size_t) deckIdx];
-                if (slot == nullptr) continue;
-                auto warped = ezdsp::reWarpLayer (slot->mono, {}, slot->rate, from, *target);
-                if (warped.left.empty()) continue;
-                auto fresh = std::make_shared<SongTrack>();
-                fresh->filePath = slot->filePath;
-                fresh->rate = slot->rate;
-                fresh->mono = std::move (warped.left);
-                retiredSongTracks.push_back (slot);
-                slot = fresh;
-                (isGuide ? liveGuideTrack : liveClickTrack)[(size_t) deckIdx].store (fresh.get(), std::memory_order_release);
-            }
-
-        if (allApplied) deckBufferBpm[(size_t) deckIdx] = *target;
-        if (isTrueActiveDeck && anyStaged) session.scheduleActiveDeckRewarp();
+        const bool live = transportRunning.load() && session.activeDeck() == d && session.isDeckAudible (d);
+        if (live) stageLiveTempo (job);
+        else      applyTempoRenderNow (*job);
     }
+
+    /** The row isn't playing: its buffers change right away. */
+    void applyTempoRenderNow (TempoRender& job)
+    {
+        const int d = job.deck;
+        auto& deck = session.decks[(size_t) d];
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+        {
+            if (! job.done[(size_t) l]) continue;
+            auto& layer = deck.layers[(size_t) l];
+            layer.left  = std::move (job.left[(size_t) l]);
+            layer.right = std::move (job.right[(size_t) l]);
+            layer.regionLength = job.region[(size_t) l];
+            taggedBpm[(size_t) d][(size_t) l] = job.toBpm;
+        }
+        replaceSongTracks (d, job.click, job.guide);
+        finishTempo (d, job.toBpm, job.setsPlayAt);
+    }
+
+    void replaceSongTracks (int d, const std::shared_ptr<SongTrack>& click, const std::shared_ptr<SongTrack>& guide)
+    {
+        if (click != nullptr && songClickTrack[(size_t) d] != nullptr)
+        {
+            retiredSongTracks.push_back (songClickTrack[(size_t) d]);
+            songClickTrack[(size_t) d] = click;
+            liveClickTrack[(size_t) d].store (click.get(), std::memory_order_release);
+        }
+        if (guide != nullptr && songGuideTrack[(size_t) d] != nullptr)
+        {
+            retiredSongTracks.push_back (songGuideTrack[(size_t) d]);
+            songGuideTrack[(size_t) d] = guide;
+            liveGuideTrack[(size_t) d].store (guide.get(), std::memory_order_release);
+        }
+    }
+
+    /** The row is playing: stage everything and let the engine swap it on the next bar. */
+    void stageLiveTempo (std::shared_ptr<TempoRender> job)
+    {
+        const int d = job->deck;
+        auto& deck = session.decks[(size_t) d];
+        bool busy = stagedTempoRender != nullptr || session.isTempoChangePending();
+        for (const auto& layer : deck.layers) busy = busy || layer.hasPendingSwap();
+        if (busy) { waitingTempoRender = job; return; }   // after the change already waiting for its bar
+
+        const double original = deckSourceBpm[(size_t) d].value_or (job->toBpm);
+        const double playingAt = deckBufferBpm[(size_t) d] > 0.0 ? deckBufferBpm[(size_t) d] : original;
+        job->scale = playingAt / job->toBpm;
+
+        for (int l = 0; l < ezdeck::kNumLayers; ++l)
+            if (job->done[(size_t) l])
+                deck.layers[(size_t) l].stagePendingSwap (std::move (job->left[(size_t) l]), std::move (job->right[(size_t) l]),
+                                                          job->region[(size_t) l]);
+
+        stagedTempoRender = job;
+        stagedClickTrack.store (songClickTrack[(size_t) d] != nullptr ? job->click.get() : nullptr, std::memory_order_release);
+        stagedGuideTrack.store (songGuideTrack[(size_t) d] != nullptr ? job->guide.get() : nullptr, std::memory_order_release);
+        stagedGuideSpb.store (guideDeck.load (std::memory_order_relaxed) == d
+                                  ? guideSamplesPerBar.load (std::memory_order_relaxed) * job->scale : 0.0,
+                              std::memory_order_relaxed);
+        stagedTempoDeck.store (d, std::memory_order_release);
+        session.scheduleTempoChange (job->toBpm, job->scale);
+    }
+
+    /** Audio thread, right after the engine rendered: a tempo change that
+        just landed brings its click, guide and bar length with it. */
+    void followTempoChange()
+    {
+        const uint32_t applied = session.tempoChangesApplied();
+        if (applied == audioSeenTempoChanges.load (std::memory_order_relaxed)) return;
+        const int d = stagedTempoDeck.load (std::memory_order_acquire);
+        if (d >= 0 && d < kNumDecks)
+        {
+            if (auto* c = stagedClickTrack.load (std::memory_order_acquire)) liveClickTrack[(size_t) d].store (c, std::memory_order_release);
+            if (auto* g = stagedGuideTrack.load (std::memory_order_acquire)) liveGuideTrack[(size_t) d].store (g, std::memory_order_release);
+            if (const double spb = stagedGuideSpb.load (std::memory_order_relaxed); spb > 0.0)
+                guideSamplesPerBar.store (spb, std::memory_order_relaxed);
+        }
+        audioSeenTempoChanges.store (applied, std::memory_order_relaxed);
+    }
+
+    /** Message thread (UI timer): finishes a change the engine applied, or
+        recovers one the transport dropped (stopped / restarted before its bar). */
+    void pollTempoChanges()
+    {
+        const uint32_t applied = session.tempoChangesApplied();
+        if (applied != uiSeenTempoChanges)
+        {
+            // wait until the audio thread has taken the staged tracks
+            if (audioSeenTempoChanges.load (std::memory_order_relaxed) != applied) return;
+            uiSeenTempoChanges = applied;
+            if (auto job = std::move (stagedTempoRender))
+            {
+                stagedTempoDeck.store (-1, std::memory_order_release);
+                const int d = job->deck;
+                // the audio thread now plays job's tracks: the slots own them from here
+                if (job->click != nullptr && songClickTrack[(size_t) d] != nullptr) { retiredSongTracks.push_back (songClickTrack[(size_t) d]); songClickTrack[(size_t) d] = job->click; }
+                if (job->guide != nullptr && songGuideTrack[(size_t) d] != nullptr) { retiredSongTracks.push_back (songGuideTrack[(size_t) d]); songGuideTrack[(size_t) d] = job->guide; }
+                stagedClickTrack.store (nullptr, std::memory_order_release);
+                stagedGuideTrack.store (nullptr, std::memory_order_release);
+                for (int l = 0; l < ezdeck::kNumLayers; ++l)
+                    if (job->done[(size_t) l]) taggedBpm[(size_t) d][(size_t) l] = job->toBpm;
+                finishTempo (d, job->toBpm, job->setsPlayAt);
+            }
+        }
+        else if (stagedTempoRender != nullptr && ! session.isTempoChangePending())
+        {
+            // the transport dropped the change before its bar
+            auto job = stagedTempoRender;
+            const int d = job->deck;
+            if (transportRunning.load() && session.activeDeck() == d)
+            {
+                session.scheduleTempoChange (job->toBpm, job->scale);   // the swaps are still staged
+            }
+            else if (! transportRunning.load() || ! session.isDeckAudible (d))
+            {
+                stagedTempoRender = nullptr;
+                stagedTempoDeck.store (-1, std::memory_order_release);
+                stagedClickTrack.store (nullptr, std::memory_order_release);
+                stagedGuideTrack.store (nullptr, std::memory_order_release);
+                session.decks[(size_t) d].applyPendingSwaps();   // nothing reads this row now
+                for (int l = 0; l < ezdeck::kNumLayers; ++l)
+                    if (job->done[(size_t) l]) taggedBpm[(size_t) d][(size_t) l] = job->toBpm;
+                replaceSongTracks (d, job->click, job->guide);
+                finishTempo (d, job->toBpm, job->setsPlayAt);
+            }
+        }
+
+        if (stagedTempoRender == nullptr && waitingTempoRender != nullptr && ! session.isTempoChangePending())
+            if (auto next = std::move (waitingTempoRender)) tempoRenderReady (next);
+    }
+
+    void finishTempo (int d, double toBpm, bool setsPlayAt)
+    {
+        deckBufferBpm[(size_t) d] = toBpm;
+        if (requestedTempo[(size_t) d] > 0.0 && std::abs (requestedTempo[(size_t) d] - toBpm) < 0.01)
+            requestedTempo[(size_t) d] = 0.0;
+        if (setsPlayAt) deckTempoOverride[(size_t) d] = toBpm;
+        if (session.activeDeck() == d)
+        {
+            // the engine already plays at toBpm; the app's own copy follows
+            masterTempo.bpm = toBpm;
+            session.setTempo (masterTempo);
+        }
+        applyDeckSourceTempo (d);   // bar counts, the song's tempo, the click and cues
+        refreshSlotLabels();
+        repaint();
+    }
+
 
     //== a song's own click and guide tracks =====================================
 
@@ -12464,10 +13440,13 @@ public:
 
         if (! quiet)
         {
-            // they brought it, so it plays: on, and the song's own
-            (isGuide ? arrangements[(size_t) deck].guideCues : arrangements[(size_t) deck].guideClick) = true;
+            // Owner: a click track arrives muted; the row keeps whatever CLICK
+            // state it already had (saved per row). A guide track plays at once.
+            if (isGuide) arrangements[(size_t) deck].guideCues = true;
             (isGuide ? useSongGuide : useSongClick)[(size_t) deck] = true;
-            showToast (deckLabel (deck) + ": " + (isGuide ? "guide" : "click") + " track " + file.getFileName());
+            const bool muted = ! isGuide && ! arrangements[(size_t) deck].guideClick;
+            showToast (deckLabel (deck) + ": " + (isGuide ? "guide" : "click") + " track " + file.getFileName()
+                       + (muted ? " (muted - tap CLICK to hear it)" : ""));
         }
         rebuildGuideSchedule();
         refreshSlotLabels();
@@ -12733,6 +13712,7 @@ public:
                 if (b <= a) return;
                 auto clip = std::make_shared<std::vector<float>> (audio->begin() + (long) a, audio->begin() + (long) b);
                 safe->startLibraryPreview (clip, nullptr, safe->currentSampleRate > 0.0 ? rate / safe->currentSampleRate : 1.0);
+                safe->previewIsFromLibrary = false;
             },
             [safe, deck] (const std::vector<ezcuereview::Choice>& chosen)
             {
@@ -12924,7 +13904,7 @@ public:
             else if (it.role == ezstems::kClick && ! click) click = loadSongTrack (deck, false, it.file, true);
             else if (it.role == ezstems::kGuide && ! guide) guide = loadSongTrack (deck, true, it.file, true);
         }
-        if (click) { arrangements[(size_t) deck].guideClick = true; useSongClick[(size_t) deck] = true; }
+        if (click) useSongClick[(size_t) deck] = true;   // muted unless the row's CLICK is already on
         if (guide) { arrangements[(size_t) deck].guideCues  = true; useSongGuide[(size_t) deck] = true; }
 
         applyDeckSourceTempo (deck);
@@ -13042,6 +14022,8 @@ public:
         // autosaveIfDue()'s own comment for why this is unconditional
         // (no dirty-tracking) rather than gated on "has anything changed."
         if (++autosaveTickCounter >= 15 * 60) { autosaveTickCounter = 0; autosaveIfDue(); }
+        pollTempoChanges();
+        if (++undoTick >= 4) { undoTick = 0; watchForEdits(); }   // ~4 times a second
 
         // Milestone 8: a lightweight "is this pad audible right now"
         // indicator -- isActive() is safe to read from the message thread
@@ -13334,7 +14316,9 @@ public:
         fxScratchR.assign ((size_t) samplesPerBlockExpected, 0.0f);
 
         // Milestone 10: same reasoning again, for the metronome.
-        metro.prepare (sampleRate);
+        clickBank.build (sampleRate);   // every click sound, at this rate (the callback isn't running now)
+        loopClick.reset();
+        previewClick.reset();
         metroScratchL.assign ((size_t) samplesPerBlockExpected, 0.0f);
         metroScratchR.assign ((size_t) samplesPerBlockExpected, 0.0f);
 
@@ -13348,7 +14332,7 @@ public:
             liveInScratch.assign ((size_t) inputs, std::vector<float> ((size_t) samplesPerBlockExpected, 0.0f));
             liveInputCount.store (inputs, std::memory_order_relaxed);
         }
-        songClick.prepare (sampleRate);
+        songClick.reset();
         for (auto& s : instruments) s.prepare (sampleRate, samplesPerBlockExpected);
         for (auto& strip : strips)
         {
@@ -13422,7 +14406,9 @@ public:
         for (int p = 0; p < numPairs; ++p)
         {
             if (outputPairPtrsL[(size_t) p] == nullptr) outputPairPtrsL[(size_t) p] = scratchR.data();
-            if (outputPairPtrsR[(size_t) p] == nullptr) outputPairPtrsR[(size_t) p] = outputPairPtrsL[(size_t) p];
+            // the missing second side of an odd last output goes nowhere --
+            // never into the first side, which would double a mono route
+            if (outputPairPtrsR[(size_t) p] == nullptr) outputPairPtrsR[(size_t) p] = scratchR.data();
         }
 
         auto* outL = outputPairPtrsL[0];   // pair 0 == Main -- preview/library-audition audio always monitors here
@@ -13474,6 +14460,8 @@ public:
         if (transportRunning.load())
         {
             session.renderPerTab (tabPtrsL, tabPtrsR, numSamples);
+            applySongFade (tabPtrsL, tabPtrsR, numSamples);   // a song that came in with a fade
+            followTempoChange();   // a +/- change that landed in this block brings its click and guide
         }
         else
         {
@@ -13585,7 +14573,7 @@ public:
         mixInR[(size_t) ezdeck::MixerChannel::Cues]  = cueScratchR.data();
         mixer.mixDown (mixInL, mixInR, outputPairPtrsL, outputPairPtrsR, numSamples);
         renderPreview (outL, outR, numSamples);
-        renderLibraryPreview (outL, outR, numSamples);
+        renderLibraryPreview (numSamples);
 
         // defensive tail, see clamp above -- every pair now, not just Main,
         // since a routed channel's own pair needs the same guarantee.
@@ -13676,6 +14664,8 @@ public:
         std::shared_ptr<const std::vector<float>> left, right;   // owned decoded copy; right may be null (mono -- played to both channels)
         double pos       { 0.0 };
         double rateRatio { 1.0 };
+        std::atomic<int>   route { 0 };      // the WEB/Library strip's output (a route code)
+        std::atomic<float> level { 1.0f };   // the WEB/Library strip's fader, 0 when muted
     };
     LibraryPreviewVoice libraryPreview;
 
@@ -13705,12 +14695,23 @@ public:
     }
 
     void stopLibraryPreview() { libraryPreview.active = false; }
+    bool previewIsFromLibrary { false };   // the preview voice was started by LIBRARY (not a cue's Hear)
 
     bool isLibraryPreviewActive() const { return libraryPreview.active.load (std::memory_order_relaxed); }
 
-    void renderLibraryPreview (float* outL, float* outR, int numSamples)
+    // Played where the WEB/Library strip points, at its level (owner: "the web
+    // mixer channel should work for both the web and the library").
+    void renderLibraryPreview (int numSamples)
     {
         if (! libraryPreview.active.load (std::memory_order_relaxed)) return;
+        const int numPairs = (int) outputPairPtrsL.size();
+        if (numPairs == 0) return;
+
+        auto target = ezdeck::outputTargetFor (libraryPreview.route.load (std::memory_order_relaxed));
+        if (target.pair >= numPairs) target = {};   // not on this device: Main, in stereo
+        float* outL = outputPairPtrsL[(size_t) target.pair];
+        float* outR = outputPairPtrsR[(size_t) target.pair];
+        const float gain = previewGain * libraryPreview.level.load (std::memory_order_relaxed);
 
         auto left = std::atomic_load (&libraryPreview.left);   // local shared_ptr copy -- keeps the buffer alive for this block even if stop/replace races in from the message thread
         if (left == nullptr || left->empty()) { libraryPreview.active = false; return; }
@@ -13742,8 +14743,15 @@ public:
             }
             else r = l;
 
-            outL[i] += l * previewGain;
-            outR[i] += r * previewGain;
+            if (target.side < 0)
+            {
+                outL[i] += l * gain;
+                outR[i] += r * gain;
+            }
+            else
+            {
+                (target.side == 0 ? outL : outR)[i] += 0.5f * (l + r) * gain;
+            }
             pos += rateRatio;
         }
 
@@ -14131,6 +15139,8 @@ public:
         storeView.setBounds (full);
         playbackHolder.setBounds (full);
         if (playbackView) playbackView->setBounds (playbackHolder.getLocalBounds());
+        browserHolder.setBounds (full);
+        if (browserTab) browserTab->setBounds (browserHolder.getLocalBounds());
 
         // Phase 1.1 P2/P3: re-assert z-order on EVERY resized(), not just
         // once when the dock is first toggled open (refreshActiveView()) --
@@ -14277,14 +15287,22 @@ public:
         // 420px is the spec's own component-width total (48+40+40+96+64+72+44
         // = 404) with no room left for gaps or the row's own inset -- widened
         // to fit both without shrinking any control below its specified size.
-        auto transportGroup = transportSceneRow.removeFromLeft (462).reduced (8, 10);
+        auto transportGroup = transportSceneRow.removeFromLeft (596).reduced (8, 10);
+        redoButtonPerform.setBounds (transportGroup.removeFromRight (28).reduced (0, 8));
+        transportGroup.removeFromRight (2);
+        undoButtonPerform.setBounds (transportGroup.removeFromRight (28).reduced (0, 8));
+        transportGroup.removeFromRight (6);
         playButton.setBounds (transportGroup.removeFromLeft (48));
         transportGroup.removeFromLeft (6);
         prevDeckButton.setBounds (transportGroup.removeFromLeft (40).reduced (0, 4));
         transportGroup.removeFromLeft (4);
         nextDeckButton.setBounds (transportGroup.removeFromLeft (40).reduced (0, 4));
         transportGroup.removeFromLeft (8);
+        tempoDownButton.setBounds (transportGroup.removeFromLeft (30).reduced (0, 6));
+        transportGroup.removeFromLeft (2);
         bpmReadout.setBounds (transportGroup.removeFromLeft (96));
+        transportGroup.removeFromLeft (2);
+        tempoUpButton.setBounds (transportGroup.removeFromLeft (30).reduced (0, 6));
         transportGroup.removeFromLeft (8);
         tapButton.setBounds (transportGroup.removeFromLeft (64).reduced (0, 2));
         transportGroup.removeFromLeft (6);
@@ -14468,10 +15486,12 @@ private:
     MixerStripHolder mixerStripHolder;             // every strip but Master, under its group label
     float webGain { 1.0f };
     bool  webMute { false };
+    int   webRoute { 0 };   // where the LIBRARY preview plays
 
     void pushWebLevel()
     {
         if (browserTab) browserTab->setMediaLevel (juce::jlimit (0.0f, 1.0f, webGain), webMute);
+        libraryPreview.level.store (webMute ? 0.0f : juce::jlimit (0.0f, 1.5f, webGain), std::memory_order_relaxed);
     }
     // Phase 1.1 P3 "Output routing" -- persisted selection per channel (see
     // MixerChannelStrip's own comment for why only index 0/"Main" is real).
@@ -14481,7 +15501,20 @@ private:
 
     // Milestone 10: the metronome -- routes through the Mixer's Metro
     // channel (solo-exempt from Mixer's own construction).
-    ezdeck::Metronome metro;
+    // Owner: "we should have different metronome settings." One click engine
+    // (ClickEngine.h) for loop mode, songs, the count-in and the settings
+    // preview, all from the same settings (Settings > Metronome, app-wide).
+    ezclick::SoundBank     clickBank;
+    ezclick::ClickParams   clickParams;
+    ezclick::CountInParams countInParams;
+    ezclick::Clicker       loopClick    { clickBank, clickParams };
+    ezclick::Clicker       previewClick { clickBank, clickParams };
+    std::atomic<int>       clickPreviewRequest { 0 };   // bumped by "Play a bar"
+    int                    clickPreviewSeen { 0 };      // audio thread
+    int64_t                clickPreviewLeft { 0 };      // audio thread: samples of preview still to play
+    double                 clickPreviewPos  { 0.0 };    // audio thread
+
+    void previewClickSound() { clickPreviewRequest.fetch_add (1, std::memory_order_relaxed); }
     std::vector<float> metroScratchL, metroScratchR;
 
     // Milestone 11: 8 scene slots + their UI buttons + a shared notification
@@ -14522,6 +15555,8 @@ private:
     // display only; no re-warp is triggered by any of this yet (see each
     // method's own comment)
     juce::TextButton   tapButton;
+    juce::TextButton   tempoDownButton, tempoUpButton;   // +/- tempo, at the next bar while playing
+    juce::TextButton   undoButtonPerform, redoButtonPerform;
     // UI_SPEC_PERFORM.md §2.2: TextButton, not ToggleButton -- setClickingTogglesState(true)
     // keeps the exact same getToggleState()/setToggleState() API every
     // existing call site already uses, while gaining buttonOnColourId
@@ -14743,8 +15778,9 @@ private:
     std::array<ezinst::InstrumentSlot, ezdeck::kNumLiveTracks> instruments;
     ezinst::HostPlayHead                                      hostPlayHead;
     std::array<std::unique_ptr<ezinst::InstrumentEditorWindow>, ezdeck::kNumLiveTracks> instrumentWindows;
-    std::unique_ptr<juce::DocumentWindow>                     pluginListWindow;
-    std::unique_ptr<juce::ThreadWithProgressWindow>           pluginScan;
+    std::unique_ptr<ezplugins::ScanWindow>                    pluginScanWindow;   // while a scan runs
+    juce::Component::SafePointer<juce::DialogWindow>          settingsDialog;     // Settings, while open
+    static constexpr int kSettingsPluginsTab = 5;   // General, Metronome, Audio, Shortcuts, MIDI, Plugins
 
     // Per live track: -1 no input, else the device input channel (see
     // SettingsSnapshot); MIDI channel 0 = every channel. Written on the
@@ -14764,7 +15800,7 @@ private:
     std::vector<ezguide::CueSample>   cueBank;         // what the player reads
     std::map<std::string, int>        cueIds;
     juce::StringArray                 cueMenuNames;    // "Song Form/Chorus-2"
-    ezguide::Click                    songClick;       // the native click (guideClick() is the per-song switch)
+    ezclick::Clicker                  songClick { clickBank, clickParams };   // the native click (guideClick() is the per-song switch)
     ezguide::CuePlayer                cuePlayer;       // audio thread
     std::vector<float>                cueScratchL, cueScratchR;
     std::unique_ptr<std::vector<ezguide::CueEvent>>              currentSchedule;
@@ -15241,8 +16277,10 @@ private:
                 // so the last count-in bar ends exactly where the song starts.
                 const double beatLen = ezdeck::barLengthSamples (session.getTempo(), currentSampleRate) / (double) beats;
                 const double pos = -(double) countInLeft;
-                // a count-in is always clicked: that is what a count-in is for
-                songClick.render (metroScratchL.data(), metroScratchR.data(), numSamples, pos, beatLen, beats);
+                // a count-in clicks even when the song's click is off, unless
+                // Settings > Metronome says otherwise
+                if (countInParams.evenWithClickOff.load (std::memory_order_relaxed) || (flags & 1))
+                    songClick.render (metroScratchL.data(), metroScratchR.data(), numSamples, pos, beatLen, beats);
                 if (flags & 2)
                 {
                     // speak "1, 2, 3, 4" on the beats of the final count-in bar
@@ -15283,11 +16321,32 @@ private:
         else
         {
             lastCountInBeat = INT64_MIN;
-            // PERFORM's loop mode keeps the plain metronome on the Click strip.
-            if (running && metronomeGate.load (std::memory_order_relaxed))
-                metro.render (metroScratchL.data(), metroScratchR.data(), numSamples, masterPosAtStart, session.getTempo().bpm);
+            const auto tempo = session.getTempo();
+            const double beatLen = tempo.bpm > 0.0 ? 60.0 * currentSampleRate / tempo.bpm : 0.0;
+            const int beats = juce::jmax (1, tempo.beatsPerBar);
+
+            // Settings > Metronome's "Play a bar": heard whatever the transport does
+            if (const int request = clickPreviewRequest.load (std::memory_order_relaxed); request != clickPreviewSeen)
+            {
+                clickPreviewSeen = request;
+                clickPreviewPos = 0.0;
+                clickPreviewLeft = (int64_t) (beatLen * beats);
+                previewClick.reset();
+            }
+            if (clickPreviewLeft > 0)
+            {
+                previewClick.render (metroScratchL.data(), metroScratchR.data(), numSamples, clickPreviewPos, beatLen, beats);
+                clickPreviewPos += numSamples;
+                clickPreviewLeft -= numSamples;
+            }
+            // PERFORM's loop mode: the metronome on the Click strip, same sounds as a song's click
+            else if (running && metronomeGate.load (std::memory_order_relaxed))
+                loopClick.render (metroScratchL.data(), metroScratchR.data(), numSamples, (double) masterPosAtStart, beatLen, beats);
             else if (! running)
+            {
                 songClick.reset();
+                loopClick.reset();
+            }
         }
 
         cuePlayer.render (cueScratchL.data(), cueScratchR.data(), numSamples);
@@ -15421,13 +16480,76 @@ private:
         if (! transportRunning.load()) endCountInIfAny();
     }
 
+    // ---- song ends ------------------------------------------------------------
+    std::atomic<int> songFadeTotal { 0 }, songFadeLeft { 0 };   // samples; the deck audio fades in
+
+    void startSongFadeIn (int seconds)
+    {
+        const int total = juce::jmax (1, (int) (juce::jlimit (1, 4, seconds) * juce::jmax (1.0, currentSampleRate)));
+        songFadeTotal.store (total, std::memory_order_relaxed);
+        songFadeLeft.store (total, std::memory_order_relaxed);
+    }
+
+    /** Audio thread: the song fade-in, over every deck output. */
+    void applySongFade (std::array<float*, ezdeck::kNumLayers>& outL, std::array<float*, ezdeck::kNumLayers>& outR, int n)
+    {
+        int left = songFadeLeft.load (std::memory_order_relaxed);
+        if (left <= 0) return;
+        const int total = juce::jmax (1, songFadeTotal.load (std::memory_order_relaxed));
+        for (int i = 0; i < n; ++i)
+        {
+            const float x = 1.0f - (float) juce::jmax (0, left - i) / (float) total;
+            const float g = std::sin (x * juce::MathConstants<float>::halfPi);   // equal-power rise
+            for (int t = 0; t < ezdeck::kNumLayers; ++t) { outL[(size_t) t][i] *= g; outR[(size_t) t][i] *= g; }
+        }
+        songFadeLeft.store (juce::jmax (0, left - n), std::memory_order_relaxed);
+    }
+
+    int  endChoice() const override
+    {
+        const int d = currentSongDeck();
+        if (d < 0) return 3;
+        const auto& a = arrangements[(size_t) d];
+        switch (a.atEnd)
+        {
+            case ezarr::EndBehaviour::stop:               return 1;
+            case ezarr::EndBehaviour::cueNext:            return 2;
+            case ezarr::EndBehaviour::autoAdvance:        return 3;
+            case ezarr::EndBehaviour::advanceWithCountIn: return 4;
+            case ezarr::EndBehaviour::fadeIntoNext:       return a.endFadeSeconds <= 1 ? 5 : a.endFadeSeconds >= 4 ? 7 : 6;
+            case ezarr::EndBehaviour::repeat:             return 8;
+        }
+        return 3;
+    }
+
+    void setEndChoice (int id) override
+    {
+        const int d = currentSongDeck();
+        if (d < 0) return;
+        auto& a = arrangements[(size_t) d];
+        switch (id)
+        {
+            case 1: a.atEnd = ezarr::EndBehaviour::stop; break;
+            case 2: a.atEnd = ezarr::EndBehaviour::cueNext; break;
+            case 4: a.atEnd = ezarr::EndBehaviour::advanceWithCountIn; break;
+            case 5: a.atEnd = ezarr::EndBehaviour::fadeIntoNext; a.endFadeSeconds = 1; break;
+            case 6: a.atEnd = ezarr::EndBehaviour::fadeIntoNext; a.endFadeSeconds = 2; break;
+            case 7: a.atEnd = ezarr::EndBehaviour::fadeIntoNext; a.endFadeSeconds = 4; break;
+            case 8: a.atEnd = ezarr::EndBehaviour::repeat; break;
+            default: a.atEnd = ezarr::EndBehaviour::autoAdvance; break;
+        }
+    }
+
     void playWithCountIn() override
     {
         const int d = currentSongDeck();
         if (d < 0) { playStop(); return; }
         if (transportRunning.load()) { playStop(); return; }
 
-        const int bars = arrangements[(size_t) d].countInBars > 0 ? arrangements[(size_t) d].countInBars : 1;
+        // a song without its own count-in takes Settings > Metronome's; "none" just starts it
+        const int bars = arrangements[(size_t) d].countInBars > 0 ? arrangements[(size_t) d].countInBars
+                                                                  : countInParams.barsWhenUnset.load();
+        if (bars <= 0) { playStop(); return; }
         adoptSongTempo (d);
         session.resetTransport();
         session.switchNow (d);
@@ -15625,12 +16747,36 @@ private:
         // for every setlist song so the engine just finishes cleanly).
         if (! session.isCountingIn() && session.decks[(size_t) d].stemFinished())
         {
+            const bool hasNext = setlistPos + 1 < (int) setlist.size();
             switch (a.atEnd)
             {
                 case ezarr::EndBehaviour::autoAdvance:
-                    if (setlistPos + 1 < (int) setlist.size()) { nextSong(); return; }
+                    if (hasNext) { nextSong(); return; }
                     transportRunning = false;
                     break;
+                case ezarr::EndBehaviour::advanceWithCountIn:
+                    transportRunning = false;
+                    endCountInIfAny();
+                    if (hasNext) { selectSong (setlistPos + 1); playWithCountIn(); }
+                    return;
+                case ezarr::EndBehaviour::fadeIntoNext:
+                    if (hasNext)
+                    {
+                        const int seconds = a.endFadeSeconds;
+                        nextSong();
+                        startSongFadeIn (seconds);
+                        return;
+                    }
+                    transportRunning = false;
+                    break;
+                case ezarr::EndBehaviour::repeat:
+                    // the same song again, from the top, at its tempo
+                    adoptSongTempo (d);
+                    session.resetTransport();
+                    session.switchNow (d);
+                    lastSectionIdx = -1;
+                    rebuildGuideSchedule();
+                    return;
                 case ezarr::EndBehaviour::cueNext:
                     transportRunning = false;
                     if (setlistPos + 1 < (int) setlist.size()) selectSong (setlistPos + 1);
@@ -15883,6 +17029,8 @@ static bool runPersistenceSelfTest()
         original.mixerChannels[(size_t) c].solo = (c == 3);
         original.mixerChannels[(size_t) c].outputRoute = (c + 1) % MixerChannelSnapshot::kMaxOutputRoutes;   // every channel on its own pair, Metro on Out 23/24
     }
+    original.mixerChannels[2].outputRoute = MixerChannelSnapshot::kMonoRouteBase + 5;   // Deck 3 alone on Out 6
+    original.settings.webRoute = MixerChannelSnapshot::kMonoRouteBase + 2;             // the library preview on Out 3
     DeckSnapshot deck;
     deck.flatIndex = 12;
     deck.tempoOverrideBpm = 128.0;
@@ -15912,7 +17060,8 @@ static bool runPersistenceSelfTest()
         s = {};
         s.name = "Tag";    s.startBar = 24; s.optional = true; s.pauseAfter = true; s.skip = true; s.cue = "Last-Time"; deck.sections.push_back (s);
         deck.arrangementLengthBars = 32;
-        deck.endBehaviour = 1;
+        deck.endBehaviour = 4;
+        deck.endFadeSeconds = 4;
         deck.countInBars = 2;
         deck.guideClick = true; deck.guideCues = true; deck.cueLeadBars = 4; deck.cueCounts = false;
     }
@@ -15935,6 +17084,13 @@ static bool runPersistenceSelfTest()
            "settings round-trip exactly");
     check (juce::approximatelyEqual (restored.settings.webGain, 0.35f) && restored.settings.webMute == true,
            "the mixer's WEB strip level and mute round-trip");
+    check (restored.settings.webRoute == MixerChannelSnapshot::kMonoRouteBase + 2
+           && restored.mixerChannels[2].outputRoute == MixerChannelSnapshot::kMonoRouteBase + 5,
+           "mono output routes round-trip (Deck 3 on Out 6, the library preview on Out 3)");
+    check (MixerChannelSnapshot::sanitiseRoute (MixerChannelSnapshot::kMonoRouteBase + 64) == 0
+           && MixerChannelSnapshot::sanitiseRoute (-3) == 0
+           && MixerChannelSnapshot::sanitiseRoute (MixerChannelSnapshot::kMonoRouteBase + 7) == MixerChannelSnapshot::kMonoRouteBase + 7,
+           "a stored route that is neither a pair nor an output loads as Main; a mono output is kept");
     check (restored.settings.trackInput == original.settings.trackInput
            && restored.settings.trackStereo == original.settings.trackStereo
            && restored.settings.trackInput[3] == -1,
@@ -16003,7 +17159,7 @@ static bool runPersistenceSelfTest()
            && restored.decks[0].sections[2].optional && restored.decks[0].sections[2].pauseAfter && restored.decks[0].sections[2].skip,
            "sections round-trip with their names, bars, colours and every flag");
     check (restored.decks.size() == 1 && restored.decks[0].arrangementLengthBars == 32
-           && restored.decks[0].endBehaviour == 1 && restored.decks[0].countInBars == 2,
+           && restored.decks[0].endBehaviour == 4 && restored.decks[0].endFadeSeconds == 4 && restored.decks[0].countInBars == 2,
            "arrangement length, end behaviour and count-in round-trip");
     check (restored.setlist == std::vector<int> { 12, 3, 40 } && restored.jumpMode == 2,
            "setlist order and jump mode round-trip");
@@ -16708,7 +17864,7 @@ public:
     {
         const auto params = getCommandLineParameters();
         return params.contains (ezinst::kScannerProcessUID) || params.contains ("--selftest") || params.contains ("--list-audio-devices")
-            || params.contains ("--scan-plugins") || params.contains ("--test-instrument");
+            || params.contains ("--scan-plugins") || params.contains ("--test-instrument") || params.contains ("--detect-tempo") || params.contains ("--dump-tempo-set");
     }
 
     // JUCE's own mechanism for this: when moreThanOneInstanceAllowed() is
@@ -16789,6 +17945,135 @@ public:
             return;
         }
 
+        // "PerformLive.exe --dump-tempo-set <folder> <out folder>": every audio
+        // file under <folder> with a tempo in its name (or its folder's name),
+        // decoded (first 60 s, channels summed, 2x decimated) to
+        // "<name>__<bpm>.f32" -- a double sample rate, a double length in
+        // seconds, then the samples. The tuning set for TempoDetect.h.
+        if (commandLine.contains ("--dump-tempo-set"))
+        {
+            auto args = juce::StringArray::fromTokens (commandLine.fromFirstOccurrenceOf ("--dump-tempo-set", false, false), true);
+            args.removeEmptyStrings();
+            const juce::File folder (args[0].unquoted()), outDir (args[1].unquoted());
+            outDir.createDirectory();
+            juce::AudioFormatManager fm;
+            fm.registerBasicFormats();
+            int written = 0;
+            for (const auto& f : folder.findChildFiles (juce::File::findFiles, true, "*.wav;*.mp3;*.aif;*.aiff;*.flac;*.m4a"))
+            {
+                const double expected = ezcue::tempoFromName (f.getFullPathName().toStdString());
+                if (expected <= 0.0) continue;
+                std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (f));
+                if (reader == nullptr || reader->sampleRate <= 0.0) continue;
+                const double sr = reader->sampleRate;
+                const int total = (int) juce::jmin<juce::int64> (reader->lengthInSamples, (juce::int64) (sr * 60.0));
+                const int channels = juce::jmax (1, (int) reader->numChannels);
+                if (total <= 0) continue;
+                juce::AudioBuffer<float> buf (channels, total);
+                reader->read (&buf, 0, total, 0, true, true);
+                const int decim = sr >= 40000.0 ? 2 : 1;
+                juce::FileOutputStream out (outDir.getChildFile (juce::File::createLegalFileName (f.getParentDirectory().getFileName().substring (0, 20)
+                                                                  + " - " + f.getFileNameWithoutExtension().substring (0, 40))
+                                                                  + "__" + juce::String (expected) + ".f32"));
+                if (! out.openedOk()) continue;
+                out.setPosition (0);
+                out.truncate();
+                out.writeDouble (sr / decim);
+                out.writeDouble ((double) reader->lengthInSamples / sr);
+                for (int i = 0; i + decim <= total; i += decim)
+                {
+                    float s = 0.0f;
+                    for (int k = 0; k < decim; ++k)
+                        for (int c = 0; c < channels; ++c) s += buf.getSample (c, i + k);
+                    out.writeFloat (s / (float) (decim * channels));
+                }
+                ++written;
+                std::printf ("  %s (%.1f)\n", f.getFileName().toRawUTF8(), expected);
+                std::fflush (stdout);
+            }
+            std::printf ("%d files written to %s\n", written, outDir.getFullPathName().toRawUTF8());
+            std::fflush (stdout);
+            quit();
+            return;
+        }
+
+        // "PerformLive.exe --detect-tempo <file or folder>": the old and the new
+        // tempo reading for every audio file, beside the tempo written in its
+        // name (or its folder's). How TempoDetect.h is measured on real loops.
+        if (commandLine.contains ("--detect-tempo"))
+        {
+            const juce::File target (commandLine.fromFirstOccurrenceOf ("--detect-tempo", false, false).trim().unquoted());
+            juce::Array<juce::File> files;
+            if (target.isDirectory())
+                files = target.findChildFiles (juce::File::findFiles, false, "*.wav;*.mp3;*.aif;*.aiff;*.flac;*.m4a");   // this folder only
+            else
+                files.add (target);
+
+            auto tempoInName = [] (const juce::String& text) -> double
+            {
+                const auto lower = text.toLowerCase();
+                for (int at = lower.indexOf ("bpm"); at >= 0; at = lower.indexOf (at + 3, "bpm"))
+                {
+                    int i = at - 1;                                   // "70bpm", "70 BPM", "_141bpm"
+                    while (i >= 0 && (lower[i] == ' ' || lower[i] == '_' || lower[i] == '-')) --i;
+                    int j = i;
+                    while (j >= 0 && juce::CharacterFunctions::isDigit (lower[j])) --j;
+                    if (j < i) return lower.substring (j + 1, i + 1).getDoubleValue();
+                    int k = at + 3;                                   // "BPM 70", "BPM100"
+                    while (k < lower.length() && (lower[k] == ' ' || lower[k] == '_' || lower[k] == '-')) ++k;
+                    int m = k;
+                    while (m < lower.length() && juce::CharacterFunctions::isDigit (lower[m])) ++m;
+                    if (m > k) return lower.substring (k, m).getDoubleValue();
+                }
+                return 0.0;
+            };
+
+            juce::AudioFormatManager fm;
+            fm.registerBasicFormats();
+            int named = 0, newRight = 0, oldRight = 0;
+            std::printf ("%-58s %6s %7s %7s %5s %6s\n", "file", "name", "old", "new", "conf", "ms");
+            for (const auto& f : files)
+            {
+                std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (f));
+                if (reader == nullptr) { std::printf ("%-58s  (cannot read)\n", f.getFileName().substring (0, 58).toRawUTF8()); continue; }
+                const double sr = reader->sampleRate;
+                const int total = (int) juce::jmin<juce::int64> (reader->lengthInSamples, (juce::int64) (sr * 95.0));
+                const int channels = juce::jmax (1, (int) reader->numChannels);
+                juce::AudioBuffer<float> buf (channels, juce::jmax (1, total));
+                reader->read (&buf, 0, total, 0, true, true);
+                std::vector<float> mono ((size_t) total, 0.0f);
+                for (int c = 0; c < channels; ++c)
+                {
+                    const auto* p = buf.getReadPointer (c);
+                    for (int i = 0; i < total; ++i) mono[(size_t) i] += p[i] / (float) channels;
+                }
+                const double seconds = (double) reader->lengthInSamples / sr;
+
+                const double t0 = juce::Time::getMillisecondCounterHiRes();
+                const auto fresh = eztempo::detect (mono.data(), total, sr, seconds);
+                const double ms = juce::Time::getMillisecondCounterHiRes() - t0;
+                const double old = ezdsp::analyze (buf.getReadPointer (0), juce::jmin (total, (int) (sr * 30.0)), sr).bpm;
+
+                double expected = tempoInName (f.getFileNameWithoutExtension());
+                if (expected <= 0.0) expected = tempoInName (f.getParentDirectory().getFileName());
+                if (expected > 0.0)
+                {
+                    ++named;
+                    if (std::fabs (fresh.bpm - expected) <= 0.5) ++newRight;
+                    if (std::fabs (old - expected) <= 0.5) ++oldRight;
+                }
+                auto label = f.getParentDirectory().getFileName().substring (0, 18) + "/" + f.getFileName();
+                std::printf ("%-58s %6.1f %7.2f %7.2f %5.2f %6.0f%s\n", label.substring (0, 58).toRawUTF8(), expected, old,
+                             fresh.bpm, fresh.confidence, ms,
+                             expected <= 0.0 ? "" : std::fabs (fresh.bpm - expected) <= 0.5 ? "  ok" : "  WRONG");
+                std::fflush (stdout);
+            }
+            std::printf ("\nnamed files: %d   new right: %d   old right: %d\n", named, newRight, oldRight);
+            std::fflush (stdout);
+            quit();
+            return;
+        }
+
         // PX-D: "PerformLive.exe --scan-plugins" scans the standard VST3
         // folders through the separate scanner process, prints what it found,
         // saves the list for the app, and quits. Proves the subprocess path
@@ -16801,25 +18086,24 @@ public:
                 void run() override
                 {
                     ezinst::PluginLibrary lib;
+                    if (auto* settings = SessionComponent::getAppSettings())
+                        lib.setTimeoutSeconds (settings->getIntValue ("pluginScanTimeoutSeconds", 30));
                     const auto pedal = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("performlive-scan-pedal.txt");
-                    int files = 0;
-                    for (auto* format : lib.formatManager().getFormats())
-                    {
-                        juce::PluginDirectoryScanner scanner (lib.list(), *format, format->getDefaultLocationsToSearch(), true, pedal, true);
-                        juce::String name;
-                        while (! threadShouldExit())
+                    juce::String lastFile;
+                    const int files = lib.scanStandardFolders (pedal, [this] { return threadShouldExit(); },
+                        [&lastFile] (const juce::String& next, float)
                         {
-                            const auto next = scanner.getNextPluginFileThatWillBeScanned();
-                            if (! scanner.scanNextFile (true, name)) break;
-                            ++files;
-                            std::printf ("  scanned %s\n", next.toRawUTF8());
+                            if (next.isEmpty() || next == lastFile) return;
+                            lastFile = next;
+                            std::printf ("  checking %s\n", next.toRawUTF8());
                             std::fflush (stdout);
-                        }
-                    }
+                        });
                     std::printf ("\n%d files scanned. Instruments:\n", files);
                     for (const auto& d : lib.instruments())
                         std::printf ("  [%s] %s -- %s\n", d.pluginFormatName.toRawUTF8(), d.name.toRawUTF8(), d.manufacturerName.toRawUTF8());
                     std::printf ("%d instruments, %d plugins in total\n", lib.instruments().size(), lib.list().getNumTypes());
+                    for (const auto& f : lib.setAsideFiles())
+                        std::printf ("  set aside: %s -- %s\n", f.toRawUTF8(), lib.reasonSetAside (f).toRawUTF8());
                     std::fflush (stdout);
                     if (auto* settings = SessionComponent::getAppSettings()) lib.saveTo (*settings);
                     juce::MessageManager::callAsync ([] { juce::JUCEApplication::getInstance()->quit(); });

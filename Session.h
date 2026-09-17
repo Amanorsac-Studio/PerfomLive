@@ -184,6 +184,7 @@ public:
         active = deckIndex;
         queued = -1;
         rewarpPending = false;
+        tempoChangePending.store (false, std::memory_order_release);
     }
 
     // Owner round 4: "always start row from beginning when I pause and start
@@ -198,6 +199,8 @@ public:
     {
         halted.store (false, std::memory_order_release);
         masterPos = 0;
+        barOrigin.store (0, std::memory_order_relaxed);
+        tempoChangePending.store (false, std::memory_order_release);
         queued = -1;
         rewarpPending = false;
         crossfade.active = false;
@@ -241,6 +244,26 @@ public:
     // since the audio thread never reads an inactive deck's layers at all.
     void scheduleActiveDeckRewarp() { rewarpPending = true; }
 
+    // Owner: "while a loop or stems are playing I press plus and the tempo
+    // goes up in the next bar." At the active deck's next bar: its staged
+    // layer swaps (re-stretched to newBpm by the caller) go in, the playhead
+    // and every position waiting on it move to the same musical place
+    // (x positionScale = new buffer length / old), the tempo becomes newBpm,
+    // and bars count from that moment. Message thread; the audio thread
+    // resolves it, sample-exactly, like a queued switch.
+    void scheduleTempoChange (double newBpm, double positionScale)
+    {
+        pendingTempoBpm.store (newBpm, std::memory_order_relaxed);
+        pendingPositionScale.store (positionScale, std::memory_order_relaxed);
+        tempoChangePending.store (true, std::memory_order_release);
+    }
+    void cancelTempoChange()              { tempoChangePending.store (false, std::memory_order_release); }
+    bool isTempoChangePending() const     { return tempoChangePending.load (std::memory_order_acquire); }
+    /** How many tempo changes have been applied: the caller watches this to follow along. */
+    uint32_t tempoChangesApplied() const  { return tempoChangeCount.load (std::memory_order_relaxed); }
+    /** Master clock position where bar 1 of the current tempo began (0 until a tempo change). */
+    int64_t barOriginPosition() const     { return barOrigin.load (std::memory_order_relaxed); }
+
     // Renders numSamples of stereo output, splitting the block internally at
     // the bar boundary if a queued switch falls inside it. Safe for any block
     // size: the boundary is computed from the absolute master sample count,
@@ -264,7 +287,7 @@ public:
             if (queued >= 0 && ! crossfade.active)
             {
                 const int64_t barLen      = barLengthSamples (effectiveTempo (active), deviceSampleRate);
-                const int64_t boundary    = nextBarBoundaryAtOrAfter (masterPos, barLen);
+                const int64_t boundary    = nextBarFromOrigin (barLen);
                 const int64_t untilSwitch = boundary - masterPos;
 
                 if (untilSwitch <= 0)
@@ -320,7 +343,7 @@ public:
             if (rewarpPending && ! crossfade.active)
             {
                 const int64_t barLen      = barLengthSamples (effectiveTempo (active), deviceSampleRate);
-                const int64_t boundary    = nextBarBoundaryAtOrAfter (masterPos, barLen);
+                const int64_t boundary    = nextBarFromOrigin (barLen);
                 const int64_t untilRewarp = boundary - masterPos;
 
                 if (untilRewarp <= 0)
@@ -334,6 +357,8 @@ public:
                     chunk = (int) untilRewarp;
                 }
             }
+
+            resolveTempoChange (chunk);   // a +/- tempo change waiting for this bar
 
             // count-in: the clock runs, the deck does not (see startCountIn)
             if (countInRemaining > 0)
@@ -507,7 +532,7 @@ public:
             if (queued >= 0 && ! crossfade.active)
             {
                 const int64_t barLen      = barLengthSamples (effectiveTempo (active), deviceSampleRate);
-                const int64_t boundary    = nextBarBoundaryAtOrAfter (masterPos, barLen);
+                const int64_t boundary    = nextBarFromOrigin (barLen);
                 const int64_t untilSwitch = boundary - masterPos;
 
                 if (untilSwitch <= 0)
@@ -539,7 +564,7 @@ public:
             if (rewarpPending && ! crossfade.active)
             {
                 const int64_t barLen      = barLengthSamples (effectiveTempo (active), deviceSampleRate);
-                const int64_t boundary    = nextBarBoundaryAtOrAfter (masterPos, barLen);
+                const int64_t boundary    = nextBarFromOrigin (barLen);
                 const int64_t untilRewarp = boundary - masterPos;
 
                 if (untilRewarp <= 0)
@@ -553,6 +578,8 @@ public:
                     chunk = (int) untilRewarp;
                 }
             }
+
+            resolveTempoChange (chunk);   // a +/- tempo change waiting for this bar
 
             // count-in: the clock runs, the deck does not (see startCountIn)
             if (countInRemaining > 0)
@@ -767,7 +794,7 @@ private:
             if (seekWhen == SeekWhen::nextBar)
             {
                 const int64_t barLen = barLengthSamples (effectiveTempo (active), deviceSampleRate);
-                until = nextBarBoundaryAtOrAfter (masterPos, barLen) - masterPos;
+                until = nextBarFromOrigin (barLen) - masterPos;
             }
             else if (seekWhen == SeekWhen::atDeckPosition)
             {
@@ -805,6 +832,51 @@ private:
         return false;
     }
     bool    rewarpPending { false };
+
+    // ---- live tempo change (scheduleTempoChange) --------------------------
+    std::atomic<bool>     tempoChangePending   { false };
+    std::atomic<double>   pendingTempoBpm      { 120.0 };
+    std::atomic<double>   pendingPositionScale { 1.0 };
+    std::atomic<uint32_t> tempoChangeCount     { 0 };
+    std::atomic<int64_t>  barOrigin            { 0 };   // bars are counted from here
+
+    // The next bar line at or after masterPos, counted from where the current
+    // tempo began (so a tempo change mid-song keeps bars on the beat).
+    int64_t nextBarFromOrigin (int64_t barLen) const
+    {
+        const int64_t origin = barOrigin.load (std::memory_order_relaxed);
+        return origin + nextBarBoundaryAtOrAfter (masterPos - origin, barLen);
+    }
+
+    void applyTempoChange()
+    {
+        auto& deck = decks[(size_t) active];
+        deck.applyPendingSwaps();
+        const double scale = pendingPositionScale.load (std::memory_order_relaxed);
+        if (scale > 0.0)
+        {
+            deck.scalePositions (scale);
+            seekTarget *= scale;
+            seekFireAt *= scale;
+            stopAtPos  *= scale;
+        }
+        tempo.bpm = pendingTempoBpm.load (std::memory_order_relaxed);
+        barOrigin.store (masterPos, std::memory_order_relaxed);
+        rewarpPending = false;
+        tempoChangePending.store (false, std::memory_order_release);
+        tempoChangeCount.fetch_add (1, std::memory_order_relaxed);
+    }
+
+    // Applies a waiting tempo change at this chunk's start if a bar line is
+    // here, or shortens the chunk so the next one starts on it.
+    void resolveTempoChange (int& chunk)
+    {
+        if (! tempoChangePending.load (std::memory_order_acquire) || crossfade.active) return;
+        const int64_t barLen = barLengthSamples (effectiveTempo (active), deviceSampleRate);
+        const int64_t until  = nextBarFromOrigin (barLen) - masterPos;
+        if (until <= 0) applyTempoChange();
+        else if (until < (int64_t) chunk) chunk = (int) until;
+    }
 
     CrossfadeState      crossfade;
     std::vector<float>  fadeScratchL;

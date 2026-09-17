@@ -96,7 +96,9 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\PerformLive.exe"
 Name: "{autodesktop}\{#AppName}";  Filename: "{app}\PerformLive.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\PerformLive.exe"; Description: "Open {#AppName} now"; Flags: nowait postinstall skipifsilent
+; runasoriginaluser: an elevated first launch gives WebView2 (the WEB tab) an
+; admin-owned data folder, and the normal launches after it then show a blank page.
+Filename: "{app}\PerformLive.exe"; Description: "Open {#AppName} now"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 { The two folders the app itself writes to (File & Data Conventions 1.1, 1.2).

@@ -248,24 +248,33 @@ inline std::vector<float> clickPitches (const std::vector<Burst>& clicks, const 
 }
 
 /** A tempo written in a file or folder name ("...-G-66.00bpm\Click.wav",
-    "Grace 72BPM - Drums.wav"): the number just before "bpm", 40-250. The
-    name nearest the file wins. 0 when there is none. */
+    "Grace 72BPM - Drums.wav", "Reggae Loop (BPM 78).mp3", "Swing (BPM100)"):
+    the number just before "bpm", or else just after it, 40-250. The name
+    nearest the file wins. 0 when there is none. */
 inline double tempoFromName (const std::string& path)
 {
     std::string s (path);
     std::transform (s.begin(), s.end(), s.begin(), [] (unsigned char ch) { return (char) std::tolower (ch); });
+    auto isGap = [] (char c) { return c == ' ' || c == '_' || c == '-' || c == ':' || c == '='; };
     double found = 0.0;
     for (size_t pos = s.find ("bpm"); pos != std::string::npos; pos = s.find ("bpm", pos + 3))
     {
+        double v = 0.0;
         size_t end = pos;
-        while (end > 0 && (s[end - 1] == ' ' || s[end - 1] == '_' || s[end - 1] == '-')) --end;
+        while (end > 0 && isGap (s[end - 1])) --end;
         size_t start = end;
         while (start > 0 && (std::isdigit ((unsigned char) s[start - 1]) || s[start - 1] == '.')) --start;
         if (start < end)
+            v = std::atof (s.substr (start, end - start).c_str());
+        else
         {
-            const double v = std::atof (s.substr (start, end - start).c_str());
-            if (v >= 40.0 && v <= 250.0) found = v;
+            size_t from = pos + 3;
+            while (from < s.size() && isGap (s[from])) ++from;
+            size_t to = from;
+            while (to < s.size() && (std::isdigit ((unsigned char) s[to]) || s[to] == '.')) ++to;
+            if (to > from) v = std::atof (s.substr (from, to - from).c_str());
         }
+        if (v >= 40.0 && v <= 250.0) found = v;
     }
     return found;
 }

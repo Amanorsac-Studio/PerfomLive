@@ -31,6 +31,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -68,7 +70,11 @@ private:
         }
     }
 
-    void handleConnectionLost() override { juce::JUCEApplicationBase::quit(); }
+    // The app hung up: it finished, stopped the scan, or gave up on a plugin
+    // that never answered. Leave at once -- this runs on the connection's own
+    // thread, and a hung plugin may hold the message thread forever, so a
+    // normal quit() would never happen and the process would stay behind.
+    void handleConnectionLost() override { std::_Exit (0); }
 
     void handleAsyncUpdate() override
     {
@@ -117,26 +123,84 @@ private:
 };
 
 //==============================================================================
+//  What the person watching a scan can do about it, shared between the scan
+//  window (message thread) and the scanner (the scan's own thread).
+//  Owner: "scanning gets stuck on some plugins, we should be able to skip the
+//  ones that get stuck."
+//==============================================================================
+struct ScanControl
+{
+    std::atomic<bool> skipCurrent { false };   // "Skip this plugin"
+    std::atomic<bool> stopAll     { false };   // "Stop scan"
+    std::atomic<int>  timeoutMs   { 30'000 };  // a plugin that doesn't answer in this long is skipped
+    std::atomic<juce::uint32> probeStartedMs { 0 };   // 0 = not checking a plugin right now
+
+    juce::String currentFile() const            { const juce::ScopedLock sl (lock); return current; }
+    void setCurrentFile (const juce::String& f) { const juce::ScopedLock sl (lock); current = f; }
+
+    /** Why a file was passed over ("Skipped", "Didn't answer within 30 s", ...). */
+    juce::String reasonFor (const juce::String& file) const { const juce::ScopedLock sl (lock); return reasons[file]; }
+    void setReason (const juce::String& file, const juce::String& why) { const juce::ScopedLock sl (lock); reasons.set (file, why); }
+    void clearReason (const juce::String& file)  { const juce::ScopedLock sl (lock); reasons.remove (juce::StringRef (file)); }
+    void clearReasons()                          { const juce::ScopedLock sl (lock); reasons.clear(); }
+    juce::StringPairArray allReasons() const     { const juce::ScopedLock sl (lock); return reasons; }
+    void setAllReasons (const juce::StringPairArray& r) { const juce::ScopedLock sl (lock); reasons = r; }
+
+private:
+    juce::CriticalSection lock;
+    juce::String current;
+    juce::StringPairArray reasons;
+};
+
+//==============================================================================
 //  The HOST side of the scan: launches the subprocess and asks it about one
-//  file at a time. If the subprocess dies, that file is skipped and a fresh
-//  subprocess handles the next one.
+//  file at a time. If the subprocess dies, hangs past the time limit, or the
+//  person skips it, that file is set aside (JUCE's blacklist, with a reason)
+//  and a fresh subprocess handles the next one.
 //==============================================================================
 class OutOfProcessScanner final : public juce::KnownPluginList::CustomScanner
 {
 public:
+    explicit OutOfProcessScanner (std::shared_ptr<ScanControl> c) : control (std::move (c)) {}
+
     bool findPluginTypesFor (juce::AudioPluginFormat& format,
                              juce::OwnedArray<juce::PluginDescription>& result,
                              const juce::String& fileOrIdentifier) override
     {
-        if (addPluginDescriptions (format.getName(), fileOrIdentifier, result))
-            return true;
-        worker = nullptr;   // it crashed on this file: the next file gets a new one
+        control->skipCurrent = false;
+        control->setCurrentFile (fileOrIdentifier);
+        control->probeStartedMs = juce::jmax<juce::uint32> (1, juce::Time::getMillisecondCounter());
+        const auto outcome = addPluginDescriptions (format.getName(), fileOrIdentifier, result);
+        control->probeStartedMs = 0;
+
+        switch (outcome)
+        {
+            case Outcome::found:
+                control->clearReason (fileOrIdentifier);
+                return true;
+            case Outcome::stopped:
+                worker = nullptr;   // not this plugin's fault: not set aside
+                return true;
+            case Outcome::skipped:
+                control->setReason (fileOrIdentifier, "Skipped");
+                break;
+            case Outcome::timedOut:
+                control->setReason (fileOrIdentifier, "Didn't answer within " + juce::String (control->timeoutMs.load() / 1000) + " s");
+                break;
+            case Outcome::crashed:
+                control->setReason (fileOrIdentifier, "Crashed while being checked");
+                break;
+        }
+        worker = nullptr;   // the next file gets a new subprocess; this one exits (handleConnectionLost)
         return false;
     }
 
-    void scanFinished() override { worker = nullptr; }
+    void scanFinished() override { worker = nullptr; control->setCurrentFile ({}); }
 
 private:
+    enum class Outcome { found, crashed, timedOut, skipped, stopped };
+    std::shared_ptr<ScanControl> control;
+
     class Worker final : private juce::ChildProcessCoordinator
     {
     public:
@@ -183,8 +247,8 @@ private:
         bool connectionLost = false, gotResult = false;
     };
 
-    bool addPluginDescriptions (const juce::String& formatName, const juce::String& fileOrIdentifier,
-                                juce::OwnedArray<juce::PluginDescription>& result)
+    Outcome addPluginDescriptions (const juce::String& formatName, const juce::String& fileOrIdentifier,
+                                   juce::OwnedArray<juce::PluginDescription>& result)
     {
         if (worker == nullptr) worker = std::make_unique<Worker>();
 
@@ -192,14 +256,16 @@ private:
         juce::MemoryOutputStream stream { block, true };
         stream.writeString (formatName);
         stream.writeString (fileOrIdentifier);
-        if (! worker->sendMessageToWorker (block)) return false;
+        if (! worker->sendMessageToWorker (block)) return Outcome::crashed;
 
-        // a plugin that hangs its own probe is abandoned after this long
-        const auto deadline = juce::Time::getMillisecondCounter() + 60'000;
+        // Checked every 50 ms: the person's Skip and Stop, and the time limit.
+        const auto deadline = juce::Time::getMillisecondCounter()
+                              + (juce::uint32) juce::jlimit (3'000, 600'000, control->timeoutMs.load());
         for (;;)
         {
-            if (shouldExit()) return true;
-            if (juce::Time::getMillisecondCounter() > deadline) return false;
+            if (shouldExit() || control->stopAll) return Outcome::stopped;
+            if (control->skipCurrent.exchange (false)) return Outcome::skipped;
+            if (juce::Time::getMillisecondCounter() > deadline) return Outcome::timedOut;
             const auto response = worker->getResponse();
             if (response.state == Worker::State::timeout) continue;
             if (response.xml != nullptr)
@@ -208,7 +274,7 @@ private:
                     auto desc = std::make_unique<juce::PluginDescription>();
                     if (desc->loadFromXml (*item)) result.add (std::move (desc));
                 }
-            return response.state == Worker::State::gotResult;
+            return response.state == Worker::State::gotResult ? Outcome::found : Outcome::crashed;
         }
     }
 
@@ -225,11 +291,62 @@ public:
     PluginLibrary()
     {
         juce::addDefaultFormatsToManager (formats);
-        known.setCustomScanner (std::make_unique<OutOfProcessScanner>());
+        known.setCustomScanner (std::make_unique<OutOfProcessScanner> (control));
     }
 
     juce::AudioPluginFormatManager& formatManager() { return formats; }
     juce::KnownPluginList& list() { return known; }
+    ScanControl& scanControl() { return *control; }
+
+    /** Scans every format's standard folders, skipping what is already known
+        or set aside. progress gets the file about to be checked and the
+        overall fraction. Returns how many files were checked. Runs on the
+        caller's thread (never the message thread: a scan can take minutes). */
+    int scanStandardFolders (const juce::File& deadMansPedal,
+                             const std::function<bool()>& stopRequested,
+                             const std::function<void (const juce::String&, float)>& progress)
+    {
+        control->stopAll = false;
+        control->skipCurrent = false;
+        int files = 0;
+        const int numFormats = juce::jmax (1, formats.getNumFormats());
+        for (int fi = 0; fi < formats.getNumFormats(); ++fi)
+        {
+            auto* format = formats.getFormat (fi);
+            juce::PluginDirectoryScanner scanner (known, *format, format->getDefaultLocationsToSearch(), true, deadMansPedal, true);
+            juce::String name;
+            for (;;)
+            {
+                if ((stopRequested && stopRequested()) || control->stopAll) return files;
+                if (progress) progress (scanner.getNextPluginFileThatWillBeScanned(), ((float) fi + scanner.getProgress()) / (float) numFormats);
+                if (! scanner.scanNextFile (true, name)) break;
+                ++files;
+            }
+        }
+        if (progress) progress ({}, 1.0f);
+        return files;
+    }
+
+    /** Files that were set aside (skipped, too slow, crashed), newest last. */
+    juce::StringArray setAsideFiles() const { return known.getBlacklistedFiles(); }
+    juce::String reasonSetAside (const juce::String& file) const
+    {
+        const auto why = control->reasonFor (file);
+        return why.isNotEmpty() ? why : juce::String ("Couldn't be checked");
+    }
+
+    /** "Try again": the next scan checks this file once more. */
+    void allowAgain (const juce::String& file) { known.removeFromBlacklist (file); control->clearReason (file); }
+    void allowAllAgain()                       { known.clearBlacklistedFiles(); control->clearReasons(); }
+
+    /** Takes one instrument off the list (a rescan finds it again). */
+    void forget (const juce::PluginDescription& d) { known.removeType (d); }
+
+    /** "Rescan everything": forgets every plugin and every set-aside file. */
+    void forgetEverything() { known.clear(); allowAllAgain(); }
+
+    int timeoutSeconds() const { return control->timeoutMs.load() / 1000; }
+    void setTimeoutSeconds (int s) { control->timeoutMs = juce::jlimit (5, 600, s) * 1000; }
 
     /** Instruments only, sorted by name -- what a column can hold. */
     juce::Array<juce::PluginDescription> instruments() const
@@ -245,27 +362,44 @@ public:
     void loadFrom (juce::PropertiesFile& props)
     {
         if (auto xml = props.getXmlValue ("pluginList")) known.recreateFromXml (*xml);
-        keepInstrumentsOnly();
+        setTimeoutSeconds (props.getIntValue ("pluginScanTimeoutSeconds", 30));
+        if (auto xml = props.getXmlValue ("pluginScanReasons"))
+        {
+            juce::StringPairArray reasons;
+            for (auto* e : xml->getChildIterator())
+                reasons.set (e->getStringAttribute ("file"), e->getStringAttribute ("why"));
+            control->setAllReasons (reasons);
+        }
     }
 
     void saveTo (juce::PropertiesFile& props)
     {
-        keepInstrumentsOnly();
         if (auto xml = known.createXml()) props.setValue ("pluginList", xml.get());
+        props.setValue ("pluginScanTimeoutSeconds", timeoutSeconds());
+        juce::XmlElement reasonsXml ("REASONS");
+        const auto reasons = control->allReasons();
+        for (const auto& file : reasons.getAllKeys())
+        {
+            auto* e = reasonsXml.createNewChildElement ("FILE");
+            e->setAttribute ("file", file);
+            e->setAttribute ("why", reasons[file]);
+        }
+        props.setValue ("pluginScanReasons", &reasonsXml);
         props.saveIfNeeded();
     }
 
     /** Owner: "the app should reject other effect plugins -- only accepts
-        instrument plugins". A scan finds everything in the VST3 folder; this
-        drops every effect from the list, so an effect can never be offered,
-        loaded or saved. Effects on a column come from the built-in PERFORM
-        LIVE channel strip instead. Returns how many were dropped. */
-    int keepInstrumentsOnly()
+        instrument plugins". Effects stay in the scanned list, so a rescan
+        doesn't check hundreds of them again, but instruments() and find()
+        never offer one: nothing can load or save an effect. Effects on a
+        column come from the built-in PERFORM LIVE channel strip instead.
+        Returns how many effects the list holds. */
+    int effectCount() const
     {
-        int dropped = 0;
+        int effects = 0;
         for (const auto& d : known.getTypes())
-            if (! d.isInstrument) { known.removeType (d); ++dropped; }
-        return dropped;
+            if (! d.isInstrument) ++effects;
+        return effects;
     }
 
     /** The directories a scan looks in: the format's own defaults (Program
@@ -286,6 +420,7 @@ public:
     }
 
 private:
+    std::shared_ptr<ScanControl> control { std::make_shared<ScanControl>() };   // before `known`, which hands it to the scanner
     juce::AudioPluginFormatManager formats;
     juce::KnownPluginList known;
 };
@@ -510,7 +645,13 @@ public:
         setVisible (true);
     }
 
-    void closeButtonPressed() override { if (onClose) onClose(); }
+    // The owner deletes this window: after this call has returned, never while
+    // the window is still running its own code.
+    void closeButtonPressed() override
+    {
+        setVisible (false);
+        if (onClose) juce::MessageManager::callAsync (onClose);
+    }
 
 private:
     std::function<void()> onClose;

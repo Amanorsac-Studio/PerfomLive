@@ -227,6 +227,85 @@ int main()
                "with a single output pair and every channel at its default routing, mixDown() sums identically to its pre-routing single-output behavior");
     }
 
+    // ---- route codes: Main, stereo pairs, mono outputs --------------------
+    {
+        const auto main = outputTargetFor (0), pair5 = outputTargetFor (5);
+        const auto out1 = outputTargetFor (kMonoRouteBase), out6 = outputTargetFor (kMonoRouteBase + 5);
+        CHECK (main.pair == 0 && main.side == -1 && pair5.pair == 5 && pair5.side == -1
+               && out1.pair == 0 && out1.side == 0 && out6.pair == 2 && out6.side == 1,
+               "route codes decode: 0 is Main, N is stereo pair N, 100+c is output c+1 alone (its pair and side)");
+        const auto bad1 = outputTargetFor (99), bad2 = outputTargetFor (kMonoRouteBase + kMaxOutputChannels), bad3 = outputTargetFor (-4);
+        CHECK (bad1.pair == 0 && bad1.side == -1 && bad2.pair == 0 && bad2.side == -1 && bad3.pair == 0 && bad3.side == -1
+               && ! isValidOutputRoute (99) && isValidOutputRoute (kMonoRouteBase + 63) && ! isValidOutputRoute (kMonoRouteBase + 64),
+               "a code that is neither a pair nor an output decodes to Main, and is reported invalid");
+    }
+
+    // Two pairs of outputs, one or two channels feeding them.
+    auto runMono = [numSamples] (Mixer& m, float tab1L, float tab1R, float tab2, int pairs,
+                                 std::vector<std::vector<float>>& outs)
+    {
+        std::array<std::vector<float>, kNumMixerChannels> srcL, srcR;
+        std::array<const float*, kNumMixerChannels> inL {}, inR {};
+        for (int c = 0; c < kNumMixerChannels; ++c)
+        {
+            const float l = c == 0 ? tab1L : (c == 1 ? tab2 : 0.0f);
+            const float r = c == 0 ? tab1R : (c == 1 ? tab2 : 0.0f);
+            srcL[(size_t) c] = constantSource (numSamples, l);
+            srcR[(size_t) c] = constantSource (numSamples, r);
+            inL[(size_t) c] = srcL[(size_t) c].data();
+            inR[(size_t) c] = srcR[(size_t) c].data();
+        }
+        outs.assign ((size_t) (pairs * 2), std::vector<float> ((size_t) numSamples, 9.0f));
+        std::vector<float*> outL, outR;
+        for (int p = 0; p < pairs; ++p) { outL.push_back (outs[(size_t) (p * 2)].data()); outR.push_back (outs[(size_t) (p * 2 + 1)].data()); }
+        m.mixDown (inL, inR, outL, outR, numSamples);
+    };
+
+    // ---- mono: one output, the channel's left and right summed -------------
+    {
+        Mixer m;
+        m.setChannelOutputRoute (MixerChannel::Tab1, kMonoRouteBase + 3);   // Out 4 alone
+        std::vector<std::vector<float>> outs;
+        runMono (m, 1.0f, 0.5f, 0.0f, 2, outs);
+        CHECK (nearlyEqual (outs[3][0], 0.75f) && nearlyEqual (outs[3][(size_t) numSamples - 1], 0.75f),
+               "a channel routed mono to Out 4 plays there at (L+R)/2");
+        CHECK (nearlyEqual (outs[0][0], 0.0f) && nearlyEqual (outs[1][0], 0.0f) && nearlyEqual (outs[2][0], 0.0f),
+               "a mono route touches no other output -- not Main, not the other side of its pair");
+    }
+
+    // ---- several channels may share one output ----------------------------
+    {
+        Mixer m;
+        m.setChannelOutputRoute (MixerChannel::Tab1, kMonoRouteBase + 2);   // Out 3
+        m.setChannelOutputRoute (MixerChannel::Tab2, kMonoRouteBase + 2);   // Out 3 too
+        std::vector<std::vector<float>> outs;
+        runMono (m, 1.0f, 1.0f, 0.5f, 2, outs);
+        CHECK (nearlyEqual (outs[2][0], 1.5f) && nearlyEqual (outs[3][0], 0.0f),
+               "two channels routed to the same mono output add up there");
+    }
+
+    // ---- a mono output the device doesn't have plays through Main ---------
+    {
+        Mixer m;
+        m.setChannelOutputRoute (MixerChannel::Tab1, kMonoRouteBase + 9);   // Out 10, on a 4-output device
+        std::vector<std::vector<float>> outs;
+        runMono (m, 0.25f, 0.75f, 0.0f, 2, outs);
+        CHECK (nearlyEqual (outs[0][0], 0.25f) && nearlyEqual (outs[1][0], 0.75f)
+               && nearlyEqual (outs[2][0], 0.0f) && nearlyEqual (outs[3][0], 0.0f),
+               "a mono output beyond the device falls back to Main in stereo, not to half of another pair");
+    }
+
+    // ---- choosing a stereo pair again undoes mono -------------------------
+    {
+        Mixer m;
+        m.setChannelOutputRoute (MixerChannel::Tab1, kMonoRouteBase + 2);
+        m.setChannelOutputPair (MixerChannel::Tab1, 1);
+        std::vector<std::vector<float>> outs;
+        runMono (m, 1.0f, 0.5f, 0.0f, 2, outs);
+        CHECK (m.getChannelOutputSide (MixerChannel::Tab1) == -1 && nearlyEqual (outs[2][0], 1.0f) && nearlyEqual (outs[3][0], 0.5f),
+               "setting a stereo pair after a mono route plays stereo on that pair again");
+    }
+
     std::printf ("\n%d/%d PASS\n", gPass, gTotal);
     return gPass == gTotal ? 0 : 1;
 }

@@ -49,6 +49,12 @@ public:
         bind (juce::KeyPress (juce::KeyPress::F5Key),       ActionId::CountInPlay);
         bind (juce::KeyPress (juce::KeyPress::F2Key),       ActionId::TogglePlaybackView);
 
+        // Live tempo: the +/- keys (= is + without Shift), and the number pad's.
+        bind (juce::KeyPress ((int) '='),                          ActionId::TempoUp);
+        bind (juce::KeyPress ((int) '-'),                          ActionId::TempoDown);
+        bind (juce::KeyPress (juce::KeyPress::numberPadAdd),       ActionId::TempoUp);
+        bind (juce::KeyPress (juce::KeyPress::numberPadSubtract),  ActionId::TempoDown);
+
         for (int i = 0; i < 8; ++i)
             bind (juce::KeyPress ((int) ('1' + i)), deckSlotAction (i));
 

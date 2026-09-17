@@ -150,7 +150,7 @@ jobs:
       - name: Engine tests
         run: |
           set -u
-          for suite in decktest:67 switchtest:69 stemlentest:9 stemplaytest:15 stemlocktest:18 outroutetest:10 sectiontest:41 arrangetest:37; do
+          for suite in decktest:67 switchtest:69 stemlentest:9 stemplaytest:15 stemlocktest:18 outroutetest:17 sectiontest:41 arrangetest:37 tempotest:11 clicktest:18 stretchtest:10 tempochangetest:11; do
             name="${suite%%:*}"; want="${suite##*:}"
             clang++ -std=c++17 -O2 -I. "$name.cpp" -o "$RUNNER_TEMP/$name" || { echo "::error::$name does not compile"; exit 1; }
             out="$("$RUNNER_TEMP/$name" 2>&1)"

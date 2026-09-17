@@ -239,6 +239,8 @@ struct Layer
     // region length for later application by the audio thread. Returns
     // false (does nothing) if a previously-staged swap hasn't been consumed
     // yet -- the caller must not overwrite an in-flight staged buffer.
+    bool hasPendingSwap() const { return pendingSwapReady.load (std::memory_order_acquire); }
+
     bool stagePendingSwap (std::vector<float> newLeft, std::vector<float> newRight, int newRegionLength)
     {
         if (pendingSwapReady.load (std::memory_order_acquire)) return false;
@@ -344,6 +346,17 @@ public:
         sectionLoopEnd.store   (std::max (0.0, endPos),   std::memory_order_relaxed);
         sectionLoopRemaining.store (remaining, std::memory_order_relaxed);
         sectionLoopEnabled.store (endPos > startPos, std::memory_order_release);
+    }
+
+    // A tempo change swapped in buffers `scale` times as long: move the
+    // playhead and the section loop to the same musical place. Audio thread
+    // only, at the moment of the swap (Session::applyTempoChange).
+    void scalePositions (double scale)
+    {
+        if (scale <= 0.0) return;
+        playhead *= scale;
+        sectionLoopStart.store (sectionLoopStart.load (std::memory_order_relaxed) * scale, std::memory_order_relaxed);
+        sectionLoopEnd.store   (sectionLoopEnd.load (std::memory_order_relaxed) * scale,   std::memory_order_relaxed);
     }
 
     void clearSectionLoop()              { sectionLoopEnabled.store (false, std::memory_order_release); }
